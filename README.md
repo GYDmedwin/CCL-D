@@ -14,7 +14,8 @@ slow and hanging collective operations. It is based on NVIDIA NCCL
 - An optional Ring-only wait counter and a three-completed-operation
   volume-normalized ranking rule, gated on a confirmed slow diagnosis.
 - A binary trace decoder, a paper-inspired hang/slow analyzer, a one-shot live
-  Ring observer, a small PyTorch workload, unit tests, and a Slurm example.
+  Ring observer, PyTorch collective and FSDP training examples, unit tests,
+  and a Slurm example.
 - The ordered patches in [ccld/patches](ccld/patches/README.md), so the
   modifications can be reviewed against the original NCCL release.
 
@@ -85,11 +86,82 @@ The current observer targets a single-host, eight-rank AllReduce communicator,
 `ring_wait.py` accepts `--slow-confirmed` after a matching base slow diagnosis
 has been confirmed.
 
+For a recorded Tree AllReduce run, the optional second stage combines the
+base analyzer's completed group decisions to identify an S1 candidate across
+channels:
+
+```bash
+python3 ccld/analyzer/tree_s1_vote.py runs/tree/jsonl runs/tree/diagnosis.jsonl
+```
+
+It consumes decoded traces and base-analyzer JSONL, and reports a candidate
+only when all eligible channels agree. Other outcomes remain available as
+`not_applicable`, `undetermined`, or `incomplete`.
+
+## Example: FSDP model training
+
+The following example trains a synthetic causal decoder with FSDP, bfloat16,
+and AdamW on eight GPUs. It runs the decoder and base analyzer alongside
+training. Start in the repository root with CUDA-enabled PyTorch installed and
+use a fresh output directory:
+
+```bash
+export CCLD_RUN="$PWD/runs/fsdp-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$CCLD_RUN/bin" "$CCLD_RUN/jsonl" "$CCLD_RUN/workload"
+export LD_LIBRARY_PATH="$PWD/build/lib:${LD_LIBRARY_PATH:-}"
+export LD_PRELOAD="$PWD/build/lib/libnccl.so.2"
+export NCCL_ALGO=Ring NCCL_PROTO=Simple
+export NCCL_CCLD_ENABLE=1 NCCL_CCLD_MODE=1 NCCL_CCLD_WAIT_ENABLE=1
+export NCCL_CCLD_POLL_US=200 NCCL_CCLD_FRAME_BLOCKS=512
+export NCCL_CCLD_QUEUE_SLOTS=2048 NCCL_CCLD_COMPLETION=event
+export NCCL_CCLD_OUT_DIR="$CCLD_RUN/bin"
+
+python3 ccld/tools/decode_async_wait.py "$CCLD_RUN/bin" "$CCLD_RUN/jsonl" --follow &
+decoder=$!
+python3 ccld/analyzer/ccld_analyze.py "$CCLD_RUN/jsonl" --follow \
+  --baseline-ms 1 --baseline-rounds 20 --baseline-skip 2 \
+  --window-s 1 --repeats 2 --poll-s 0.2 > "$CCLD_RUN/diagnosis.jsonl" &
+analyzer=$!
+torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+  ccld/experiments/fsdp_train.py --profile medium --steps 20 \
+  --output-dir "$CCLD_RUN/workload" --expect-nccl-prefix "$PWD/build/lib"
+kill "$decoder"; wait "$decoder"
+sleep 1
+kill "$analyzer"; wait "$analyzer" 2>/dev/null || true
+```
+
+The example checks the NCCL library mapped by every rank and writes per-rank
+losses, step times and CPU affinity to `workload/`. The `medium` profile has
+approximately 117 million parameters; `smoke` is a smaller setup check. The
+tokens are synthetic, so the loss is useful for checking run consistency
+rather than model quality. Choose analysis windows and baseline values for
+your workload.
+
+To monitor an existing PyTorch training job, enable the same NCCL environment
+on every rank, launch the training command as usual, and run the decoder and
+base analyzer on its trace directory. The covered operations are Ring
+AllReduce, AllGather and ReduceScatter, and Tree AllReduce. For multiple nodes,
+use a directory visible to the observer and every rank. On Linux, check
+`/proc/<training-pid>/maps` for the mapped `libnccl.so` when using your own
+workload. The one-shot Ring observer above is a separate example for its
+specified eight-rank AllReduce workload.
+
+For a two-node Slurm launch, activate the PyTorch environment, set
+`CCLD_ROOT` to the shared repository path, and submit
+[ccld/slurm/fsdp_train.sh](ccld/slurm/fsdp_train.sh) with your site's
+account, partition and GPU resource options. The script uses eight GPUs per
+node by default; `CCLD_GPUS_PER_NODE`, `CCLD_PROFILE`, `CCLD_STEPS`, and
+`CCLD_RUN` can be set before submission. Adjust the CPU request to the site
+and workload so the training workers and NCCL/monitoring threads have room to
+run; [RESULTS.md](RESULTS.md) includes an example CPU allocation comparison.
+
 ## Validation
 
 The online observer has been evaluated with single-node, eight-H100
 AllReduce workloads using Ring/Simple, Ring/LL, and Ring/LL128. Each protocol
 was exercised with five simulated S2 send delays and five no-fault controls.
+Collective correctness and FSDP training have also been exercised across two
+eight-H100 nodes.
 See [RESULTS.md](RESULTS.md) for the test configuration and results.
 
 ## Fault simulation
