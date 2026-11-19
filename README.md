@@ -100,10 +100,13 @@ standalone `ring_wait.py` accepts `--slow-confirmed` only when the matching
 base slow result has already been checked. A lack of confirmation or data is
 indeterminate, not a healthy verdict.
 
-The Python entry points used in this export were made portable and tested with
-synthetic data. The historical online validation used a pinned build, fixed
-plan, and different wrapper; the port itself has not yet been revalidated on
-the original GPU trial matrix.
+The portable online observer has been exercised on H100 with five synthetic
+S2 faults and five controls per protocol, using the historical restricted
+fault-injection library and workload. All faults were localized and no control
+raised an online alert. LL and LL128 faults were classified as S3 by the base
+analyzer. An offline experiment that bypassed the slow gate crossed the old
+threshold in one Simple control, without a majority rank candidate. See
+[RESULTS.md](RESULTS.md) for the limits and timing of this validation.
 
 ## Fault simulation
 
