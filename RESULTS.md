@@ -5,6 +5,201 @@ validated for arbitrary workloads. Raw traces are not included. The export
 preserves the selected asynchronous Ring-wait NCCL patch chain; its portable
 observer has now been exercised on the limited GPU matrix described below.
 
+## Online memory transport
+
+A full NCCL 2.24.3 build with CUDA 12.8.2 was tested on H100s with the
+rank-to-agent Unix socket and independent TCP pulls. The online analyzer
+decoded records directly into its decision state. The test directories
+contained zero raw binary trace or per-rank JSONL telemetry files.
+
+| Setup | Check | Observed result |
+|---|---|---|
+| Two training nodes, 16 H100s, analyzer on the batch host | 30 FSDP steps | All 12,512 expected rank completions arrived during or by the end of the run, with no reported gaps. The first completion was received during training. All 480 rank-step losses matched the earlier file-mode reference for the same model and inputs. |
+| Same two-node allocation | Rank 12 enters the last AllReduce 12 s late | H1 named rank 12 while the operation was outstanding. All 112 rank operations completed and passed the numerical checks. |
+| One 8-H100 training node and a different two-CPU analyzer host | Rank 5 enters the last AllReduce 12 s late | The remote analyzer named rank 5 while the operation was outstanding. It subsequently reported recovery, with all 56 rank operations completed and verified. |
+
+Both hang checks used a 5 s threshold, a 250 ms snapshot interval and a
+200 ms analyzer poll. The separate analyzer allocation requested zero GPUs
+and ran the Python code from a private local copy. The FSDP case used Ring
+wait counters and 32 probing frames. These runs verify transport and
+decisions under the tested settings. Long-running CPU and network cost
+remain unmeasured. See [deployment](ccld/docs/live.md) for the online
+commands.
+
+## Pull rate and separate analysis CPU
+
+A separate CPU allocation received events from an eight-H100 FSDP training
+node with 48 logical CPUs, Ring/Simple, wait counters and 32 probing frames.
+The model used the same synthetic tokens in every pass. After warmup, the
+file writer produced about 26,000 raw records/s on the training node. The
+p95 rate across 100 ms bins was about 28,000 records/s.
+
+The first tests found three issues under sustained traffic. The file decoder
+could stop before it revisited the earlier rank files, the online analyzer
+deferred retiring ready operations until its pull cursor caught up, and the
+16,384-record node buffer overwrote unread records in several runs. After
+fixing the two software issues, a 65,536-record buffer sustained the 300-step
+runs, but the uncompressed 1,500-step test still reported a coverage gap.
+The analyzer kept training separate from the diagnosis and reported the
+gap rather than using incomplete telemetry for rank attribution.
+
+The next version compressed the TCP payload and increased the maximum
+batch from 1,024 to 4,096 raw records. The 1,500-step, 200 ms serial run
+received all 312,016 rank completions. Its binary payload was about 1.82 GiB
+before encoding and 131 MiB on the wire, excluding TCP/IP headers. Three
+300-step runs on a separate four-CPU analyzer with the same 65,536-record
+buffer also delivered all 62,416 completions each.
+
+| Idle poll interval | Requests over process lifetime | Maximum unread records at a node pull |
+|---|---:|---:|
+| 50 ms | 455 | 16,969 |
+| 200 ms | 149 | 8,613 |
+| 1 s | 68 | 29,284 |
+
+These short cases ran once per interval. The 200 ms setting gives a starting
+point for this workload. The highest observed backlog includes scheduling
+and processing variability as well as the poll interval. A full retention
+buffer can still contain previously consumed records.
+
+With compression and the same 200 ms interval, the following three
+1,500-step cases were run in one allocation. Each used a 65,536-record
+buffer. CPU masks applied to the entire analysis process tree.
+
+| Analysis CPU mask | Decode workers | Rank completions received | Maximum unread records | Analyzer CPU seconds including workers |
+|---:|---:|---:|---:|---:|
+| 2 logical CPUs | 1 | 234,291 / 312,016, overrun reported | 65,662 | 22.4 before overrun |
+| 4 logical CPUs | 1 | 312,016 / 312,016 | 44,261 | 30.2 |
+| 4 logical CPUs | 2 | 312,016 / 312,016 | 9,926 | 64.7 |
+
+The two complete cases measured 25.04 and 25.11 ms per step on the same
+training configuration. The decoded events were processed in two worker
+processes and combined in order by the coordinator when parallel decoding
+was enabled. Up to two batches may already be in the analyzer while worker
+processing proceeds. The maximum unread metric measures the node-side
+cursor lag and excludes those in-flight batches.
+
+The site's per-job limit allowed a separate 96-logical-CPU analysis
+allocation with zero GPUs. The training allocation and the 200 ms poll,
+compression and 65,536-record buffer were the same for all three cases.
+Each 1,500-step case received 312,016 completions and matched the 12,000
+rank-step loss values in the first case.
+
+| Decode workers with 96 CPUs available | Maximum unread records | Analyzer CPU seconds including workers | Mean max-rank step time |
+|---:|---:|---:|---:|
+| 2 | 11,409 | 52.3 | 24.09 ms |
+| 4 | 8,776 | 55.9 | 24.09 ms |
+| 8 | 11,537 | 61.5 | 24.65 ms |
+
+Four workers had the smallest observed lag in this rotation. The eight-worker
+case did not improve the lag and consumed more CPU. Each setting ran once.
+The coordinator still joins rank evidence, and larger jobs with more
+communicators can distribute decode work across more active shards. This
+rotation does not establish an optimal worker count for other workloads.
+
+The complete 300-step file-mode reference used 36.0 and 37.3 CPU seconds
+for remote decoding plus analysis. The separate 300-step compressed
+serial run at 200 ms used 6.2 CPU seconds on the analyzer. The node-side
+probe and publisher plus agent used approximately 0.79 logical CPUs
+during timed steps in that compressed run. These are job-level observations,
+with one run for each long comparison setting. The experiments used a
+single training node and describe functional coverage and observed CPU
+and transport costs at that scale.
+
+## Deferred channel decoding and Tree root candidates
+
+Two eager and two deferred passes ran in eager, deferred, deferred, eager
+order. The unchanged compressed transport pulled from a separate
+eight-H100 FSDP node. Analysis used four decode workers, 200 ms polling
+and a 65,536-record buffer. Every 1,500-step pass received exactly 312,016
+rank completions with no coverage gaps. All 12,000 rank-step loss values
+matched the first pass.
+
+| Online decode path | Analyzer CPU seconds per pass | Maximum unread records per pass |
+|---|---|---|
+| Eager | 56.20 / 56.58 | 12,859 / 24,307 |
+| Deferred | 31.52 / 31.87 | 7,822 / 40,760 |
+
+Deferring the detailed metrics reduced mean analyzer CPU time by 44%
+in this comparison. All four passes had full event coverage and transferred
+130.93–131.18 MiB of compressed payload. Peak unread backlog varied between
+7,822 and 40,760 records. The deferred path saw both endpoints of this range.
+
+Tree layer results are now reported as candidates. The online analyzer
+uses cross-channel S1 votes for communicator-level attribution, using
+complete classified group evidence from the same operation and slow
+window. Evidence from different operations, missing groups and
+non-unique votes leave the communicator root undetermined.
+
+A replay of the previous two-node Tree/Simple traces ran all six held-out
+S1 injections and three controls through the online state machine. In
+each injection the rank with the longest duration in the selected round
+was a different rank from the injected one. The aggregated S1 candidate
+matched the injected rank in all six. The three controls produced no
+slow candidates. The separate strong S2 trial produced local candidate
+groups and no communicator-level root. These are replays of recorded
+traces with the frozen configuration and two injected S1 ranks.
+
+Slurm job 16396 exercised the full NCCL 2.24.3 build through the live
+binary transport on two eight-H100 nodes. It ran 64 MiB Tree/Simple
+AllReduce with three warmup and three measured rounds per case. All
+96 rank completions per case arrived and passed numerical verification.
+The control emitted zero slow results. With a 3 s delay before the last
+three collectives at rank 3, all 14 eligible channels gave that rank the
+S1 vote for the confirmed candidate. Both cases finished without coverage
+gaps. A separate analysis process ran on one of the two training nodes.
+This functional test used 200 ms pulls, a 1 s slow window and two detections
+for confirmation.
+
+## Batch aggregation of completed progress
+
+Jobs 16397 and 16398 ran two ordinary and two coalesced analyzer passes in
+ABBA order. An eight-H100 FSDP trainer used the same Ring/Simple NCCL
+build for each 1,500-step pass. The separate analyzer used four decode
+workers, a 200 ms idle poll and 65,536 records of retention.
+Every pass received 312,016 rank completions with complete coverage,
+and all 12,000 rank-step loss checks matched the reference.
+
+| Analyzer | Batch apply CPU seconds per pass | Total analyzer CPU seconds per pass | Peak unread records | Receive-to-apply P99 (ms) |
+|---|---|---|---|---|
+| Ordinary | 1.79 / 1.72 | 29.30 / 27.62 | 7,804 / 12,617 | 293.2 / 288.0 |
+| Coalesced | 1.31 / 1.25 | 29.34 / 28.68 | 7,134 / 8,335 | 288.7 / 285.6 |
+
+The workers folded about 307,000 superseded entry states per coalesced
+pass, keeping logical event counts and the completed channel evidence.
+The coordinator used 27% less CPU for batch application and evaluation.
+Worker CPU increased and total analyzer CPU stayed near 28–29 seconds.
+Peak unread counts were lower in both pairs, with training step duration
+varying across runs. Receive-to-apply timing covers time after the
+analyzer accepts a batch, including its wait for the next pull iteration.
+
+CPU-only replay job 16400 read one archived 300-step FSDP capture.
+Each pass applied the same 187,326 binary records in the same batches
+and received 62,416 rank completions. The logical event counts and the
+one preliminary slow finding agreed across all four passes. The file
+sink terminates at EOF. After validating expected completions and
+rank coverage, the replay supplies eight end markers to release the
+remaining window state. Coalescing reduced coordinator batch-apply
+CPU from 1.16–1.17 to 0.97–0.98 s on this fixed input. Either path
+can be selected for future runtime tests.
+
+## Online release validation
+
+Slurm job 16401 ran the full NCCL 2.24.3 build on two eight-H100 nodes
+with four decode workers and `--coalesce-completed`. Each case used
+64 MiB AllReduce and the Simple protocol. Its analysis process ran on
+one of the training nodes. The preflight observed idle compute processes
+on one node. The cases check diagnostic and numerical behavior.
+
+| Case | Verified rank completions | Diagnostic result |
+|---|---:|---|
+| Tree control | 96 | No alerts |
+| Tree, 3 s delay at rank 3 on three rounds | 96 | S1 rank 3 with all 14 comparable channels voting for it |
+| Ring, 12 s delay at rank 3 on the final round | 64 | H1 rank 3 during the delay, followed by a recovery report |
+
+All three cases had complete event coverage. In the Ring case the H1
+report appeared 5.33 s after the injected-delay marker at a 5 s threshold.
+The injector and analyzer shared the same host clock for that observation.
+
 ## Two-node collective and training checks
 
 On 2026-11-19, the full, non-fault-injection NCCL build was exercised on two

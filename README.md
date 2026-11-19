@@ -10,12 +10,12 @@ slow and hanging collective operations. It is based on NVIDIA NCCL
 ## What is included
 
 - NCCL source with opt-in mapped-host progress counters, per-communicator host
-  probing, asynchronous binary trace writing, and periodic hang snapshots.
+  probing, asynchronous telemetry delivery, and periodic hang snapshots.
 - An optional Ring-only wait counter and a three-completed-operation
   volume-normalized ranking rule, gated on a confirmed slow diagnosis.
-- A binary trace decoder, a paper-inspired hang/slow analyzer, a one-shot live
-  Ring observer, PyTorch collective and FSDP training examples, unit tests,
-  and a Slurm example.
+- A node agent and an independent online hang/slow analyzer that pulls
+  telemetry from memory, tools for offline trace replay, a one-shot live Ring
+  observer, PyTorch training examples, and tests.
 - The ordered patches in [ccld/patches](ccld/patches/README.md), so the
   modifications can be reviewed against the original NCCL release.
 
@@ -100,61 +100,30 @@ only when all eligible channels agree. Other outcomes remain available as
 
 ## Example: FSDP model training
 
-The following example trains a synthetic causal decoder with FSDP, bfloat16,
-and AdamW on eight GPUs. It runs the decoder and base analyzer alongside
-training. Start in the repository root with CUDA-enabled PyTorch installed and
-use a fresh output directory:
+The Slurm example trains a synthetic causal decoder with FSDP, bfloat16 and
+AdamW on two nodes. Each training node keeps its NCCL events in a memory
+buffer. The analyzer runs as a separate process on the batch host for this
+example and retrieves new events from every node over the job network.
+Activate your CUDA-enabled PyTorch environment, build NCCL, and submit with
+your site account and partition:
 
 ```bash
-export CCLD_RUN="$PWD/runs/fsdp-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$CCLD_RUN/bin" "$CCLD_RUN/jsonl" "$CCLD_RUN/workload"
-export LD_LIBRARY_PATH="$PWD/build/lib:${LD_LIBRARY_PATH:-}"
-export LD_PRELOAD="$PWD/build/lib/libnccl.so.2"
-export NCCL_ALGO=Ring NCCL_PROTO=Simple
-export NCCL_CCLD_ENABLE=1 NCCL_CCLD_MODE=1 NCCL_CCLD_WAIT_ENABLE=1
-export NCCL_CCLD_POLL_US=200 NCCL_CCLD_FRAME_BLOCKS=32
-export NCCL_CCLD_QUEUE_SLOTS=2048 NCCL_CCLD_COMPLETION=event
-export NCCL_CCLD_OUT_DIR="$CCLD_RUN/bin"
-
-python3 ccld/tools/decode_async_wait.py "$CCLD_RUN/bin" "$CCLD_RUN/jsonl" --follow &
-decoder=$!
-python3 ccld/analyzer/ccld_analyze.py "$CCLD_RUN/jsonl" --follow \
-  --baseline-ms 1 --baseline-rounds 20 --baseline-skip 2 \
-  --window-s 1 --repeats 2 --poll-s 0.2 > "$CCLD_RUN/diagnosis.jsonl" &
-analyzer=$!
-torchrun --standalone --nnodes=1 --nproc-per-node=8 \
-  ccld/experiments/fsdp_train.py --profile medium --steps 20 \
-  --output-dir "$CCLD_RUN/workload" --expect-nccl-prefix "$PWD/build/lib"
-kill "$decoder"; wait "$decoder"
-sleep 1
-kill "$analyzer"; wait "$analyzer" 2>/dev/null || true
+export CCLD_ROOT="$PWD"
+sbatch --account YOUR_ACCOUNT --partition YOUR_GPU_PARTITION ccld/slurm/fsdp_train.sh
 ```
 
-The example checks the NCCL library mapped by every rank and writes per-rank
-losses, step times and CPU affinity to `workload/`. The `medium` profile has
-approximately 117 million parameters; `smoke` is a smaller setup check. The
-tokens are synthetic, so the loss is useful for checking run consistency
-rather than model quality. Choose analysis windows and baseline values for
-your workload.
+The script writes analyzer decisions and a final event summary to
+`diagnosis.log`, and each rank's loss, step times and loaded NCCL library to
+`workload/`. It defaults to eight GPUs per node and 32 probe frames. Set
+`CCLD_GPUS_PER_NODE`, `CCLD_PROFILE`, `CCLD_STEPS`, `CCLD_RUN` or
+`NCCL_CCLD_FRAME_BLOCKS` before submission to change those settings.
+The `medium` profile has approximately 117 million parameters and `smoke`
+is a smaller setup check. The model uses synthetic tokens to check training
+consistency.
 
-To monitor an existing PyTorch training job, enable the same NCCL environment
-on every rank, launch the training command as usual, and run the decoder and
-base analyzer on its trace directory. The covered operations are Ring
-AllReduce, AllGather and ReduceScatter, and Tree AllReduce. For multiple nodes,
-use a directory visible to the observer and every rank. On Linux, check
-`/proc/<training-pid>/maps` for the mapped `libnccl.so` when using your own
-workload. The one-shot Ring observer above is a separate example for its
-specified eight-rank AllReduce workload.
-
-For a two-node Slurm launch, activate the PyTorch environment, set
-`CCLD_ROOT` to the shared repository path, and submit
-[ccld/slurm/fsdp_train.sh](ccld/slurm/fsdp_train.sh) with your site's
-account, partition and GPU resource options. The script uses eight GPUs per
-node by default; `CCLD_GPUS_PER_NODE`, `CCLD_PROFILE`, `CCLD_STEPS`, and
-`CCLD_RUN` can be set before submission. The default 32 probe frames can be
-changed through `NCCL_CCLD_FRAME_BLOCKS`. Adjust the CPU request to the site
-and workload so the training workers and NCCL/monitoring threads have room to
-run; [RESULTS.md](RESULTS.md) includes an example CPU allocation comparison.
+To run the analyzer on a dedicated CPU host or use an existing training
+command, follow the [online deployment guide](ccld/docs/live.md). In that
+deployment the analyzer needs the node endpoints, a job token and Python.
 
 ## Validation
 

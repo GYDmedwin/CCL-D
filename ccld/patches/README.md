@@ -7,8 +7,9 @@ lexicographic order. Gaps in numbering reflect omitted experiments.
 
 The series adds base probes, compile-time-gated bounded fault simulations,
 ReduceScatter Ring probing, configurable frames and queues, event completion,
-binary asynchronous writing, and finally the optional Ring wait counters.
-The fault simulations are compiled out of the ordinary build.
+binary asynchronous writing, optional Ring wait counters, and a node-local
+socket sink for online analysis. The fault simulations are compiled out of the
+ordinary build.
 
 From this repository's root, with `UPSTREAM_NCCL` pointing to a clean checkout:
 

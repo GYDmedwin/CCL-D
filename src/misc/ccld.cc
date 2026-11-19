@@ -1,6 +1,7 @@
 #include "ccld.h"
 #include "ccld_log.h"
 #include "ccld_queue.h"
+#include "ccld_stream.h"
 #include "comm.h"
 #include "info.h"
 #include "collectives.h"
@@ -66,6 +67,7 @@ struct CcldState {
   std::atomic<int> callbacksOutstanding{0};
   std::atomic<uint64_t> counter{0}, logDrops{0}, lastDroppedSeq{0};
   FILE* out = nullptr;
+  CcldNodeStream nodeStream;
   CcldFrame* frame = nullptr;
   CcldFrame* device = nullptr;
   CcldWaitChannel* waitFrame = nullptr;
@@ -87,6 +89,7 @@ struct CcldState {
   uint64_t faultKind = 0, faultRank = UINT64_MAX, faultOp = 0, faultCycles = 0, faultRepeats = 1;
 #endif
   int rank = 0, nranks = 0;
+  ~CcldState() { if (out) fclose(out); }
 };
 struct CcldCallback { CcldState* state; int slot; };
 
@@ -131,14 +134,25 @@ static void ccldWriter(CcldState* s) {
     }
     while (n < 16 && s->logQueue->pop(batch[n])) ++n;
     if (n) {
-      if (fwrite(batch, sizeof(CcldLogEvent), n, s->out) != n || fflush(s->out) != 0) {
-        if (!s->ioFailed.exchange(true)) WARN("CCL-D binary trace write failed");
+      if (s->ioFailed.load(std::memory_order_relaxed)) continue;
+      const bool sent = s->out ?
+          (fwrite(batch, sizeof(CcldLogEvent), n, s->out) == n && fflush(s->out) == 0) :
+          s->nodeStream.write(batch, n * sizeof(CcldLogEvent));
+      if (!sent) {
+        s->ioFailed.store(true, std::memory_order_relaxed);
+        s->nodeStream.close();
+        WARN("CCL-D telemetry writer lost its sink");
       }
     } else if (s->writerStop.load(std::memory_order_acquire)) {
       break;
     } else {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+  }
+  if (!s->out && !s->ioFailed.load(std::memory_order_relaxed)) {
+    CcldLogEvent end = ccldLogBase(s, CcldLogEnd, s->counter.load(std::memory_order_relaxed), ccldNow());
+    if (!s->nodeStream.write(&end, sizeof(end))) WARN("CCL-D could not deliver final telemetry marker");
+    s->nodeStream.close();
   }
 }
 static uint64_t ccldLoad(const uint64_t* p) {
@@ -271,8 +285,10 @@ void ccldInit(ncclComm* comm) {
     return;
   }
   const char* dir = getenv("NCCL_CCLD_OUT_DIR");
-  if (!dir || !*dir) {
-    WARN("CCL-D requires an existing NCCL_CCLD_OUT_DIR; telemetry disabled");
+  const char* nodeSocket = getenv("NCCL_CCLD_NODE_SOCKET");
+  const bool inMemory = nodeSocket && *nodeSocket;
+  if (!inMemory && (!dir || !*dir)) {
+    WARN("CCL-D requires NCCL_CCLD_NODE_SOCKET or NCCL_CCLD_OUT_DIR; telemetry disabled");
     return;
   }
   CcldState* s = new CcldState();
@@ -304,14 +320,20 @@ void ccldInit(ncclComm* comm) {
 #endif
   s->pollUs = envNumber("NCCL_CCLD_POLL_US", 200, 20, 1000000);
   s->dumpNs = envNumber("NCCL_CCLD_DUMP_MS", 1000, 10, 60000) * 1000000ull;
-  char path[4096];
-  int n = snprintf(path, sizeof(path), "%s/ccld-%016" PRIx64 "-rank%d-pid%ld.ccldbin", dir, s->hash, s->rank, (long)getpid());
-  if (n < 0 || size_t(n) >= sizeof(path) || (s->out = fopen(path, "wb")) == nullptr) {
-    WARN("CCL-D cannot open output; telemetry disabled"); delete s; return;
+  if (inMemory) {
+    if (!s->nodeStream.open(nodeSocket)) {
+      WARN("CCL-D cannot connect to local node agent; telemetry disabled"); delete s; return;
+    }
+  } else {
+    char path[4096];
+    int n = snprintf(path, sizeof(path), "%s/ccld-%016" PRIx64 "-rank%d-pid%ld.ccldbin", dir, s->hash, s->rank, (long)getpid());
+    if (n < 0 || size_t(n) >= sizeof(path) || (s->out = fopen(path, "wb")) == nullptr) {
+      WARN("CCL-D cannot open output; telemetry disabled"); delete s; return;
+    }
   }
   if (comm->nChannels < 1 || comm->nChannels > CCLD_MAX_CHANNELS) {
     WARN("CCL-D channel count is outside the supported frame range");
-    fclose(s->out); delete s; return;
+    delete s; return;
   }
   s->frameChannels = unsigned(comm->nChannels);
   const char* selectedAlgo = getenv("NCCL_ALGO");
@@ -322,7 +344,7 @@ void ccldInit(ncclComm* comm) {
   s->slots.reset(new (std::nothrow) CcldSlot[s->frameBlocks]);
   if (!s->slots) {
     WARN("CCL-D frame slot metadata allocation failed");
-    fclose(s->out); delete s; return;
+    delete s; return;
   }
   s->frameBytes = ccldFrameBytes(s->frameChannels, s->frameGroups, s->frameBlocks);
   cudaError_t err = cudaHostAlloc((void**)&s->frame, s->frameBytes, cudaHostAllocMapped);
@@ -330,7 +352,7 @@ void ccldInit(ncclComm* comm) {
   if (err != cudaSuccess) {
     WARN("CCL-D mapped allocation failed: %s", cudaGetErrorString(err));
     if (s->frame) cudaFreeHost(s->frame);
-    fclose(s->out); delete s; return;
+    delete s; return;
   }
   if (waitRequested && s->frameGroups == 1) {
     s->waitBlockBytes = size_t(s->frameChannels) * s->frameGroups * sizeof(CcldWaitChannel);
@@ -340,7 +362,7 @@ void ccldInit(ncclComm* comm) {
     if (err != cudaSuccess) {
       WARN("CCL-D wait frame allocation failed: %s", cudaGetErrorString(err));
       if (s->waitFrame) cudaFreeHost(s->waitFrame);
-      cudaFreeHost(s->frame); fclose(s->out); delete s; return;
+      cudaFreeHost(s->frame); delete s; return;
     }
     memset(s->waitFrame, 0, s->waitBytes);
   }
@@ -351,7 +373,7 @@ void ccldInit(ncclComm* comm) {
         WARN("CCL-D event allocation failed: %s", cudaGetErrorString(err));
         for (unsigned j = 0; j < i; ++j) cudaEventDestroy(s->slots[j].completionEvent);
         if (s->waitFrame) cudaFreeHost(s->waitFrame);
-        cudaFreeHost(s->frame); fclose(s->out); delete s; return;
+        cudaFreeHost(s->frame); delete s; return;
       }
     }
   }
@@ -375,7 +397,7 @@ void ccldInit(ncclComm* comm) {
     if (s->writer.joinable()) s->writer.join();
     if (s->useEvent) for (unsigned i = 0; i < s->frameBlocks; ++i) cudaEventDestroy(s->slots[i].completionEvent);
     if (s->waitFrame) cudaFreeHost(s->waitFrame);
-    cudaFreeHost(s->frame); fclose(s->out); delete s; return;
+    cudaFreeHost(s->frame); delete s; return;
   }
   comm->ccldState = s;
 }
@@ -541,7 +563,10 @@ void ccldFree(ncclComm* comm) {
   bool active = false;
   for (unsigned i = 0; i < s->frameBlocks; ++i) active |= s->slots[i].phase.load(std::memory_order_acquire) != 0;
   active |= s->callbacksOutstanding.load(std::memory_order_acquire) != 0;
-  fclose(s->out);
+  if (s->out) {
+    fclose(s->out);
+    s->out = nullptr;
+  }
   comm->ccldState = nullptr;
   if (active) {
     // An aborted/erroring CUDA stream may suppress callbacks. Keep storage alive

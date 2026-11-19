@@ -10,19 +10,23 @@ import time
 
 REPRO = Path(os.environ.get('CCLD_REPRO_ROOT', Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(REPRO / 'tools'))
-from decode_ccld_binary import Event, RECORD_BYTES, decode_record, text
+if __package__:
+    from .decode_ccld_binary import (Event, RECORD_BYTES, WAIT_CHANNEL_FIELDS, channel_payload,
+                                     decode_event, parse_event, text)
+else:
+    from decode_ccld_binary import (Event, RECORD_BYTES, WAIT_CHANNEL_FIELDS, channel_payload,
+                                    decode_event, parse_event, text)
 
 
 class WaitDecoder:
     """Join a wait record with its matching snapshot/completion before output."""
 
-    def __init__(self):
+    def __init__(self, defer_channels=False):
         self.pending = {}
+        self.defer_channels = defer_channels
 
     def consume(self, raw):
-        if len(raw) != RECORD_BYTES:
-            raise ValueError('incomplete binary record')
-        e = Event.from_buffer_copy(raw)
+        e = parse_event(raw)
         if e.type == 1 and e.startNs:
             raise ValueError('new device-frame format requires decode_frame_wait.py')
         if e.type == 7:
@@ -32,28 +36,29 @@ class WaitDecoder:
             key = (e.hash, e.rank, e.seq, e.nowNs, e.reserved)
             if key in self.pending or len(self.pending) >= 4096:
                 raise ValueError('duplicate or excessive unmatched Ring-wait records')
-            values = {}
-            for channel in e.channels[:e.nChannels]:
-                if (channel.id in values or not 0 <= channel.id < 32 or not 0 <= channel.parent < e.nranks or
-                        channel.sendChanges >= e.nranks):
+            payload = channel_payload(raw, e.nChannels)
+            ids = set()
+            for cid, prev, _, _, nxt in WAIT_CHANNEL_FIELDS.iter_unpack(payload):
+                if cid in ids or not 0 <= cid < 32 or not 0 <= prev < e.nranks or nxt >= e.nranks:
                     raise ValueError('invalid Ring-wait channel or neighbor')
-                values[channel.id] = {'ring_prev': channel.parent, 'ring_next': channel.sendChanges,
-                                      'wait_data_spins': channel.send, 'wait_credit_spins': channel.recv}
-            self.pending[key] = values
+                ids.add(cid)
+            self.pending[key] = (ids, payload)
             return None
-        record = decode_record(raw)
+        record = decode_event(e, raw)
         if e.type == 1:
             record['wait_frame_bytes'] = e.count
             record['wait_requested'] = bool(e.count)
         elif e.type in (3, 4):
+            channels = record['channels']
             record['wait_probe'] = text(e.reason) == 'ring_wait_v1'
             if record['wait_probe']:
                 key = (e.hash, e.rank, e.seq, e.nowNs, e.type)
-                values = self.pending.pop(key, None)
-                if values is None or set(values) != {c['id'] for c in record['channels']}:
+                wait = self.pending.pop(key, None)
+                if wait is None or wait[0] != channels.parents().keys():
                     raise ValueError('missing or inconsistent Ring-wait pair')
-                for channel in record['channels']:
-                    channel.update(values[channel['id']])
+                channels.wait_payload = wait[1]
+            if not self.defer_channels:
+                record['channels'] = list(channels)
         return record
 
     def finish(self):
@@ -84,6 +89,7 @@ def follow(source_dir, target_dir, interval, decoder_factory=WaitDecoder):
     previous = signal.signal(signal.SIGTERM, stop)
     try:
         while True:
+            final_pass = stopping
             for source in sorted(source_dir.glob('ccld-*.ccldbin')):
                 if source not in outputs:
                     outputs[source] = (target_dir / (source.stem + '.jsonl')).open('x')
@@ -93,7 +99,7 @@ def follow(source_dir, target_dir, interval, decoder_factory=WaitDecoder):
                     while True:
                         raw = stream.read(RECORD_BYTES)
                         if len(raw) < RECORD_BYTES:
-                            if stopping and raw:
+                            if final_pass and raw:
                                 raise ValueError(f'{source}: incomplete final binary record')
                             break
                         record = decoders[source].consume(raw)
@@ -101,11 +107,12 @@ def follow(source_dir, target_dir, interval, decoder_factory=WaitDecoder):
                             outputs[source].write(json.dumps(record, ensure_ascii=False, sort_keys=True) + '\n')
                         offsets[source] += RECORD_BYTES
                 outputs[source].flush()
-            if stopping:
+            if final_pass:
                 for decoder in decoders.values():
                     decoder.finish()
                 return
-            time.sleep(interval)
+            if not stopping:
+                time.sleep(interval)
     finally:
         for output in outputs.values():
             output.close()

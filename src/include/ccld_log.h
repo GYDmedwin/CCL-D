@@ -11,7 +11,7 @@
 enum CcldLogType : uint32_t {
   CcldLogInit = 1, CcldLogEntered = 2, CcldLogSnapshot = 3,
   CcldLogComplete = 4, CcldLogHeartbeat = 5, CcldLogDropped = 6,
-  CcldLogRingWait = 7
+  CcldLogRingWait = 7, CcldLogEnd = 8
 };
 struct CcldLogChannel {
   int32_t id, parent;

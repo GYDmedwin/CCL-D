@@ -5,6 +5,7 @@ import ctypes
 import json
 from pathlib import Path
 import signal
+import struct
 import time
 
 
@@ -34,17 +35,77 @@ class Event(ctypes.LittleEndianStructure):
 RECORD_BYTES = 2088
 assert ctypes.sizeof(Channel) == 56 and ctypes.sizeof(Event) == RECORD_BYTES
 KINDS = {1: 'comm_init', 2: 'entered', 3: 'snapshot', 4: 'complete', 5: 'heartbeat',
-         6: 'dropped', 7: 'coverage_gap'}
+         6: 'dropped', 7: 'coverage_gap', 8: 'comm_end'}
+CHANNEL_FIELDS = struct.Struct('<ii6Q')
+CHANNEL_PARENTS = struct.Struct('<ii48x')
+WAIT_CHANNEL_FIELDS = struct.Struct('<ii3Q24x')
+assert ctypes.sizeof(Channel) == CHANNEL_FIELDS.size == CHANNEL_PARENTS.size == WAIT_CHANNEL_FIELDS.size
+
+
+def channel_payload(raw, n_channels):
+    offset = Event.channels.offset
+    return bytes(raw[offset:offset + n_channels * CHANNEL_FIELDS.size])
+
+
+class ChannelMetrics:
+    """Keep binary channel data compact until a decision needs its metrics."""
+    __slots__ = ('payload', 'window_ns', 'wait_payload', '_decoded')
+
+    def __init__(self, payload, window_ns, wait_payload=None):
+        self.payload = payload
+        self.window_ns = window_ns
+        self.wait_payload = wait_payload
+        self._decoded = None
+
+    def __reduce__(self):
+        return (type(self), (self.payload, self.window_ns, self.wait_payload))
+
+    def parents(self):
+        return dict(CHANNEL_PARENTS.iter_unpack(self.payload))
+
+    def __len__(self):
+        return len(self.payload) // CHANNEL_FIELDS.size
+
+    def __iter__(self):
+        return iter(self._metrics())
+
+    def __getitem__(self, index):
+        return self._metrics()[index]
+
+    def _metrics(self):
+        if self._decoded is None:
+            wait = {}
+            if self.wait_payload is not None:
+                wait = {cid: (prev, nxt, data, credit)
+                        for cid, prev, data, credit, nxt in WAIT_CHANNEL_FIELDS.iter_unpack(self.wait_payload)}
+            channels = []
+            for cid, parent, send, recv, send_changes, recv_changes, send_delta, recv_delta in CHANNEL_FIELDS.iter_unpack(self.payload):
+                channel = {'id': cid, 'tree_parent': parent,
+                           'send_count': send, 'recv_count': recv,
+                           'send_rate': 1 / send_changes if send_changes else None,
+                           'recv_rate': 1 / recv_changes if recv_changes else None,
+                           'send_delta_per_ms': send_delta * 1e6 / self.window_ns,
+                           'recv_delta_per_ms': recv_delta * 1e6 / self.window_ns}
+                if wait:
+                    prev, nxt, data, credit = wait[cid]
+                    channel.update(ring_prev=prev, ring_next=nxt, wait_data_spins=data,
+                                   wait_credit_spins=credit)
+                channels.append(channel)
+            self._decoded = channels
+        return self._decoded
 
 
 def text(value):
     return bytes(value).split(b'\0', 1)[0].decode('utf-8')
 
 
-def decode_record(raw):
+def parse_event(raw):
     if len(raw) != RECORD_BYTES:
         raise ValueError('incomplete CCL-D binary record')
-    e = Event.from_buffer_copy(raw)
+    return Event.from_buffer_copy(raw)
+
+
+def decode_event(e, raw):
     if (e.magic != 0x444c4343 or e.version != 1 or e.type not in KINDS or
             e.nranks < 1 or e.rank >= e.nranks or e.nChannels > 32):
         raise ValueError('invalid CCL-D binary header')
@@ -62,14 +123,7 @@ def decode_record(raw):
         if e.windowNs == 0 or e.nChannels == 0:
             raise ValueError('invalid channel snapshot dimensions')
         duration = max(0, e.nowNs - e.startNs)
-        channels = []
-        for channel in e.channels[:e.nChannels]:
-            channels.append({'id': channel.id, 'tree_parent': channel.parent,
-                             'send_count': channel.send, 'recv_count': channel.recv,
-                             'send_rate': 1 / channel.sendChanges if channel.sendChanges else None,
-                             'recv_rate': 1 / channel.recvChanges if channel.recvChanges else None,
-                             'send_delta_per_ms': channel.sendDelta * 1e6 / e.windowNs,
-                             'recv_delta_per_ms': channel.recvDelta * 1e6 / e.windowNs})
+        channels = ChannelMetrics(channel_payload(raw, e.nChannels), e.windowNs)
         result.update(start_mono_ns=e.startNs, duration_ns=duration, op=text(e.op),
                       algorithm=text(e.algorithm), protocol=text(e.protocol), datatype=text(e.datatype),
                       count=e.count, bytes=e.bytes, n_channels=e.nChannels, channels=channels)
@@ -83,6 +137,13 @@ def decode_record(raw):
         if e.type == 6 and result['reason'] == 'binary_queue_overflow':
             result['dropped_records'] = e.count
     return result
+
+
+def decode_record(raw):
+    record = decode_event(parse_event(raw), raw)
+    if 'channels' in record:
+        record['channels'] = list(record['channels'])
+    return record
 
 
 def decode_file(source, target):

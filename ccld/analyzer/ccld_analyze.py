@@ -98,6 +98,13 @@ def channel_map(event: dict) -> dict[int, dict]:
     return result
 
 
+def channel_parents(event: dict) -> dict[int, int]:
+    parents = getattr(event.get('channels'), 'parents', None)
+    if parents is not None:
+        return parents()
+    return {cid: channel.get('tree_parent') for cid, channel in channel_map(event).items()}
+
+
 def operation_signature_partition(states: dict[int, dict], world_size: int) -> dict:
     """Separate inconsistent all-hung signatures only under a strict-majority assumption."""
     if set(states) != set(range(world_size)):
@@ -135,14 +142,14 @@ def comparable_groups(rank_events: dict[int, dict], world_size: int) -> tuple[li
         return [], [f'unsupported comparison algorithm: {algorithm}']
     if len(rank_events) != world_size:
         return [], ['tree topology requires observations from every rank']
-    channels = [channel_map(rank_events[r]) for r in range(world_size)]
+    channels = [channel_parents(rank_events[r]) for r in range(world_size)]
     ids = set(channels[0])
     if not ids or any(set(c) != ids for c in channels):
         return [], ['tree channel sets are missing or unequal']
     groups: list[tuple[str, list[int], int | None]] = []
     errors: list[str] = []
     for cid in sorted(ids):
-        parent = {r: channels[r][cid].get('tree_parent') for r in range(world_size)}
+        parent = {r: channels[r][cid] for r in range(world_size)}
         if any(type(p) is not int or p < -1 or p >= world_size or p == r for r, p in parent.items()):
             errors.append(f'channel {cid}: invalid or absent tree_parent')
             continue
@@ -227,10 +234,42 @@ def min_candidates(scores: dict[int, float | None]) -> list[int]:
     return sorted(k for k, v in scores.items() if math.isclose(v, m, rel_tol=1e-12, abs_tol=1e-12))
 
 
-def result_common(comm: str, op_count: int, category: str) -> dict:
+def result_common(comm: str, op_count: int | None, category: str) -> dict:
     return {'comm_hash': comm, 'op_count': op_count, 'category': category,
             'detection_latency_ms': None, 'location_latency_ms': None,
             'timing_note': 'offline input has no analyzer-side fault/arrival timestamps'}
+
+
+def slow_decision(comm, op, states, label, window, members, cid, base, baseline, detections, cfg):
+    durs = {r: states[r]['duration_ns'] / 1e6 for r in members}
+    tmax, tmin = max(durs.values()), min(durs.values())
+    ratio = (tmax-base)/base
+    if ratio <= cfg.slow_threshold:
+        return None
+    detections[label] += 1
+    item = result_common(comm, op, 'slow')
+    item.update(group=label, window=int(window), t_base_ms=base, t_max_ms=tmax, t_min_ms=tmin,
+                slowdown_ratio=ratio, detections=detections[label], baseline=baseline)
+    if detections[label] < cfg.repeats:
+        item.update(kind='detected', roots=[], reason='waiting for repetition threshold')
+        return item
+    locate_start = time.perf_counter_ns()
+    p = (tmax-tmin)/(tmax-base)
+    comp = min_candidates(durs)
+    rates = comparable_rate_scores(states, members, cid, cfg.rate_metric)
+    comm_roots = min_candidates(rates)
+    if p > cfg.beta:
+        kind, roots = 'S1', comp
+    elif p < cfg.alpha:
+        kind, roots = ('S2', comm_roots) if comm_roots else ('undetermined', [])
+    else:
+        kind, roots = ('S3', sorted(set(comp+comm_roots))) if comm_roots else ('undetermined', [])
+    item.update(kind=kind, roots=roots, p=p, compute_roots=comp,
+                communication_roots=comm_roots, rate_metric=cfg.rate_metric, rate_scores=rates)
+    if p < 0 or p > 1:
+        item['baseline_warning'] = 'P is outside [0,1]; baseline is outside the observed duration range'
+    item['location_latency_ms'] = (time.perf_counter_ns() - locate_start) / 1e6
+    return item
 
 
 def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
@@ -424,36 +463,10 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
             continue
         _, op, states, members, cid, t = max(entries, key=lambda x: (x[0], -x[1]))
         base = dynamic_base if baseline_ready_ns is not None and t > baseline_ready_ns else cfg.baseline_ms
-        durs = {r: states[r]['duration_ns'] / 1e6 for r in members}
-        tmax, tmin = max(durs.values()), min(durs.values())
-        ratio = (tmax-base)/base
-        if ratio <= cfg.slow_threshold:
-            continue
-        detections[label] += 1
-        item = result_common(comm, op, 'slow')
-        item.update(group=label, window=int(window), t_base_ms=base, t_max_ms=tmax, t_min_ms=tmin,
-                    slowdown_ratio=ratio, detections=detections[label],
-                    baseline='dynamic' if base == dynamic_base and baseline_ready_ns is not None and t > baseline_ready_ns else 'initial')
-        if detections[label] < cfg.repeats:
-            item.update(kind='detected', roots=[], reason='waiting for repetition threshold')
-        else:
-            locate_start = time.perf_counter_ns()
-            p = (tmax-tmin)/(tmax-base)
-            comp = min_candidates(durs)
-            rates = comparable_rate_scores(states, members, cid, cfg.rate_metric)
-            comm_roots = min_candidates(rates)
-            if p > cfg.beta:
-                kind, roots = 'S1', comp
-            elif p < cfg.alpha:
-                kind, roots = ('S2', comm_roots) if comm_roots else ('undetermined', [])
-            else:
-                kind, roots = ('S3', sorted(set(comp+comm_roots))) if comm_roots else ('undetermined', [])
-            item.update(kind=kind, roots=roots, p=p, compute_roots=comp,
-                        communication_roots=comm_roots, rate_metric=cfg.rate_metric, rate_scores=rates)
-            if p < 0 or p > 1:
-                item['baseline_warning'] = 'P is outside [0,1]; baseline is outside the observed duration range'
-            item['location_latency_ms'] = (time.perf_counter_ns() - locate_start) / 1e6
-        output.append(item)
+        baseline = 'dynamic' if base == dynamic_base and baseline_ready_ns is not None and t > baseline_ready_ns else 'initial'
+        item = slow_decision(comm, op, states, label, window, members, cid, base, baseline, detections, cfg)
+        if item:
+            output.append(item)
     return output
 
 
@@ -515,9 +528,7 @@ def load_fault_markers(paths: list[Path]) -> list[dict]:
     return markers
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('paths', nargs='+', type=Path, help='JSONL files or directories (searched recursively)')
+def add_decision_arguments(p):
     p.add_argument('--hang-s', type=float, default=300)
     p.add_argument('--window-s', type=float, default=60)
     p.add_argument('--baseline-ms', type=float, required=True)
@@ -529,16 +540,31 @@ def main() -> int:
     p.add_argument('--baseline-skip', type=int, default=0, help='exclude initial warmup rounds from dynamic baseline')
     p.add_argument('--baseline-s', type=float, default=120)
     p.add_argument('--rate-metric', choices=('paper', 'delta'), default='paper')
+
+
+def decision_config(p, args, flush_last_window=False):
+    if (any(not math.isfinite(x) or x <= 0 for x in (args.hang_s, args.window_s, args.baseline_ms, args.baseline_s)) or
+            not math.isfinite(args.slow_threshold) or args.slow_threshold < 0 or
+            args.repeats < 1 or args.baseline_rounds < 1 or args.baseline_skip < 0 or
+            not (0 <= args.alpha < args.beta <= 1)):
+        p.error('durations, baseline and counts must be positive; require 0 <= alpha < beta <= 1')
+    return Config(args.hang_s, args.window_s, args.baseline_ms, args.slow_threshold,
+                  args.repeats, args.alpha, args.beta, args.baseline_rounds, args.baseline_s,
+                  args.rate_metric, flush_last_window, args.baseline_skip)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('paths', nargs='+', type=Path, help='JSONL files or directories (searched recursively)')
+    add_decision_arguments(p)
     p.add_argument('--flush-last-window', action='store_true', help='analyze incomplete last window (offline experiments)')
     p.add_argument('--follow', action='store_true', help='poll for complete new JSONL lines')
     p.add_argument('--fault-events', nargs='*', type=Path, default=[], help='injector .ndjson files/directories for same-host live latency')
     p.add_argument('--poll-s', type=float, default=1)
     args = p.parse_args()
-    if min(args.hang_s, args.window_s, args.baseline_ms, args.baseline_s, args.poll_s) <= 0 or args.repeats < 1 or args.baseline_rounds < 1 or args.baseline_skip < 0 or not (0 <= args.alpha < args.beta <= 1):
-        p.error('durations, baseline and counts must be positive; require 0 <= alpha < beta <= 1')
-    cfg = Config(args.hang_s, args.window_s, args.baseline_ms, args.slow_threshold,
-                 args.repeats, args.alpha, args.beta, args.baseline_rounds, args.baseline_s,
-                 args.rate_metric, args.flush_last_window, args.baseline_skip)
+    if not math.isfinite(args.poll_s) or args.poll_s <= 0:
+        p.error('--poll-s must be positive')
+    cfg = decision_config(p, args, args.flush_last_window)
     emitted = set()
     reported_problems = set()
     while True:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline Tree S1 candidate from complete per-channel group decisions.
+"""Tree S1 candidate from complete per-channel group decisions.
 
 This optional second stage is applied only after the base slow analyzer has
 confirmed and classified a complete group window. It does not diagnose S2,
@@ -10,7 +10,10 @@ from collections import Counter, defaultdict
 import json
 from pathlib import Path
 
-from ccld_analyze import comparable_groups, load_records
+if __package__:
+    from .ccld_analyze import comparable_groups, load_records
+else:
+    from ccld_analyze import comparable_groups, load_records
 
 CLASSIFIED = {'S1', 'S2', 'S3', 'undetermined'}
 

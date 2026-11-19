@@ -104,6 +104,7 @@ def main():
     p.add_argument('--fault-rank', type=int, default=0)
     p.add_argument('--fault-iteration', type=int, default=3)
     p.add_argument('--sleep-ms', type=int, default=1000)
+    p.add_argument('--gap-ms', type=int, default=0, help='delay between collective rounds')
     p.add_argument('--hang-seconds', type=int, default=20)
     p.add_argument('--timeout-seconds', type=int, default=90)
     p.add_argument('--fault-log-dir', default='fault-events')
@@ -113,8 +114,8 @@ def main():
     args = p.parse_args()
     rank, world = int(os.environ['RANK']), int(os.environ['WORLD_SIZE'])
     local_rank = int(os.environ['LOCAL_RANK'])
-    if args.numel < 2 or args.iters < 1 or args.warmup < 0 or not 0 <= args.fault_rank < world:
-        p.error('invalid size, iteration count, or fault rank')
+    if args.numel < 2 or args.iters < 1 or args.warmup < 0 or args.gap_ms < 0 or not 0 <= args.fault_rank < world:
+        p.error('invalid size, iteration count, round delay, or fault rank')
     if args.fault == 'H2' and args.op != 'allreduce':
         p.error('H2 count mismatch is implemented only for AllReduce')
     profile = os.environ.get('CCLD_RESTRICTED_BUILD', '')
@@ -154,6 +155,8 @@ def main():
         if not mismatched_round and not verify(args.op, x, expected, args.numel, rank, world):
             raise RuntimeError(f'numerical verification failed rank={rank} iteration={iteration}')
         log_workload(args, rank, {'rank': rank, 'iteration': iteration, 'verified': not mismatched_round})
+        if args.gap_ms and iteration + 1 < args.warmup + args.iters:
+            time.sleep(args.gap_ms / 1000)
     dist.destroy_process_group()
 
 
