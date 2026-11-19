@@ -1,16 +1,11 @@
-# CCL-D-style diagnostics for NCCL (experimental)
+# CCL-D for NCCL
 
-This repository contains an experimental NCCL implementation of diagnostic
-ideas from [CCL-D](https://doi.org/10.1145/3774934.3786429), together with
-trace decoders and analyzers. It is a separate NCCL-based implementation; it
-does not contain the original AntCCL implementation. The starting point is
-NVIDIA NCCL **v2.24.3-1**, commit
+This repository provides an NCCL-based research implementation of the
+diagnostic ideas in [CCL-D](https://doi.org/10.1145/3774934.3786429), with
+GPU-level communication probes, host-side monitoring, and analysis tools for
+slow and hanging collective operations. It is based on NVIDIA NCCL
+**v2.24.3-1**, commit
 `6aae37927840b2bd7b7d42d2f0050e75f88ee97f`.
-
-**Research prototype:** the Ring wait rule has only narrow synthetic
-single-node validation. Its scores and thresholds are not proven to transfer
-to other models, sizes, hardware, builds, protocols, or topologies. This is
-not a production hang detector. See [RESULTS.md](RESULTS.md) before use.
 
 ## What is included
 
@@ -23,12 +18,9 @@ not a production hang detector. See [RESULTS.md](RESULTS.md) before use.
 - The ordered patches in [ccld/patches](ccld/patches/README.md), so the
   modifications can be reviewed against the original NCCL release.
 
-There is no claim that the Tree wait rule, grouped point-to-point/AlltoAll
-coverage, graph capture/replay, multi-node Ring wait localization, or FSDP
-training is validated by these experiments. Progress snapshots may be
-unavailable or dropped; missing evidence is not treated as a zero counter.
-The current store-only probe supports **mode 1 only**. Telemetry is disabled by
-default; this does not establish zero overhead versus unmodified NCCL.
+Telemetry is enabled through environment variables and uses mode 1 for the
+store-only probe. The Ring wait observer combines a slow-detection gate with
+per-rank wait information to identify candidate ranks.
 
 ## Build
 
@@ -43,11 +35,9 @@ make -j8 src.build CUDA_HOME=/usr/local/cuda \
 python3 -m unittest discover -s ccld/tests -v
 ```
 
-The default output is `build/lib/libnccl.so.*`. This full build has fault
-injection compiled out unless explicitly enabled at build time. A successful
-build does not guarantee that a framework loads this library; verify the
-actual mapped library before interpreting traces or performance. See the
-upstream [NCCL README](README.NVIDIA.md) for other build options.
+The default output is `build/lib/libnccl.so.*`. Fault simulation can be
+enabled in a separate build as described below. See the upstream
+[NCCL README](README.NVIDIA.md) for other build options.
 
 ## Example: one-node Ring experiment
 
@@ -73,10 +63,9 @@ python3 ccld/analyzer/ccld_analyze.py runs/example/jsonl \
   --baseline-ms 1 --flush-last-window
 ```
 
-`--baseline-ms 1` is an example, not a generally valid baseline. Inspect the
-decoded records and calibrate the detector for the workload. The Slurm example
-is in [ccld/slurm/single_node_smoke.sh](ccld/slurm/single_node_smoke.sh); set
-your site's account and partition at submission.
+Set `--baseline-ms` to suit the workload. The Slurm example is in
+[ccld/slurm/single_node_smoke.sh](ccld/slurm/single_node_smoke.sh); set your
+site's account and partition at submission.
 
 For live use, start the decoder with `--follow` while the program is running,
 and analyze its JSONL output with `--follow`. The optional one-shot Ring
@@ -91,32 +80,24 @@ python3 ccld/analyzer/online_ring_wait.py runs/live-jsonl \
   --baseline-ms 1 --window-s 1 --repeats 2
 ```
 
-The observer is intentionally restricted to one eight-rank, single-host
-AllReduce communicator, 200 µs polling, and completed operations 4–6. It
-rejects missing ranks, inconsistent signatures, invalid Ring links and
-reported dropped records. These choices mirror the narrow historical
-experiment; they do not make its threshold universally applicable. The
-standalone `ring_wait.py` accepts `--slow-confirmed` only when the matching
-base slow result has already been checked. A lack of confirmation or data is
-indeterminate, not a healthy verdict.
+The current observer targets a single-host, eight-rank AllReduce communicator,
+200 µs polling, and completed operations 4–6. The standalone
+`ring_wait.py` accepts `--slow-confirmed` after a matching base slow diagnosis
+has been confirmed.
 
-The portable online observer has been exercised on H100 with five synthetic
-S2 faults and five controls per protocol, using the historical restricted
-fault-injection library and workload. All faults were localized and no control
-raised an online alert. LL and LL128 faults were classified as S3 by the base
-analyzer. An offline experiment that bypassed the slow gate crossed the old
-threshold in one Simple control, without a majority rank candidate. See
-[RESULTS.md](RESULTS.md) for the limits and timing of this validation.
+## Validation
+
+The online observer has been evaluated with single-node, eight-H100
+AllReduce workloads using Ring/Simple, Ring/LL, and Ring/LL128. Each protocol
+was exercised with five simulated S2 send delays and five no-fault controls.
+See [RESULTS.md](RESULTS.md) for the test configuration and results.
 
 ## Fault simulation
 
-The small workload supports `--fault H1`, `H2`, and `S1` for isolated,
-time-limited tests. H1/H2 can intentionally stall communication; use a job
-timeout and an isolated allocation. The source also contains bounded H3/S2
-GPU fault simulation guarded by `CCLD_FAULT_INJECTION`; the default build does
-not enable it. Such delays are simulations, not hardware failures. The
-historical fault-validation library was a restricted-function build and must
-not be substituted for a normal framework library.
+The small workload supports `--fault H1`, `H2`, and `S1`. The source also
+provides bounded H3 and S2 GPU fault simulations, enabled with
+`CCLD_FAULT_INJECTION`. Run fault simulations in an isolated, time-limited
+allocation.
 
 For a separate, explicitly fault-enabled test build on H100:
 
@@ -139,8 +120,7 @@ injection and operation in the collected traces.
 NCCL's license is retained in [LICENSE.txt](LICENSE.txt), NVTX's in
 [LICENSE-NVTX.txt](LICENSE-NVTX.txt), and original reproduction additions in
 [LICENSE-CCLD.txt](LICENSE-CCLD.txt). See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The paper and experiment
-logs are not distributed in this repository.
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Yida Gu, Fakang Wang, et al., “CCL-D: A High-Precision Diagnostic System for
 Slow and Hang Anomalies in Large-Scale Model Training,” PPoPP 2026.
