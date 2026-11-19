@@ -1,9 +1,45 @@
 # Historical results and validation boundaries
 
-These are observations from the preceding research runs, not a claim that this
-clean export has already reproduced every result. Raw traces are not included.
-The export preserves the selected asynchronous Ring-wait NCCL patch chain;
-the portable Ring observer is a refactoring and requires fresh GPU validation.
+These are controlled research observations, not a claim that the release is
+validated for arbitrary workloads. Raw traces are not included. The export
+preserves the selected asynchronous Ring-wait NCCL patch chain; its portable
+observer has now been exercised on the limited GPU matrix described below.
+
+## Released online observer: H100 revalidation
+
+On 2026-11-19, we ran 30 separate single-node, eight-H100 jobs using the
+released decoder and online observer. For each Ring protocol, five jobs used a
+bounded S2 send-delay injection and five were no-fault controls. The injected
+ranks were 0 twice, 1 twice, and 7 once per protocol. Each job ran six
+AllReduce operations of 262,144 float32 elements; all 1,440 rank-operation
+numerical checks and telemetry validation passed.
+
+| Protocol | S2 faults with correct wait rank | Controls with online alarm | Base slow classification on injected S2 | Controls over threshold when gate forcibly bypassed |
+|---|---:|---:|---|---:|
+| Simple | 5/5 | 0/5 | S2: 5/5 | 1/5 |
+| LL | 5/5 | 0/5 | S3: 5/5 | 0/5 |
+| LL128 | 5/5 | 0/5 | S3: 5/5 | 0/5 |
+
+The last column is a separate **offline forced-score** analysis, not an
+online false alarm: the normal Simple trial did not pass the confirmed-slow
+gate, and the forced score did not produce a majority rank candidate. It shows
+that the wait score can cross the old threshold on normal data and should not
+be used as an ungated detector. The base analyzer's S3 classifications on LL
+and LL128 are incorrect for these pure S2 injections, even though the separate
+wait-based rank candidate was correct.
+
+Across the 15 fault jobs, injection-to-first-alert was 1.98–2.09 s and
+injection-to-wait-decision was 3.54–3.66 s. These same-host measurements
+include trace polling and the configured 1.2-second gaps between operations;
+they are not isolated analyzer execution time.
+
+This test used the same restricted-function, fault-enabled library and the
+previously fitted `0.6469719382` threshold, a strong 50-million-cycle software
+send delay, and the historical 22-channel workload signature. Trials ran on
+two H100 hosts, one host per job; this was not a multi-node communicator test.
+No Tree, H1/H2/H3, S1/S3 mixed fault, FSDP, weaker fault, or full non-injection
+library fault-localization claim follows from this matrix. The aggregate data
+are in [online-ring-s2-validation-20261119.json](ccld/evidence/online-ring-s2-validation-20261119.json).
 
 ## Synthetic Ring/S2 faults
 
