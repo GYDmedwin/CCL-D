@@ -503,6 +503,10 @@
             "run_ms_per_rank_per_step": 7.05376119,
             "runnable_wait_ms_per_rank_per_step": 20.3321978125
           },
+          "estimated_cpu_equivalents_per_node": {
+            "ccld": 0.440757,
+            "other": 13.910221
+          },
           "other": {
             "matched_threads": 400,
             "run_ms_per_rank_per_step": 222.611523945,
@@ -530,6 +534,10 @@
             "matched_threads": 32,
             "run_ms_per_rank_per_step": 9.200346,
             "runnable_wait_ms_per_rank_per_step": 22.558513960000003
+          },
+          "estimated_cpu_equivalents_per_node": {
+            "ccld": 0.527533,
+            "other": 13.852613
           },
           "other": {
             "matched_threads": 400,
@@ -559,6 +567,10 @@
             "run_ms_per_rank_per_step": 9.674092795,
             "runnable_wait_ms_per_rank_per_step": 25.778934307500002
           },
+          "estimated_cpu_equivalents_per_node": {
+            "ccld": 0.505837,
+            "other": 13.983919
+          },
           "other": {
             "matched_threads": 400,
             "run_ms_per_rank_per_step": 267.4404054075,
@@ -586,6 +598,10 @@
             "matched_threads": 32,
             "run_ms_per_rank_per_step": 8.550595055,
             "runnable_wait_ms_per_rank_per_step": 21.4288564425
+          },
+          "estimated_cpu_equivalents_per_node": {
+            "ccld": 0.547174,
+            "other": 13.900488
           },
           "other": {
             "matched_threads": 400,
@@ -615,6 +631,10 @@
             "run_ms_per_rank_per_step": 9.7302055675,
             "runnable_wait_ms_per_rank_per_step": 0.009506575000000001
           },
+          "estimated_cpu_equivalents_per_node": {
+            "ccld": 1.640112,
+            "other": 14.84025
+          },
           "other": {
             "matched_threads": 400,
             "run_ms_per_rank_per_step": 88.0462212525,
@@ -642,6 +662,10 @@
             "matched_threads": 32,
             "run_ms_per_rank_per_step": 7.534889605,
             "runnable_wait_ms_per_rank_per_step": 0.0228660475
+          },
+          "estimated_cpu_equivalents_per_node": {
+            "ccld": 1.271479,
+            "other": 14.973761
           },
           "other": {
             "matched_threads": 400,
@@ -671,6 +695,10 @@
             "run_ms_per_rank_per_step": 14.780799115,
             "runnable_wait_ms_per_rank_per_step": 0.017856555
           },
+          "estimated_cpu_equivalents_per_node": {
+            "ccld": 1.990079,
+            "other": 14.98082
+          },
           "other": {
             "matched_threads": 400,
             "run_ms_per_rank_per_step": 111.2603293175,
@@ -699,6 +727,10 @@
             "run_ms_per_rank_per_step": 9.4995897075,
             "runnable_wait_ms_per_rank_per_step": 0.0082054475
           },
+          "estimated_cpu_equivalents_per_node": {
+            "ccld": 1.558187,
+            "other": 14.909403
+          },
           "other": {
             "matched_threads": 400,
             "run_ms_per_rank_per_step": 90.89261662999999,
@@ -708,6 +740,7 @@
         "unfinished_entries": 0
       }
     ],
+    "cpu_equivalents_method": "For each process, divide each matched thread-group schedstat CPU runtime by that rank's sum of measured step durations after five warmup steps; sum rank ratios per node and average two nodes. The step-timing denominator omits work outside timed steps, including loss extraction and logging, so these are approximate. The other group is all other matched training-process threads and can include NCCL/CUDA/PyTorch; a separate online analyzer is excluded. Each setting has two passes.",
     "external_process_at_start": false,
     "external_process_observed_during_run": false,
     "nodes": 2,

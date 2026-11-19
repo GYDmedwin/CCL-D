@@ -123,6 +123,31 @@ snapshots. The small sample supports CPU scheduling pressure as a contributor;
 it does not prove that frame scanning is the only cause or that 32 frames is
 sufficient for arbitrary training workloads.
 
+For the same frame comparison, the sampled threads' approximate CPU runtime
+per node was as follows. One CPU equivalent corresponds to one logical CPU
+busy for a time equal to the sum of timed steps; values average two passes and
+two nodes.
+
+| CPUs available per node | Frames | CCL-D probe and writer | Other matched training-process threads |
+|---|---:|---:|---:|
+| 8 physical cores, 16 logical CPUs | 32 | 0.49 CPU | 13.91 CPUs |
+| 8 physical cores, 16 logical CPUs | 512 | 0.52 CPU | 13.92 CPUs |
+| 24 physical cores, 48 logical CPUs | 32 | 1.60 CPUs | 14.87 CPUs |
+| 24 physical cores, 48 logical CPUs | 512 | 1.63 CPUs | 14.98 CPUs |
+
+For example, 0.49 CPU is approximately 0.26% of the node's 192 logical CPUs,
+but approximately 3.1% of the 16 logical CPUs available to the process group.
+The other group includes all other matched threads in the training processes,
+which can include PyTorch, NCCL and CUDA threads; the separate live analyzer
+was disabled and is not included. CPU
+runtime and runnable waiting are different measurements. CPU equivalents here
+divide sampled thread runtime by the sum of each rank's timed step durations;
+because that denominator excludes work outside the timed steps, the values
+are approximate, not full-interval utilization measurements. Threads created
+or exited between snapshots are also excluded. The apparent increase in probe
+CPU equivalents with more available CPUs occurred alongside faster training;
+it is not a controlled per-operation CPU cost.
+
 The published FSDP Slurm example was then rerun with its new 32-frame
 default, 48 allocated logical CPUs per node and Ring wait counting enabled.
 All 16 ranks completed ten steps with matching expected NCCL mappings and
