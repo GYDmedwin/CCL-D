@@ -1,0 +1,182 @@
+{
+  "cases": [
+    {
+      "complete_traces": 16,
+      "completed_operations": {
+        "AllGather": 8160,
+        "AllReduce": 32,
+        "ReduceScatter": 4320
+      },
+      "estimated_cpu_equivalents_per_node": {
+        "ccld": 0.5287293492438216,
+        "other": 13.8148125325671
+      },
+      "frames": 32,
+      "index": 1,
+      "mean_max_rank_step_ms": 147.33154168,
+      "mode": "wait",
+      "physical_cores_per_node": 8,
+      "sidecar_cpu_equivalents_master_node": null
+    },
+    {
+      "complete_traces": 16,
+      "completed_operations": {
+        "AllGather": 8160,
+        "AllReduce": 32,
+        "ReduceScatter": 4320
+      },
+      "estimated_cpu_equivalents_per_node": {
+        "ccld": 0.4664570222794432,
+        "other": 13.576858119193023
+      },
+      "frames": 32,
+      "index": 2,
+      "mean_max_rank_step_ms": 186.51872056,
+      "mode": "live",
+      "physical_cores_per_node": 8,
+      "sidecar_cpu_equivalents_master_node": {
+        "analyzer": 0.5414253399796837,
+        "complete_trace_seen_during_training": true,
+        "decoder": 0.3353238510448192,
+        "sampled_training_seconds": 6.113492952
+      }
+    },
+    {
+      "complete_traces": 16,
+      "completed_operations": {
+        "AllGather": 8160,
+        "AllReduce": 32,
+        "ReduceScatter": 4320
+      },
+      "estimated_cpu_equivalents_per_node": {
+        "ccld": 0.4273147073764813,
+        "other": 13.711168683599997
+      },
+      "frames": 32,
+      "index": 3,
+      "mean_max_rank_step_ms": 156.94107888,
+      "mode": "live",
+      "physical_cores_per_node": 8,
+      "sidecar_cpu_equivalents_master_node": {
+        "analyzer": 0.554872899265146,
+        "complete_trace_seen_during_training": true,
+        "decoder": 0.3736899117499963,
+        "sampled_training_seconds": 5.298510711
+      }
+    },
+    {
+      "complete_traces": 16,
+      "completed_operations": {
+        "AllGather": 8160,
+        "AllReduce": 32,
+        "ReduceScatter": 4320
+      },
+      "estimated_cpu_equivalents_per_node": {
+        "ccld": 0.4554817458551291,
+        "other": 13.943440264524476
+      },
+      "frames": 32,
+      "index": 4,
+      "mean_max_rank_step_ms": 138.02154816,
+      "mode": "wait",
+      "physical_cores_per_node": 8,
+      "sidecar_cpu_equivalents_master_node": null
+    },
+    {
+      "complete_traces": 16,
+      "completed_operations": {
+        "AllGather": 8160,
+        "AllReduce": 32,
+        "ReduceScatter": 4320
+      },
+      "estimated_cpu_equivalents_per_node": {
+        "ccld": 1.408219932793558,
+        "other": 14.859677564691339
+      },
+      "frames": 32,
+      "index": 5,
+      "mean_max_rank_step_ms": 46.834776319999996,
+      "mode": "wait",
+      "physical_cores_per_node": 24,
+      "sidecar_cpu_equivalents_master_node": null
+    },
+    {
+      "complete_traces": 16,
+      "completed_operations": {
+        "AllGather": 8160,
+        "AllReduce": 32,
+        "ReduceScatter": 4320
+      },
+      "estimated_cpu_equivalents_per_node": {
+        "ccld": 1.3492792449686086,
+        "other": 14.828715358222196
+      },
+      "frames": 32,
+      "index": 6,
+      "mean_max_rank_step_ms": 53.22684864,
+      "mode": "live",
+      "physical_cores_per_node": 24,
+      "sidecar_cpu_equivalents_master_node": {
+        "analyzer": 0.4604320798110393,
+        "complete_trace_seen_during_training": true,
+        "decoder": 0.6733200306914123,
+        "sampled_training_seconds": 2.019841885
+      }
+    },
+    {
+      "complete_traces": 16,
+      "completed_operations": {
+        "AllGather": 8160,
+        "AllReduce": 32,
+        "ReduceScatter": 4320
+      },
+      "estimated_cpu_equivalents_per_node": {
+        "ccld": 1.087523850111121,
+        "other": 14.887299980752768
+      },
+      "frames": 32,
+      "index": 7,
+      "mean_max_rank_step_ms": 47.69304312,
+      "mode": "live",
+      "physical_cores_per_node": 24,
+      "sidecar_cpu_equivalents_master_node": {
+        "analyzer": 0.3515581963907453,
+        "complete_trace_seen_during_training": true,
+        "decoder": 0.6288435343890797,
+        "sampled_training_seconds": 2.019580278
+      }
+    },
+    {
+      "complete_traces": 16,
+      "completed_operations": {
+        "AllGather": 8160,
+        "AllReduce": 32,
+        "ReduceScatter": 4320
+      },
+      "estimated_cpu_equivalents_per_node": {
+        "ccld": 1.1181916056985381,
+        "other": 14.928274894570684
+      },
+      "frames": 32,
+      "index": 8,
+      "mean_max_rank_step_ms": 58.016629359999996,
+      "mode": "wait",
+      "physical_cores_per_node": 24,
+      "sidecar_cpu_equivalents_master_node": null
+    }
+  ],
+  "external_observation_scope": "The external process was detected on the second node during the Slurm steps for cases 1\u20134; polling was roughly every 2 seconds and actual overlap with the timed training steps or utilization attributable to that process is unknown. No detection was recorded for cases 5\u20138; brief activity could be missed.",
+  "external_observed_case_indices": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "external_process_at_start": false,
+  "external_process_observed_during_run": true,
+  "nodes": 2,
+  "scope": "Two passes per configuration, synthetic FSDP. Training-thread CPU is approximate from post-warmup timed steps and matched threads; sidecar CPU covers their rank-0 training-window samples, includes warmup, is measured only on master, and does not include sampler or watcher overhead.",
+  "steps": 30,
+  "warmup_steps_excluded_for_steps": 5,
+  "world_size": 16
+}

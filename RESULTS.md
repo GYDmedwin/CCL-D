@@ -153,6 +153,37 @@ default, 48 allocated logical CPUs per node and Ring wait counting enabled.
 All 16 ranks completed ten steps with matching expected NCCL mappings and
 complete traces; the separate AlltoAll numerical smoke also passed.
 
+### Online decoder and analyzer CPU
+
+An additional short two-node, 16-rank FSDP comparison used 32 frames, Ring
+wait counting, a 200 µs probe poll, a decoder following every 50 ms and the
+base analyzer following every 200 ms. There were two passes per setting, each
+with 30 steps. The decoder and analyzer ran as separate processes on the master
+node and shared the same logical-CPU affinity as its training processes.
+Their CPU times were sampled over the rank-0 training interval; the probe
+thread estimate uses timed steps after five warmup steps.
+
+| CPUs available per node | Probe and writer, average per node | Decoder, master node | Analyzer, master node |
+|---|---:|---:|---:|
+| 8 physical cores, 16 logical CPUs | 0.45 CPU | 0.35 CPU | 0.55 CPU |
+| 24 physical cores, 48 logical CPUs | 1.22 CPUs | 0.65 CPU | 0.41 CPU |
+
+Each value is an approximate logical-CPU equivalent. In the 16-logical-CPU
+setting, the two sidecars together used approximately 0.90 CPU on the master
+node in addition to the probe threads. The two CPU measurement windows are
+not identical, and these values are not a universal full-system maximum.
+The online analyzer currently rereads accumulated JSONL on each poll; CPU
+cost and analysis latency may therefore change with trace size and poll rate.
+
+All eight passes had complete expected traces and matching loss checks. An
+external GPU process appeared on the second node during the Slurm steps for
+the four 16-logical-CPU cases; its utilization and exact overlap with timed
+training steps are unknown. No process was detected during the four larger
+CPU-allocation cases, but the periodic monitor can miss brief activity. The
+short, potentially shared runs are not a clean performance comparison or a
+long-training CPU characterization. The compact per-pass measurements are in
+[fsdp-online-cpu-16371.json](ccld/evidence/fsdp-online-cpu-16371.json).
+
 ## Two-node, 16-rank bounded fault checks
 
 The full non-injection NCCL build was also tested with the PyTorch AllReduce
