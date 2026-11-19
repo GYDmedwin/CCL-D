@@ -1,0 +1,100 @@
+{
+  "all_signatures_match": true,
+  "evidence_type": "aggregate summary; raw traces not included",
+  "fault_library_sha256": "78ca63292f8d88e10552223c47d9ea42873b9d96ac6d5f0b240a209e4ef1a132",
+  "fault_rank_counts_per_protocol": {
+    "0": 2,
+    "1": 2,
+    "7": 1
+  },
+  "library_profile": "restricted functions, fault injection compiled in",
+  "notes": [
+    "One node per trial; 30 separate Slurm jobs on H100 nodes.",
+    "Normal control scores with the slow gate forcibly bypassed are offline analyses, not online alerts.",
+    "One forced Simple control exceeded the threshold but produced no majority rank candidate.",
+    "The threshold was fitted on earlier data; this is not validation for other builds or workloads."
+  ],
+  "num_trials": 30,
+  "numerical_checks": 1440,
+  "observer_sha256": "bd5e0a1e3763d29e0597adef6bae9ba11863754d9a019ba816051c93160aa930",
+  "protocols": {
+    "LL": {
+      "base_classifications": {
+        "S3": 5
+      },
+      "confirmed_control_alarms": 0,
+      "control_trials": 5,
+      "fault_trials": 5,
+      "forced_score_control_alerts": 0,
+      "forced_score_control_gap_max": 0.17389655592724518,
+      "forced_score_fault_gap_min": 1.054982796081768,
+      "forced_score_faults_correct": 5,
+      "injection_to_decision_ms": {
+        "max": 3655.580759,
+        "median": 3586.735657,
+        "min": 3538.096009
+      },
+      "injection_to_first_alert_ms": {
+        "max": 2059.418994,
+        "median": 2017.251942,
+        "min": 1988.953376
+      },
+      "preliminary_control_alerts": 0,
+      "unique_correct": 5
+    },
+    "LL128": {
+      "base_classifications": {
+        "S3": 5
+      },
+      "confirmed_control_alarms": 0,
+      "control_trials": 5,
+      "fault_trials": 5,
+      "forced_score_control_alerts": 0,
+      "forced_score_control_gap_max": 0.07002736877513265,
+      "forced_score_fault_gap_min": 1.1261873797297224,
+      "forced_score_faults_correct": 5,
+      "injection_to_decision_ms": {
+        "max": 3649.46965,
+        "median": 3588.933903,
+        "min": 3580.733157
+      },
+      "injection_to_first_alert_ms": {
+        "max": 2088.823704,
+        "median": 2030.209658,
+        "min": 1982.273737
+      },
+      "preliminary_control_alerts": 0,
+      "unique_correct": 5
+    },
+    "Simple": {
+      "base_classifications": {
+        "S2": 5
+      },
+      "confirmed_control_alarms": 0,
+      "control_trials": 5,
+      "fault_trials": 5,
+      "forced_score_control_alerts": 1,
+      "forced_score_control_gap_max": 0.781960733493164,
+      "forced_score_fault_gap_min": 1.1558679189378889,
+      "forced_score_faults_correct": 5,
+      "injection_to_decision_ms": {
+        "max": 3592.650255,
+        "median": 3573.082078,
+        "min": 3562.322608
+      },
+      "injection_to_first_alert_ms": {
+        "max": 2086.08149,
+        "median": 2020.865371,
+        "min": 1981.537302
+      },
+      "preliminary_control_alerts": 0,
+      "unique_correct": 5
+    }
+  },
+  "release_source_commit": "559535ff8ec60ea2275b2ea7ff634eb06e91a9b9",
+  "synthetic_s2_cycles": 50000000,
+  "threshold": 0.6469719381871902,
+  "threshold_previously_fitted": true,
+  "time_definition": "same-host monotonic injection to online observer; includes polling and configured 1.2s gaps",
+  "workload": "8-rank one-node AllReduce; f32 count 262144; 22 channels; operations 4\u20136"
+}
