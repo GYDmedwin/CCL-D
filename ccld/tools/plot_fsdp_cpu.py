@@ -7,6 +7,7 @@ import statistics
 
 import matplotlib
 matplotlib.use('Agg')
+matplotlib.rcParams['svg.hashsalt'] = 'ccld-fsdp-cpu-20261119'
 import matplotlib.pyplot as plt
 
 
@@ -42,8 +43,9 @@ def main():
     ax.grid(axis='y',color='#dbe2e7',linewidth=.7,zorder=0)
     ax.spines[['top','right']].set_visible(False)
     ax.legend(frameon=False,ncol=3,loc='upper right',fontsize=8)
-    fig.text(.10,.05,'117M parameters, synthetic tokens; 30 steps/pass, first 5 excluded. Dots: individual passes.',
-             fontsize=8,color='#45535d')
+    fig.text(.10,.065,'117M parameters, synthetic tokens; 30 steps/pass, first 5 excluded.\n'
+             '512 frames, Ring wait off; dots show the two passes.',
+             fontsize=8,color='#45535d',va='center')
     fig.savefig(args.output,metadata={'Date':None})
     if args.output.suffix.lower() == '.svg':
         args.output.write_text('\n'.join(line.rstrip() for line in args.output.read_text().splitlines())+'\n')

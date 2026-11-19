@@ -112,7 +112,7 @@ export LD_LIBRARY_PATH="$PWD/build/lib:${LD_LIBRARY_PATH:-}"
 export LD_PRELOAD="$PWD/build/lib/libnccl.so.2"
 export NCCL_ALGO=Ring NCCL_PROTO=Simple
 export NCCL_CCLD_ENABLE=1 NCCL_CCLD_MODE=1 NCCL_CCLD_WAIT_ENABLE=1
-export NCCL_CCLD_POLL_US=200 NCCL_CCLD_FRAME_BLOCKS=512
+export NCCL_CCLD_POLL_US=200 NCCL_CCLD_FRAME_BLOCKS=32
 export NCCL_CCLD_QUEUE_SLOTS=2048 NCCL_CCLD_COMPLETION=event
 export NCCL_CCLD_OUT_DIR="$CCLD_RUN/bin"
 
@@ -151,7 +151,8 @@ For a two-node Slurm launch, activate the PyTorch environment, set
 [ccld/slurm/fsdp_train.sh](ccld/slurm/fsdp_train.sh) with your site's
 account, partition and GPU resource options. The script uses eight GPUs per
 node by default; `CCLD_GPUS_PER_NODE`, `CCLD_PROFILE`, `CCLD_STEPS`, and
-`CCLD_RUN` can be set before submission. Adjust the CPU request to the site
+`CCLD_RUN` can be set before submission. The default 32 probe frames can be
+changed through `NCCL_CCLD_FRAME_BLOCKS`. Adjust the CPU request to the site
 and workload so the training workers and NCCL/monitoring threads have room to
 run; [RESULTS.md](RESULTS.md) includes an example CPU allocation comparison.
 

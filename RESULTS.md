@@ -75,8 +75,8 @@ To investigate the 16-rank timing, we repeated the same 117M model in a
 mirrored rotation with fixed CPU affinity, 30 steps per pass, two passes per
 configuration and two hardware threads available per physical core. `Off`
 loads the modified library with CCL-D disabled; `Base` enables the base probe
-without the Ring wait counters or live analysis. Each cell averages the
-maximum-rank step time after excluding five warmup steps.
+with 512 frames and without the Ring wait counters or live analysis. Each cell
+averages the maximum-rank step time after excluding five warmup steps.
 
 | Physical cores per node | Upstream | Modified, off | Base probe |
 |---|---:|---:|---:|
@@ -102,6 +102,31 @@ The example Slurm launcher was subsequently rerun on two nodes using 48
 allocated logical CPUs per node. All 16 ranks recorded a 48-CPU affinity,
 completed ten FSDP steps and produced complete AllGather, ReduceScatter and
 AllReduce traces.
+
+We also compared the base probe with 32 versus 512 frame blocks, using the
+same model, 16 ranks, a 200 µs poll and two paired passes per setting. The
+Ring wait counter and live analyzer were off for this comparison.
+
+| Physical cores per node | 32 frames | 512 frames |
+|---|---:|---:|
+| 8 cores, 16 hardware threads | 130.71 ms | 151.04 ms |
+| 24 cores, 48 hardware threads | 48.87 ms | 53.76 ms |
+
+All eight passes produced complete traces without reported drops and the
+training loss checks passed. Linux scheduler counters sampled for threads
+present at both ends of the measured interval show the CCL-D threads waiting
+to run for an average of 20.88 versus 24.17 ms per rank per step in the
+limited-core 32/512-frame cases; at 24 cores the corresponding values were
+0.009 versus 0.020 ms. These are sums across monitored threads, not elapsed
+communication time, and exclude threads that appeared or exited between
+snapshots. The small sample supports CPU scheduling pressure as a contributor;
+it does not prove that frame scanning is the only cause or that 32 frames is
+sufficient for arbitrary training workloads.
+
+The published FSDP Slurm example was then rerun with its new 32-frame
+default, 48 allocated logical CPUs per node and Ring wait counting enabled.
+All 16 ranks completed ten steps with matching expected NCCL mappings and
+complete traces; the separate AlltoAll numerical smoke also passed.
 
 ## Two-node, 16-rank bounded fault checks
 
