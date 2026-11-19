@@ -1,0 +1,130 @@
+diff --git a/src/misc/ccld.cc b/src/misc/ccld.cc
+index 69977e6..915cf9e 100644
+--- a/src/misc/ccld.cc
++++ b/src/misc/ccld.cc
+@@ -33,7 +33,10 @@ struct CcldStart {
+ struct CcldSlot {
+   bool active = false;
+   std::atomic<bool> done{false};
++  std::atomic<bool> eventRecorded{false};
+   std::atomic<uint64_t> endNs{0};
++  cudaEvent_t completionEvent = nullptr;
++  bool eventFailed = false;
+   uint64_t seq = 0, startNs = 0, lastDumpNs = 0;
+   uint64_t count = 0, bytes = 0;
+   const char* op = nullptr;
+@@ -61,6 +64,8 @@ struct CcldState {
+   std::map<uint64_t, CcldStart> pending;
+   uint64_t hash = 0, counter = 0, pollUs = 200, dumpNs = 1000000000ull;
+   uint64_t mode = 1;
++  int cudaDev = -1;
++  bool useEvent = true;
+ #ifdef CCLD_FAULT_INJECTION
+   uint64_t faultKind = 0, faultRank = UINT64_MAX, faultOp = 0, faultCycles = 0, faultRepeats = 1;
+ #endif
+@@ -142,7 +147,9 @@ static void ccldEmit(CcldState* s, int idx, const char* type, uint64_t now) {
+ }
+ static void ccldWorker(CcldState* s) {
+   (void)pthread_setname_np(pthread_self(), "ccld-probe");
++  const bool deviceReady = !s->useEvent || cudaSetDevice(s->cudaDev) == cudaSuccess;
+   std::unique_lock<std::mutex> lock(s->mu);
++  if (!deviceReady) ccldStatus(s, "dropped", 0, "event_worker_device_setup_failed");
+   uint64_t lastHeartbeat = ccldNow();
+   while (!s->stop) {
+     s->cv.wait_for(lock, std::chrono::microseconds(s->pollUs));
+@@ -151,6 +158,18 @@ static void ccldWorker(CcldState* s) {
+       CcldSlot& slot = s->slots[i];
+       if (!slot.active) continue;
+       ccldSample(s, i);
++      if (s->useEvent && deviceReady && slot.eventRecorded.load(std::memory_order_acquire) &&
++          !slot.done.load(std::memory_order_relaxed) && !slot.eventFailed) {
++        cudaError_t query = cudaEventQuery(slot.completionEvent);
++        if (query == cudaSuccess) {
++          ccldSample(s, i); // Re-read after CUDA confirms the kernel has completed.
++          slot.endNs.store(ccldNow(), std::memory_order_relaxed);
++          slot.done.store(true, std::memory_order_release);
++        } else if (query != cudaErrorNotReady) {
++          slot.eventFailed = true;
++          ccldStatus(s, "dropped", slot.seq, "completion_event_query_failed");
++        }
++      }
+       if (slot.done.load(std::memory_order_acquire)) {
+         uint64_t end = slot.endNs.load(std::memory_order_relaxed);
+         ccldEmit(s, i, "complete", end);
+@@ -195,6 +214,10 @@ void ccldInit(ncclComm* comm) {
+   }
+   CcldState* s = new CcldState();
+   s->rank = comm->rank; s->nranks = comm->nRanks; s->hash = comm->commHash; s->mode = mode;
++  s->cudaDev = comm->cudaDev;
++  const char* completion = getenv("NCCL_CCLD_COMPLETION");
++  if (completion && strcmp(completion, "hostfunc") == 0) s->useEvent = false;
++  else if (completion && strcmp(completion, "event") != 0) WARN("CCL-D unknown completion mode; using event");
+ #ifdef CCLD_FAULT_INJECTION
+   const char* kind = getenv("NCCL_CCLD_FAULT_KIND");
+   if (kind && strcmp(kind, "H3") == 0) s->faultKind = 1;
+@@ -233,16 +256,27 @@ void ccldInit(ncclComm* comm) {
+     if (s->frame) cudaFreeHost(s->frame);
+     fclose(s->out); delete s; return;
+   }
++  if (s->useEvent) {
++    for (int i = 0; i < CCLD_BLOCKS; ++i) {
++      err = cudaEventCreateWithFlags(&s->slots[i].completionEvent, cudaEventDisableTiming);
++      if (err != cudaSuccess) {
++        WARN("CCL-D event allocation failed: %s", cudaGetErrorString(err));
++        for (int j = 0; j < i; ++j) cudaEventDestroy(s->slots[j].completionEvent);
++        cudaFreeHost(s->frame); fclose(s->out); delete s; return;
++      }
++    }
++  }
+   memset(s->frame, 0, s->frameBytes); s->frame->mode = mode;
+   char host[256] = {};
+   gethostname(host, sizeof(host)-1);
+   ccldPrefix(s, "comm_init", 0, ccldNow());
+-  fprintf(s->out, ",\"host\":\"%s\",\"frame_bytes\":%zu,\"frame_channels\":%u,\"frame_groups\":%u,\"poll_us\":%" PRIu64 ",\"mode\":%" PRIu64 "}\n", host, s->frameBytes, s->frameChannels, s->frameGroups, s->pollUs, s->mode);
++  fprintf(s->out, ",\"host\":\"%s\",\"frame_bytes\":%zu,\"frame_channels\":%u,\"frame_groups\":%u,\"poll_us\":%" PRIu64 ",\"mode\":%" PRIu64 ",\"completion\":\"%s\"}\n", host, s->frameBytes, s->frameChannels, s->frameGroups, s->pollUs, s->mode, s->useEvent ? "event_query" : "hostfunc");
+   fflush(s->out);
+   try {
+     s->thread = std::thread(ccldWorker, s);
+   } catch (const std::exception& e) {
+     WARN("CCL-D thread creation failed: %s", e.what());
++    if (s->useEvent) for (int i = 0; i < CCLD_BLOCKS; ++i) cudaEventDestroy(s->slots[i].completionEvent);
+     cudaFreeHost(s->frame); fclose(s->out); delete s; return;
+   }
+   comm->ccldState = s;
+@@ -330,6 +364,7 @@ void ccldPlan(ncclComm* comm, ncclKernelPlan* plan) {
+     slot.changesSend[c] = slot.changesRecv[c] = 0;
+   }
+   slot.done.store(false, std::memory_order_relaxed); slot.endNs.store(0, std::memory_order_relaxed);
++  slot.eventRecorded.store(false, std::memory_order_relaxed); slot.eventFailed = false;
+   slot.active = true;
+   work->ccldSlotPlus1 = index + 1;
+   plan->ccldSlotPlus1 = index + 1;
+@@ -349,6 +384,20 @@ static void CUDART_CB ccldDone(void* data) {
+ }
+ void ccldCallbackEnqueue(ncclComm* comm, ncclKernelPlan* plan, cudaStream_t stream) {
+   CcldState* s = static_cast<CcldState*>(comm->ccldState);
++  if (s->useEvent) {
++    CcldSlot& slot = s->slots[plan->ccldSlotPlus1-1];
++    cudaError_t err = cudaEventRecord(slot.completionEvent, stream);
++    if (err == cudaSuccess) {
++      slot.eventRecorded.store(true, std::memory_order_release);
++      s->cv.notify_one();
++    } else {
++      std::lock_guard<std::mutex> lock(s->mu);
++      ccldStatus(s, "dropped", slot.seq, "completion_event_record_failed");
++      WARN("CCL-D event record failed: %s", cudaGetErrorString(err));
++      // Do not reuse the slot while a kernel may still be writing to it.
++    }
++    return;
++  }
+   CcldCallback* cb = new CcldCallback{s, plan->ccldSlotPlus1-1};
+   s->callbacksOutstanding.fetch_add(1, std::memory_order_relaxed);
+   cudaError_t err = cudaLaunchHostFunc(stream, ccldDone, cb);
+@@ -380,6 +429,7 @@ void ccldFree(ncclComm* comm) {
+     WARN("CCL-D retains pinned storage after incomplete/aborted kernel");
+     return;
+   }
++  if (s->useEvent) for (int i = 0; i < CCLD_BLOCKS; ++i) cudaEventDestroy(s->slots[i].completionEvent);
+   cudaFreeHost(s->frame);
+   delete s;
+ }

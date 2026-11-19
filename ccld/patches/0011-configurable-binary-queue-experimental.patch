@@ -1,0 +1,112 @@
+diff --git a/src/include/ccld_queue.h b/src/include/ccld_queue.h
+index 51024be..4f58884 100644
+--- a/src/include/ccld_queue.h
++++ b/src/include/ccld_queue.h
+@@ -4,30 +4,36 @@
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdint>
++#include <memory>
++#include <new>
+ 
+ // Bounded multi-producer/single-consumer queue. A full queue never waits for
+ // the writer; callers must explicitly record a dropped event instead.
+-template <typename T, size_t Capacity>
++template <typename T, size_t Capacity = 0>
+ class CcldQueue {
+-  static_assert(Capacity >= 2, "queue needs at least two cells");
++  static_assert(Capacity == 0 || Capacity >= 2, "queue needs at least two cells");
+   struct Cell {
+     std::atomic<size_t> sequence;
+     T value;
+   };
+-  Cell cells[Capacity];
++  const size_t capacity;
++  std::unique_ptr<Cell[]> cells;
+   std::atomic<size_t> producer{0};
+   size_t consumer = 0;
+ 
+  public:
+-  CcldQueue() {
+-    for (size_t i = 0; i < Capacity; ++i) cells[i].sequence.store(i, std::memory_order_relaxed);
++  explicit CcldQueue(size_t requested = Capacity)
++      : capacity(requested), cells(requested >= 2 ? new (std::nothrow) Cell[requested] : nullptr) {
++    if (cells) for (size_t i = 0; i < capacity; ++i) cells[i].sequence.store(i, std::memory_order_relaxed);
+   }
++  bool valid() const { return cells != nullptr; }
++  size_t allocatedBytes() const { return cells ? capacity * sizeof(Cell) : 0; }
+   bool lockFree() const { return producer.is_lock_free(); }
+   bool push(const T& value) {
+     size_t pos = producer.load(std::memory_order_relaxed);
+     Cell* cell;
+     for (;;) {
+-      cell = &cells[pos % Capacity];
++      cell = &cells[pos % capacity];
+       const size_t sequence = cell->sequence.load(std::memory_order_acquire);
+       const intptr_t diff = intptr_t(sequence) - intptr_t(pos);
+       if (diff == 0) {
+@@ -43,11 +49,11 @@ class CcldQueue {
+     return true;
+   }
+   bool pop(T& value) {
+-    Cell& cell = cells[consumer % Capacity];
++    Cell& cell = cells[consumer % capacity];
+     const size_t sequence = cell.sequence.load(std::memory_order_acquire);
+     if (intptr_t(sequence) - intptr_t(consumer + 1) != 0) return false;
+     value = cell.value;
+-    cell.sequence.store(consumer + Capacity, std::memory_order_release);
++    cell.sequence.store(consumer + capacity, std::memory_order_release);
+     ++consumer;
+     return true;
+   }
+diff --git a/src/misc/ccld.cc b/src/misc/ccld.cc
+index ffb844d..69b358f 100644
+--- a/src/misc/ccld.cc
++++ b/src/misc/ccld.cc
+@@ -71,7 +71,8 @@ struct CcldState {
+   std::thread thread, writer;
+   std::unique_ptr<CcldSlot[]> slots;
+   CcldPending pending[256];
+-  CcldQueue<CcldLogEvent, 128> logQueue;
++  std::unique_ptr<CcldQueue<CcldLogEvent>> logQueue;
++  size_t queueSlots = 0;
+   uint64_t hash = 0, pollUs = 200, dumpNs = 1000000000ull;
+   uint64_t mode = 1;
+   int cudaDev = -1;
+@@ -101,7 +102,7 @@ static CcldLogEvent ccldLogBase(CcldState* s, CcldLogType type, uint64_t seq, ui
+   return e;
+ }
+ static void ccldLog(CcldState* s, const CcldLogEvent& e) {
+-  if (!s->logQueue.push(e)) {
++  if (!s->logQueue->push(e)) {
+     s->lastDroppedSeq.store(e.seq, std::memory_order_relaxed);
+     s->logDrops.fetch_add(1, std::memory_order_release);
+   }
+@@ -123,7 +124,7 @@ static void ccldWriter(CcldState* s) {
+       ccldCopyString(batch[n].reason, sizeof(batch[n].reason), "binary_queue_overflow");
+       ++n;
+     }
+-    while (n < 16 && s->logQueue.pop(batch[n])) ++n;
++    while (n < 16 && s->logQueue->pop(batch[n])) ++n;
+     if (n) {
+       if (fwrite(batch, sizeof(CcldLogEvent), n, s->out) != n || fflush(s->out) != 0) {
+         if (!s->ioFailed.exchange(true)) WARN("CCL-D binary trace write failed");
+@@ -248,7 +249,9 @@ void ccldInit(ncclComm* comm) {
+     return;
+   }
+   CcldState* s = new CcldState();
+-  if (!s->logQueue.lockFree() || !s->counter.is_lock_free()) {
++  s->queueSlots = size_t(envNumber("NCCL_CCLD_QUEUE_SLOTS", 128, 128, 4096));
++  s->logQueue.reset(new (std::nothrow) CcldQueue<CcldLogEvent>(s->queueSlots));
++  if (!s->logQueue || !s->logQueue->valid() || !s->logQueue->lockFree() || !s->counter.is_lock_free()) {
+     WARN("CCL-D requires lock-free host queue and counter atomics"); delete s; return;
+   }
+   s->rank = comm->rank; s->nranks = comm->nRanks; s->hash = comm->commHash; s->mode = mode;
+@@ -314,6 +317,7 @@ void ccldInit(ncclComm* comm) {
+   gethostname(s->host, sizeof(s->host)-1);
+   CcldLogEvent init = ccldLogBase(s, CcldLogInit, 0, ccldNow());
+   init.reserved = s->frameBlocks; // Version-1 init records used zero before this extension.
++  init.bytes = s->queueSlots; init.windowNs = s->logQueue->allocatedBytes();
+   init.frameBytes = s->frameBytes; init.frameChannels = s->frameChannels; init.frameGroups = s->frameGroups;
+   init.pollUs = s->pollUs; init.mode = s->mode;
+   ccldCopyString(init.host, sizeof(init.host), s->host);

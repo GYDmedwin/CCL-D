@@ -1,0 +1,154 @@
+diff --git a/src/include/ccld.h b/src/include/ccld.h
+index fc4158d..a6fe162 100644
+--- a/src/include/ccld.h
++++ b/src/include/ccld.h
+@@ -7,6 +7,7 @@
+ // The variable tail contains only the communicator's actual channels. A
+ // second subgroup is retained whenever Tree can be selected.
+ #define CCLD_BLOCKS 8
++#define CCLD_MAX_BLOCKS 512
+ #define CCLD_MAX_CHANNELS 32
+ #define CCLD_GROUPS 2
+ struct CcldChannel {
+@@ -25,8 +26,8 @@ static_assert(offsetof(CcldBlock, channel) == 16, "dynamic block header must be
+ static inline size_t ccldBlockBytes(unsigned channels, unsigned groups) {
+   return offsetof(CcldBlock, channel) + size_t(channels) * groups * sizeof(CcldChannel);
+ }
+-static inline size_t ccldFrameBytes(unsigned channels, unsigned groups) {
+-  return offsetof(CcldFrame, blocks) + CCLD_BLOCKS * ccldBlockBytes(channels, groups);
++static inline size_t ccldFrameBytes(unsigned channels, unsigned groups, unsigned blocks) {
++  return offsetof(CcldFrame, blocks) + blocks * ccldBlockBytes(channels, groups);
+ }
+ static inline CcldBlock* ccldFrameBlock(CcldFrame* frame, unsigned index, unsigned channels, unsigned groups) {
+   return reinterpret_cast<CcldBlock*>(reinterpret_cast<unsigned char*>(frame) +
+diff --git a/src/include/device.h b/src/include/device.h
+index a33ffbe..98995f0 100644
+--- a/src/include/device.h
++++ b/src/include/device.h
+@@ -262,7 +262,8 @@ struct alignas(16) ncclDevWorkColl {
+   uint32_t channelLo:5, channelHi:5;
+   uint32_t nWarps:5;
+   uint32_t redOpArgIsPtr:1, regUsed:1, netRegUsed:1, oneNode:1, direct:2, isOneRPN:1;
+-  uint32_t ccldSlotPlus1:4; // 0 means disabled; 1..8 select a mapped frame block
++  // The original word has 10 unused bits. 0 disables, 1..512 select a slot.
++  uint32_t ccldSlotPlus1:10;
+   uint32_t root;
+   void* recvbuff;
+   void* sendbuff;
+diff --git a/src/misc/ccld.cc b/src/misc/ccld.cc
+index 6f5690d..ffb844d 100644
+--- a/src/misc/ccld.cc
++++ b/src/misc/ccld.cc
+@@ -14,7 +14,9 @@
+ #include <cstring>
+ #include <strings.h>
+ #include <inttypes.h>
++#include <memory>
+ #include <mutex>
++#include <new>
+ #include <pthread.h>
+ #include <thread>
+ #include <time.h>
+@@ -65,9 +67,9 @@ struct CcldState {
+   CcldFrame* frame = nullptr;
+   CcldFrame* device = nullptr;
+   size_t frameBytes = 0;
+-  unsigned frameChannels = 0, frameGroups = 0;
++  unsigned frameChannels = 0, frameGroups = 0, frameBlocks = CCLD_BLOCKS;
+   std::thread thread, writer;
+-  CcldSlot slots[CCLD_BLOCKS];
++  std::unique_ptr<CcldSlot[]> slots;
+   CcldPending pending[256];
+   CcldQueue<CcldLogEvent, 128> logQueue;
+   uint64_t hash = 0, pollUs = 200, dumpNs = 1000000000ull;
+@@ -183,7 +185,7 @@ static void ccldWorker(CcldState* s) {
+   while (!s->stop.load(std::memory_order_acquire)) {
+     s->cv.wait_for(lock, std::chrono::microseconds(s->pollUs));
+     uint64_t now = ccldNow();
+-    for (int i = 0; i < CCLD_BLOCKS; ++i) {
++    for (unsigned i = 0; i < s->frameBlocks; ++i) {
+       CcldSlot& slot = s->slots[i];
+       if (slot.phase.load(std::memory_order_acquire) != 2) continue;
+       ccldSample(s, i);
+@@ -213,7 +215,7 @@ static void ccldWorker(CcldState* s) {
+     }
+   }
+   // Drain already completed slots even if shutdown follows a callback quickly.
+-  for (int i = 0; i < CCLD_BLOCKS; ++i) {
++  for (unsigned i = 0; i < s->frameBlocks; ++i) {
+     CcldSlot& slot = s->slots[i];
+     if (slot.phase.load(std::memory_order_acquire) != 2) continue;
+     ccldSample(s, i);
+@@ -284,7 +286,13 @@ void ccldInit(ncclComm* comm) {
+   s->frameChannels = unsigned(comm->nChannels);
+   const char* selectedAlgo = getenv("NCCL_ALGO");
+   s->frameGroups = selectedAlgo && strcasecmp(selectedAlgo, "Ring") == 0 ? 1 : CCLD_GROUPS;
+-  s->frameBytes = ccldFrameBytes(s->frameChannels, s->frameGroups);
++  s->frameBlocks = unsigned(envNumber("NCCL_CCLD_FRAME_BLOCKS", CCLD_BLOCKS, CCLD_BLOCKS, CCLD_MAX_BLOCKS));
++  s->slots.reset(new (std::nothrow) CcldSlot[s->frameBlocks]);
++  if (!s->slots) {
++    WARN("CCL-D frame slot metadata allocation failed");
++    fclose(s->out); delete s; return;
++  }
++  s->frameBytes = ccldFrameBytes(s->frameChannels, s->frameGroups, s->frameBlocks);
+   cudaError_t err = cudaHostAlloc((void**)&s->frame, s->frameBytes, cudaHostAllocMapped);
+   if (err == cudaSuccess) err = cudaHostGetDevicePointer((void**)&s->device, s->frame, 0);
+   if (err != cudaSuccess) {
+@@ -293,11 +301,11 @@ void ccldInit(ncclComm* comm) {
+     fclose(s->out); delete s; return;
+   }
+   if (s->useEvent) {
+-    for (int i = 0; i < CCLD_BLOCKS; ++i) {
++    for (unsigned i = 0; i < s->frameBlocks; ++i) {
+       err = cudaEventCreateWithFlags(&s->slots[i].completionEvent, cudaEventDisableTiming);
+       if (err != cudaSuccess) {
+         WARN("CCL-D event allocation failed: %s", cudaGetErrorString(err));
+-        for (int j = 0; j < i; ++j) cudaEventDestroy(s->slots[j].completionEvent);
++        for (unsigned j = 0; j < i; ++j) cudaEventDestroy(s->slots[j].completionEvent);
+         cudaFreeHost(s->frame); fclose(s->out); delete s; return;
+       }
+     }
+@@ -305,6 +313,7 @@ void ccldInit(ncclComm* comm) {
+   memset(s->frame, 0, s->frameBytes); s->frame->mode = mode;
+   gethostname(s->host, sizeof(s->host)-1);
+   CcldLogEvent init = ccldLogBase(s, CcldLogInit, 0, ccldNow());
++  init.reserved = s->frameBlocks; // Version-1 init records used zero before this extension.
+   init.frameBytes = s->frameBytes; init.frameChannels = s->frameChannels; init.frameGroups = s->frameGroups;
+   init.pollUs = s->pollUs; init.mode = s->mode;
+   ccldCopyString(init.host, sizeof(init.host), s->host);
+@@ -317,7 +326,7 @@ void ccldInit(ncclComm* comm) {
+     WARN("CCL-D thread creation failed: %s", e.what());
+     s->writerStop.store(true, std::memory_order_release);
+     if (s->writer.joinable()) s->writer.join();
+-    if (s->useEvent) for (int i = 0; i < CCLD_BLOCKS; ++i) cudaEventDestroy(s->slots[i].completionEvent);
++    if (s->useEvent) for (unsigned i = 0; i < s->frameBlocks; ++i) cudaEventDestroy(s->slots[i].completionEvent);
+     cudaFreeHost(s->frame); fclose(s->out); delete s; return;
+   }
+   comm->ccldState = s;
+@@ -378,7 +387,7 @@ void ccldPlan(ncclComm* comm, ncclKernelPlan* plan) {
+   }
+   CcldStart start = pending.start;
+   pending.owner.store(0, std::memory_order_release);
+-  const int index = int(task->ccldSeq % CCLD_BLOCKS);
++  const int index = int(task->ccldSeq % s->frameBlocks);
+   CcldSlot& slot = s->slots[index];
+   ncclWorkList* node = ncclIntruQueueHead(&plan->workQueue);
+   if (!node || (node->workType != ncclDevWorkTypeColl && node->workType != ncclDevWorkTypeCollReg)) {
+@@ -476,7 +485,7 @@ void ccldFree(ncclComm* comm) {
+   s->writerStop.store(true, std::memory_order_release);
+   s->writer.join();
+   bool active = false;
+-  for (int i = 0; i < CCLD_BLOCKS; ++i) active |= s->slots[i].phase.load(std::memory_order_acquire) != 0;
++  for (unsigned i = 0; i < s->frameBlocks; ++i) active |= s->slots[i].phase.load(std::memory_order_acquire) != 0;
+   active |= s->callbacksOutstanding.load(std::memory_order_acquire) != 0;
+   fclose(s->out);
+   comm->ccldState = nullptr;
+@@ -486,7 +495,7 @@ void ccldFree(ncclComm* comm) {
+     WARN("CCL-D retains pinned storage after incomplete/aborted kernel");
+     return;
+   }
+-  if (s->useEvent) for (int i = 0; i < CCLD_BLOCKS; ++i) cudaEventDestroy(s->slots[i].completionEvent);
++  if (s->useEvent) for (unsigned i = 0; i < s->frameBlocks; ++i) cudaEventDestroy(s->slots[i].completionEvent);
+   cudaFreeHost(s->frame);
+   delete s;
+ }

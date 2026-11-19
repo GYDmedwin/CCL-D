@@ -1,0 +1,597 @@
+diff --git a/src/device/primitives.h b/src/device/primitives.h
+index 73c10c2..c4dfe38 100644
+--- a/src/device/primitives.h
++++ b/src/device/primitives.h
+@@ -11,6 +11,18 @@
+ #include "reduce_kernel.h" // for reduction funcs
+ #include "common_kernel.h"
+ #include "common.h"
++#include "ccld.h"
++
++// One writer per protocol subgroup; tree split executes two groups concurrently.
++__device__ __forceinline__ void ccldCount(CcldBlock* b, int tid, int group, bool send, bool recv) {
++  if (b != nullptr && tid == 0 && ncclShmem.channelId < CCLD_MAX_CHANNELS) {
++    int g = group == 0 ? 0 : 1;
++    volatile uint64_t* s = &b->channel[ncclShmem.channelId].send[g];
++    volatile uint64_t* r = &b->channel[ncclShmem.channelId].recv[g];
++    if (send) *s = *s + 1;
++    if (recv) *r = *r + 1;
++  }
++}
+ 
+ #define NCCL_SPINS_BEFORE_CHECK_ABORT 1000000
+ 
+diff --git a/src/device/prims_ll.h b/src/device/prims_ll.h
+index 3e00f3b..b57da26 100644
+--- a/src/device/prims_ll.h
++++ b/src/device/prims_ll.h
+@@ -13,6 +13,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
+   static constexpr int MaxRecv = Fan::MaxRecv > 1 ? Fan::MaxRecv : 1;
+   static constexpr int MaxSend = Fan::MaxSend;
+   static constexpr int Input=0, Output=1;
++  CcldBlock* ccldBlock;
+   RedOp redOp;
+   const int tid;
+   const int nthreads;
+@@ -240,6 +241,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
+     // Always waitSend in case of cleanup
+     nelem = nelem < 0 ? 0 : nelem;
+     if (SEND) waitSend(divUp(nelem, EltPerLine)*sizeof(ncclLLFifoLine));
++    if (SEND) ccldCount(ccldBlock, tid, group, true, false);
+ 
+     nelem -= tid*EltPerLine;
+     srcElts += tid*EltPerLine;
+@@ -304,6 +306,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
+         incSend(i, offset);
+       incSend(0, offset);
+     }
++    if (RECV) ccldCount(ccldBlock, tid, group, false, true);
+   }
+ 
+   __device__ __forceinline__ void loadRecvConn(struct ncclConnInfo* conn, int i) {
+@@ -339,6 +342,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
+       uint8_t connIndexRecv=0, uint8_t connIndexSend=0, struct ncclDevWorkColl* e = nullptr,
+       bool ipcReg = false, bool netReg = false, int stepSize_ = 0
+     ):
++    ccldBlock(e ? e->ccldBlock : nullptr),
+     redOp(redOpArg),
+     tid(tid), nthreads(nthreads), wid(tid%WARP_SIZE), group(group),
+     stepLines(ncclShmem.comm.buffSizes[NCCL_PROTO_LL]/NCCL_STEPS/sizeof(ncclLLFifoLine)) {
+diff --git a/src/device/prims_ll128.h b/src/device/prims_ll128.h
+index 617b7ac..27764b4 100644
+--- a/src/device/prims_ll128.h
++++ b/src/device/prims_ll128.h
+@@ -14,6 +14,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
+ 
+   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
+   static constexpr int Input=0, Output=1;
++  CcldBlock* ccldBlock;
+   RedOp redOp;
+   const int tid; // thread index in primitives group
+   const int nthreads; // thread count in primitives group
+@@ -308,6 +309,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
+     nelem = nelem < 0 ? 0 : nelem;
+ 
+     if (SEND) waitSend(divUp(nelem, DataEltPerSlice)*WireWordPerSlice*sizeof(uint64_t));
++    if (SEND) ccldCount(ccldBlock, tid, group, true, false);
+     barrier();
+     nelem -= DataEltPerSlice*warp;
+     srcPtr += DataEltPerSlice*warp;
+@@ -330,6 +332,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
+     if (SEND) postSend();
+     if (RECV) for (int i=0; i < MaxRecv; i++) recvStep[i] += 1;
+     if (RECV) postRecv();
++    if (RECV) ccldCount(ccldBlock, tid, group, false, true);
+   }
+ 
+   __device__ __forceinline__ void loadRecvConn(struct ncclConnInfo* conn, int i) {
+@@ -371,6 +374,7 @@ public:
+       uint8_t connIndexRecv=0, uint8_t connIndexSend=0, struct ncclDevWorkColl* e = nullptr,
+       bool ipcReg = false, bool netReg = false, int stepSize_ = 0
+     ):
++    ccldBlock(e ? e->ccldBlock : nullptr),
+     redOp(redOpArg),
+     tid(tid), nthreads(nthreads), wid(tid%WARP_SIZE), warp(tid/WARP_SIZE),
+     warpInBlock(threadIdx.x/WARP_SIZE),
+diff --git a/src/device/prims_simple.h b/src/device/prims_simple.h
+index 0051019..5009a0b 100644
+--- a/src/device/prims_simple.h
++++ b/src/device/prims_simple.h
+@@ -35,6 +35,7 @@ class Primitives<
+                        NvlsMinPolling = 0x1000,
+                        NetDeviceUnpack = 0x2000,
+                        AnyNetDeviceUnpack = 0x4000;
++  CcldBlock* ccldBlock;
+   const int tid, tidInBlock;
+   const int nthreads;
+   int nworkers;
+@@ -323,6 +324,7 @@ class Primitives<
+       offset += sliceSize;
+       slice += 1;
+     }
++    ccldCount(ccldBlock, tid, group, Send, Recv);
+   }
+ 
+ public:
+@@ -598,6 +600,7 @@ private:
+       uint8_t connIndexRecv = 0, uint8_t connIndexSend = 0, struct ncclDevWorkColl* collWork = nullptr,
+       struct ncclDevWorkP2p* p2pWork = nullptr, int stepSize_ = 0, int mode = primsModeDefault
+     ):
++    ccldBlock(collWork ? collWork->ccldBlock : nullptr),
+     tid(tid), nthreads(nthreads), tidInBlock(threadIdx.x), group(group),
+     stepSize(stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T) : stepSize_) {
+ 
+diff --git a/src/enqueue.cc b/src/enqueue.cc
+index 285e17f..8687b3a 100644
+--- a/src/enqueue.cc
++++ b/src/enqueue.cc
+@@ -5,6 +5,7 @@
+  ************************************************************************/
+ 
+ #include "enqueue.h"
++#include "ccld.h"
+ #include "argcheck.h"
+ #include "coll_net.h"
+ #include "gdrwrap.h"
+@@ -1342,6 +1343,7 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
+       if (planner->nTasksColl == 0 && planner->nTasksP2p != 0) {
+         NCCLCHECKGOTO(scheduleP2pTasksToPlan(comm, plan, &budget), result, failure);
+       }
++      if (comm->ccldState) ccldPlan(comm, plan);
+       finishPlan(comm, plan);
+       if (plan->workBytes != 0) {
+         ncclIntruQueueEnqueue(&planner->planQueue, plan);
+@@ -1488,11 +1490,13 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
+ 
+     //CUDACHECK(cudaLaunchKernelExC(&launchConfig, fnAddr, args));
+     CUCHECK(cuLaunchKernelEx(&launchConfig, fn, nullptr, extra));
++    if (plan->ccldSlotPlus1) ccldCallbackEnqueue(comm, plan, launchStream);
+     return ncclSuccess;
+   }
+   #endif
+   // Standard kernel launch
+   CUCHECK(cuLaunchKernel(fn, grid.x, grid.y, grid.z, block.x, block.y, block.z, smem, launchStream, nullptr, extra));
++  if (plan->ccldSlotPlus1) ccldCallbackEnqueue(comm, plan, launchStream);
+   //CUDACHECK(cudaLaunchKernel(fnAddr, grid, block, args, smem, launchStream));
+   return ncclSuccess;
+ }
+@@ -2141,6 +2145,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
+       // Must be in thread local group before tasks can be alloc'd in `comm->memScoped`.
+       ncclGroupCommJoin(info->comm);
+       struct ncclTaskColl* t = ncclMemoryPoolAlloc<struct ncclTaskColl>(&comm->memPool_ncclTaskColl, &comm->memPermanent);
++      t->ccldSeq = comm->ccldState ? ccldEnter(comm, info) : 0;
+       t->func = info->coll;
+       t->sendbuff = info->sendbuff;
+       t->recvbuff = info->recvbuff;
+diff --git a/src/include/ccld.h b/src/include/ccld.h
+new file mode 100644
+index 0000000..11b05d2
+--- /dev/null
++++ b/src/include/ccld.h
+@@ -0,0 +1,38 @@
++#ifndef NCCL_CCLD_H_
++#define NCCL_CCLD_H_
++
++#include <stdint.h>
++#include <stddef.h>
++
++// Pinned host memory. The two subgroups avoid concurrent tree up/down writers.
++#define CCLD_BLOCKS 8
++#define CCLD_MAX_CHANNELS 32
++#define CCLD_GROUPS 2
++struct CcldChannel {
++  uint64_t send[CCLD_GROUPS];
++  uint64_t recv[CCLD_GROUPS];
++};
++struct CcldBlock {
++  uint64_t commHash, opCount;
++  struct CcldChannel channel[CCLD_MAX_CHANNELS];
++};
++struct CcldFrame {
++  uint64_t kernelIndex, mode, counter, detectChannel;
++  struct CcldBlock blocks[CCLD_BLOCKS];
++};
++static_assert(offsetof(CcldFrame, blocks) == 32, "frame header must be 32 bytes");
++
++#ifndef __CUDACC__
++#include <cuda_runtime.h>
++struct ncclComm;
++struct ncclInfo;
++struct ncclTaskColl;
++struct ncclDevWorkColl;
++struct ncclKernelPlan;
++void ccldInit(struct ncclComm* comm);
++void ccldFree(struct ncclComm* comm);
++uint64_t ccldEnter(struct ncclComm* comm, const struct ncclInfo* info);
++void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan);
++void ccldCallbackEnqueue(struct ncclComm* comm, struct ncclKernelPlan* plan, cudaStream_t stream);
++#endif
++#endif
+diff --git a/src/include/comm.h b/src/include/comm.h
+index c3f4eb4..2ec9bf5 100644
+--- a/src/include/comm.h
++++ b/src/include/comm.h
+@@ -180,6 +180,7 @@ struct ncclCollnetHandleList {
+ };
+ 
+ struct ncclTaskColl {
++  uint64_t ccldSeq;
+   struct ncclTaskColl* next;
+   ncclFunc_t func;
+   void const* sendbuff;
+@@ -260,6 +261,7 @@ struct ncclKernelPlan {
+   struct ncclIntruQueue<struct ncclTaskColl, &ncclTaskColl::next> collTaskQueue;
+   struct ncclIntruQueue<struct ncclProxyOp, &ncclProxyOp::enqNext> proxyOpQueue;
+ 
++  int ccldSlotPlus1;
+   // Profiler plugin
+   void* groupEventHandle;
+ };
+@@ -610,6 +612,7 @@ struct ncclComm {
+   bool useNetPXN;
+   bool useGdr;
+   int splitCount;
++  void* ccldState;
+   uint64_t endMagic;
+ };
+ 
+diff --git a/src/include/device.h b/src/include/device.h
+index 0c861f5..6800ec7 100644
+--- a/src/include/device.h
++++ b/src/include/device.h
+@@ -254,7 +254,10 @@ inline __device__ int ncclP2pChannelToPart(int nP2pChannels, int base, int chann
+   return reverseBits(delta, nChannelsLog2);
+ }
+ 
++struct CcldBlock;
++
+ struct alignas(16) ncclDevWorkColl {
++  struct CcldBlock* ccldBlock; // null for disabled/unsupported telemetry
+   // Running on channels [channelLo..channelHi], hi is inclusive.
+   //   nChannels == (channelHi - channelLo) + 1
+   uint32_t channelLo:8, channelHi:8;
+diff --git a/src/init.cc b/src/init.cc
+index 5caaaae..7546ddb 100644
+--- a/src/init.cc
++++ b/src/init.cc
+@@ -5,6 +5,7 @@
+  ************************************************************************/
+ 
+ #include "nccl.h"
++#include "ccld.h"
+ #include "channel.h"
+ #include "nvmlwrap.h"
+ #include "gdrwrap.h"
+@@ -183,6 +184,7 @@ static ncclResult_t commFree(ncclComm_t comm) {
+   if (comm == NULL)
+     return ncclSuccess;
+ 
++  ccldFree(comm);
+   NCCLCHECK(ncclRasCommFini(comm));
+ 
+   /* in commReclaim, we have guaranteed only last rank which calls ncclCommDestroy() will
+@@ -1291,6 +1293,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
+     }
+   }
+ 
++  ccldInit(comm);
++
+   // Call devCommSetup before the last barrier, making sure we don't have a thread running in front and starting to
+   // launch NCCL kernels before all cuda mem allocation is complete. That could cause a deadlock.
+   NCCLCHECKGOTO(devCommSetup(comm), ret, fail);
+diff --git a/src/misc/ccld.cc b/src/misc/ccld.cc
+new file mode 100644
+index 0000000..0d5ccfb
+--- /dev/null
++++ b/src/misc/ccld.cc
+@@ -0,0 +1,310 @@
++#include "ccld.h"
++#include "comm.h"
++#include "info.h"
++#include "collectives.h"
++#include "debug.h"
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <inttypes.h>
++#include <map>
++#include <mutex>
++#include <thread>
++#include <time.h>
++#include <unistd.h>
++
++static uint64_t ccldNow() {
++  struct timespec t;
++  clock_gettime(CLOCK_MONOTONIC, &t);
++  return uint64_t(t.tv_sec) * 1000000000ull + t.tv_nsec;
++}
++
++struct CcldStart {
++  uint64_t ns, count, bytes;
++  const char* op;
++  const char* dtype;
++};
++struct CcldSlot {
++  bool active = false;
++  std::atomic<bool> done{false};
++  std::atomic<uint64_t> endNs{0};
++  uint64_t seq = 0, startNs = 0, lastDumpNs = 0;
++  uint64_t count = 0, bytes = 0;
++  const char* op = nullptr;
++  const char* dtype = nullptr;
++  const char* algo = nullptr;
++  const char* proto = nullptr;
++  int lo = 0, hi = -1;
++  int parents[CCLD_MAX_CHANNELS] = {};
++  uint64_t lastSend[CCLD_MAX_CHANNELS] = {}, lastRecv[CCLD_MAX_CHANNELS] = {};
++  uint64_t dumpSend[CCLD_MAX_CHANNELS] = {}, dumpRecv[CCLD_MAX_CHANNELS] = {};
++  uint64_t changesSend[CCLD_MAX_CHANNELS] = {}, changesRecv[CCLD_MAX_CHANNELS] = {};
++};
++struct CcldState {
++  std::mutex mu;
++  std::condition_variable cv;
++  bool stop = false;
++  FILE* out = nullptr;
++  CcldFrame* frame = nullptr;
++  CcldFrame* device = nullptr;
++  std::thread thread;
++  CcldSlot slots[CCLD_BLOCKS];
++  std::map<uint64_t, CcldStart> pending;
++  uint64_t hash = 0, counter = 0, pollUs = 200, dumpNs = 1000000000ull;
++  int rank = 0, nranks = 0;
++};
++struct CcldCallback { CcldState* state; int slot; };
++
++static uint64_t envNumber(const char* key, uint64_t fallback, uint64_t lo, uint64_t hi) {
++  const char* s = getenv(key);
++  if (!s || !*s) return fallback;
++  char* end = nullptr;
++  unsigned long long v = strtoull(s, &end, 10);
++  return end != s && *end == 0 && v >= lo && v <= hi ? v : fallback;
++}
++static void ccldPrefix(CcldState* s, const char* type, uint64_t seq, uint64_t now) {
++  fprintf(s->out, "{\"event\":\"%s\",\"comm_hash\":\"%016" PRIx64 "\",\"rank\":%d,\"world_size\":%d,\"mono_ns\":%" PRIu64 ",\"op_count\":%" PRIu64,
++          type, s->hash, s->rank, s->nranks, now, seq);
++}
++static void ccldStatus(CcldState* s, const char* type, uint64_t seq, const char* reason) {
++  ccldPrefix(s, type, seq, ccldNow());
++  fprintf(s->out, ",\"reason\":\"%s\"}\n", reason);
++  fflush(s->out);
++}
++static uint64_t ccldLoad(const uint64_t* p) {
++  return *(const volatile uint64_t*)p;
++}
++static void ccldSample(CcldState* s, int idx) {
++  CcldSlot& slot = s->slots[idx];
++  const CcldBlock& b = s->frame->blocks[idx];
++  for (int c = slot.lo; c <= slot.hi; ++c) {
++    uint64_t send = 0, recv = 0;
++    for (int g = 0; g < CCLD_GROUPS; ++g) {
++      send += ccldLoad(&b.channel[c].send[g]);
++      recv += ccldLoad(&b.channel[c].recv[g]);
++    }
++    if (send != slot.lastSend[c]) ++slot.changesSend[c];
++    if (recv != slot.lastRecv[c]) ++slot.changesRecv[c];
++    slot.lastSend[c] = send;
++    slot.lastRecv[c] = recv;
++  }
++}
++static void ccldEmit(CcldState* s, int idx, const char* type, uint64_t now) {
++  CcldSlot& slot = s->slots[idx];
++  const uint64_t elapsed = now >= slot.startNs ? now - slot.startNs : 0;
++  const uint64_t window = now > slot.lastDumpNs ? now - slot.lastDumpNs : 1;
++  ccldPrefix(s, type, slot.seq, now);
++  fprintf(s->out, ",\"start_mono_ns\":%" PRIu64 ",\"duration_ns\":%" PRIu64
++          ",\"op\":\"%s\",\"algorithm\":\"%s\",\"protocol\":\"%s\",\"datatype\":\"%s\",\"count\":%" PRIu64
++          ",\"bytes\":%" PRIu64 ",\"n_channels\":%d,\"channels\":[",
++          slot.startNs, elapsed, slot.op, slot.algo, slot.proto, slot.dtype, slot.count,
++          slot.bytes, slot.hi-slot.lo+1);
++  for (int c = slot.lo; c <= slot.hi; ++c) {
++    if (c != slot.lo) fputc(',', s->out);
++    fprintf(s->out, "{\"id\":%d,\"tree_parent\":%d,\"send_count\":%" PRIu64 ",\"recv_count\":%" PRIu64 ",\"send_rate\":",
++            c, slot.parents[c], slot.lastSend[c], slot.lastRecv[c]);
++    if (slot.changesSend[c]) fprintf(s->out, "%.12g", 1.0 / slot.changesSend[c]);
++    else fputs("null", s->out);
++    fputs(",\"recv_rate\":", s->out);
++    if (slot.changesRecv[c]) fprintf(s->out, "%.12g", 1.0 / slot.changesRecv[c]);
++    else fputs("null", s->out);
++    fprintf(s->out, ",\"send_delta_per_ms\":%.12g,\"recv_delta_per_ms\":%.12g}",
++            double(slot.lastSend[c] - slot.dumpSend[c])*1e6/window,
++            double(slot.lastRecv[c] - slot.dumpRecv[c])*1e6/window);
++    slot.dumpSend[c] = slot.lastSend[c];
++    slot.dumpRecv[c] = slot.lastRecv[c];
++    slot.changesSend[c] = slot.changesRecv[c] = 0;
++  }
++  fputs("]", s->out);
++  if (strcmp(type, "complete") == 0) {
++    double busbw = elapsed ? double(slot.bytes)*2.0*(s->nranks-1)/s->nranks / double(elapsed) : 0.0;
++    fprintf(s->out, ",\"busbw_gbps\":%.12g", busbw);
++  }
++  fputs("}\n", s->out);
++  fflush(s->out);
++  slot.lastDumpNs = now;
++}
++static void ccldWorker(CcldState* s) {
++  std::unique_lock<std::mutex> lock(s->mu);
++  uint64_t lastHeartbeat = ccldNow();
++  while (!s->stop) {
++    s->cv.wait_for(lock, std::chrono::microseconds(s->pollUs));
++    uint64_t now = ccldNow();
++    for (int i = 0; i < CCLD_BLOCKS; ++i) {
++      CcldSlot& slot = s->slots[i];
++      if (!slot.active) continue;
++      ccldSample(s, i);
++      if (slot.done.load(std::memory_order_acquire)) {
++        uint64_t end = slot.endNs.load(std::memory_order_relaxed);
++        ccldEmit(s, i, "complete", end);
++        slot.active = false;
++      } else if (now - slot.lastDumpNs >= s->dumpNs) {
++        ccldEmit(s, i, "snapshot", now);
++      }
++    }
++    if (now - lastHeartbeat >= s->dumpNs) {
++      ccldPrefix(s, "heartbeat", s->counter, now);
++      fputs("}\n", s->out);
++      fflush(s->out);
++      lastHeartbeat = now;
++    }
++  }
++  // Drain already completed slots even if shutdown follows a callback quickly.
++  for (int i = 0; i < CCLD_BLOCKS; ++i) {
++    CcldSlot& slot = s->slots[i];
++    if (!slot.active) continue;
++    ccldSample(s, i);
++    if (slot.done.load(std::memory_order_acquire)) {
++      ccldEmit(s, i, "complete", slot.endNs.load(std::memory_order_relaxed));
++      slot.active = false;
++    } else {
++      ccldEmit(s, i, "snapshot", ccldNow());
++    }
++  }
++}
++void ccldInit(ncclComm* comm) {
++  static_assert(MAXCHANNELS <= CCLD_MAX_CHANNELS, "increase CCLD_MAX_CHANNELS");
++  if (envNumber("NCCL_CCLD_ENABLE", 0, 0, 1) != 1) return;
++  uint64_t mode = envNumber("NCCL_CCLD_MODE", 1, 0, 2);
++  if (mode == 0) return;
++  if (mode != 1) {
++    WARN("CCL-D prototype supports mode 1 only; telemetry disabled");
++    return;
++  }
++  const char* dir = getenv("NCCL_CCLD_OUT_DIR");
++  if (!dir || !*dir) {
++    WARN("CCL-D requires an existing NCCL_CCLD_OUT_DIR; telemetry disabled");
++    return;
++  }
++  CcldState* s = new CcldState();
++  s->rank = comm->rank; s->nranks = comm->nRanks; s->hash = comm->commHash;
++  s->pollUs = envNumber("NCCL_CCLD_POLL_US", 200, 20, 1000000);
++  s->dumpNs = envNumber("NCCL_CCLD_DUMP_MS", 1000, 10, 60000) * 1000000ull;
++  char path[4096];
++  int n = snprintf(path, sizeof(path), "%s/ccld-%016" PRIx64 "-rank%d-pid%ld.jsonl", dir, s->hash, s->rank, (long)getpid());
++  if (n < 0 || size_t(n) >= sizeof(path) || (s->out = fopen(path, "w")) == nullptr) {
++    WARN("CCL-D cannot open output; telemetry disabled"); delete s; return;
++  }
++  cudaError_t err = cudaHostAlloc((void**)&s->frame, sizeof(CcldFrame), cudaHostAllocMapped);
++  if (err == cudaSuccess) err = cudaHostGetDevicePointer((void**)&s->device, s->frame, 0);
++  if (err != cudaSuccess) {
++    WARN("CCL-D mapped allocation failed: %s", cudaGetErrorString(err));
++    if (s->frame) cudaFreeHost(s->frame);
++    fclose(s->out); delete s; return;
++  }
++  memset(s->frame, 0, sizeof(CcldFrame)); s->frame->mode = 1;
++  ccldPrefix(s, "comm_init", 0, ccldNow());
++  fprintf(s->out, ",\"frame_bytes\":%zu,\"poll_us\":%" PRIu64 "}\n", sizeof(CcldFrame), s->pollUs);
++  fflush(s->out);
++  comm->ccldState = s;
++  s->thread = std::thread(ccldWorker, s);
++}
++uint64_t ccldEnter(ncclComm* comm, const ncclInfo* info) {
++  CcldState* s = static_cast<CcldState*>(comm->ccldState);
++  std::lock_guard<std::mutex> lock(s->mu);
++  uint64_t seq = ++s->counter;
++  uint64_t now = ccldNow();
++  CcldStart start{now, info->count, info->count * uint64_t(ncclTypeSize(info->datatype)),
++                  ncclFuncToString(info->coll), ncclDatatypeToString(info->datatype)};
++  s->pending[seq] = start;
++  ccldPrefix(s, "entered", seq, now);
++  fprintf(s->out, ",\"op\":\"%s\",\"count\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"datatype\":\"%s\"}\n",
++          start.op, start.count, start.bytes, start.dtype);
++  fflush(s->out);
++  return seq;
++}
++void ccldPlan(ncclComm* comm, ncclKernelPlan* plan) {
++  CcldState* s = static_cast<CcldState*>(comm->ccldState);
++  std::lock_guard<std::mutex> lock(s->mu);
++  ncclTaskColl* task = ncclIntruQueueHead(&plan->collTaskQueue);
++  if (!task) return;
++  const bool supported = !plan->persistent && !task->next && ncclIntruQueueEmpty(&plan->p2pTaskQueue) &&
++      task->func == ncclFuncAllReduce && (task->algorithm == NCCL_ALGO_RING || task->algorithm == NCCL_ALGO_TREE);
++  if (!supported) {
++    for (ncclTaskColl* t = task; t; t = t->next) {
++      ccldStatus(s, "dropped", t->ccldSeq, "unsupported_group_graph_or_operation");
++      s->pending.erase(t->ccldSeq);
++    }
++    return;
++  }
++  auto it = s->pending.find(task->ccldSeq);
++  if (it == s->pending.end()) return;
++  const int index = int(task->ccldSeq % CCLD_BLOCKS);
++  CcldSlot& slot = s->slots[index];
++  if (slot.active) {
++    ccldStatus(s, "dropped", task->ccldSeq, "frame_slot_busy");
++    s->pending.erase(it); return;
++  }
++  ncclWorkList* node = ncclIntruQueueHead(&plan->workQueue);
++  if (!node || (node->workType != ncclDevWorkTypeColl && node->workType != ncclDevWorkTypeCollReg)) {
++    ccldStatus(s, "dropped", task->ccldSeq, "unexpected_work_type");
++    s->pending.erase(it); return;
++  }
++  ncclDevWorkColl* work = reinterpret_cast<ncclDevWorkColl*>(node + 1);
++  memset(&s->frame->blocks[index], 0, sizeof(CcldBlock));
++  s->frame->blocks[index].commHash = s->hash;
++  s->frame->blocks[index].opCount = task->ccldSeq;
++  s->frame->kernelIndex = index; s->frame->counter = task->ccldSeq;
++  s->frame->detectChannel = work->channelHi - work->channelLo + 1;
++  slot.seq = task->ccldSeq; slot.startNs = it->second.ns; slot.lastDumpNs = slot.startNs;
++  slot.count = it->second.count; slot.bytes = it->second.bytes;
++  slot.op = it->second.op; slot.dtype = it->second.dtype;
++  slot.algo = ncclAlgoToString(task->algorithm); slot.proto = ncclProtoToString(task->protocol);
++  slot.lo = work->channelLo; slot.hi = work->channelHi;
++  for (int c = 0; c < CCLD_MAX_CHANNELS; ++c) {
++    slot.parents[c] = comm->channels[c].tree.up;
++    slot.lastSend[c] = slot.lastRecv[c] = slot.dumpSend[c] = slot.dumpRecv[c] = 0;
++    slot.changesSend[c] = slot.changesRecv[c] = 0;
++  }
++  slot.done.store(false, std::memory_order_relaxed); slot.endNs.store(0, std::memory_order_relaxed);
++  slot.active = true;
++  work->ccldBlock = &s->device->blocks[index];
++  plan->ccldSlotPlus1 = index + 1;
++  s->pending.erase(it);
++  s->cv.notify_one();
++}
++static void CUDART_CB ccldDone(void* data) {
++  CcldCallback* cb = static_cast<CcldCallback*>(data);
++  CcldSlot& slot = cb->state->slots[cb->slot];
++  slot.endNs.store(ccldNow(), std::memory_order_relaxed);
++  slot.done.store(true, std::memory_order_release);
++  cb->state->cv.notify_one();
++  delete cb;
++}
++void ccldCallbackEnqueue(ncclComm* comm, ncclKernelPlan* plan, cudaStream_t stream) {
++  CcldState* s = static_cast<CcldState*>(comm->ccldState);
++  CcldCallback* cb = new CcldCallback{s, plan->ccldSlotPlus1-1};
++  cudaError_t err = cudaLaunchHostFunc(stream, ccldDone, cb);
++  if (err != cudaSuccess) {
++    delete cb;
++    std::lock_guard<std::mutex> lock(s->mu);
++    ccldStatus(s, "dropped", s->slots[plan->ccldSlotPlus1-1].seq, "host_callback_failed");
++    WARN("CCL-D callback enqueue failed: %s", cudaGetErrorString(err));
++    // Do not reuse the slot: the kernel may still be writing to it.
++  }
++}
++void ccldFree(ncclComm* comm) {
++  CcldState* s = static_cast<CcldState*>(comm->ccldState);
++  if (!s) return;
++  {
++    std::lock_guard<std::mutex> lock(s->mu);
++    s->stop = true; s->cv.notify_one();
++  }
++  s->thread.join();
++  bool active = false;
++  for (int i = 0; i < CCLD_BLOCKS; ++i) active |= s->slots[i].active && !s->slots[i].done.load(std::memory_order_acquire);
++  fclose(s->out);
++  comm->ccldState = nullptr;
++  if (active) {
++    // An aborted/erroring CUDA stream may suppress callbacks. Keep storage alive
++    // until process exit rather than risking a device or callback use-after-free.
++    WARN("CCL-D retains pinned storage after incomplete/aborted kernel");
++    return;
++  }
++  cudaFreeHost(s->frame);
++  delete s;
++}
