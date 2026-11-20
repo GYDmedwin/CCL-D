@@ -1533,6 +1533,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
 
   if (planner->numStreams == 1 && !plan->persistent) {
     CUDACHECK(hipExtLaunchKernel(plan->kernelFn, grid, block, extra, 0, launchStream, NULL, comm->doneEvent, 0));
+    if (plan->ccldSlotPlus1) ccldCallbackEnqueue(comm, plan, launchStream);
     comm->lastStream = planner->streams->stream;
     return ncclSuccess;
   }
@@ -1588,12 +1589,14 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
 
     //CUDACHECK(cudaLaunchKernelExC(&launchConfig, fnAddr, args));
     CUCHECK(cuLaunchKernelEx(&launchConfig, fn, nullptr, extra));
+    if (plan->ccldSlotPlus1) ccldCallbackEnqueue(comm, plan, launchStream);
     return ncclSuccess;
   }
   #endif
   // Standard kernel launch
   //cuLaunchKernel(sym, grid.x, grid.y, grid.z, block.x, block.y, block.z, smem, launchStream, nullptr, extra);
   CUDACHECK(cudaLaunchKernel(sym, grid, block, extra, smem, launchStream));
+  if (plan->ccldSlotPlus1) ccldCallbackEnqueue(comm, plan, launchStream);
   return ncclSuccess;
 }
 

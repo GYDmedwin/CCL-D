@@ -1,5 +1,6 @@
 #include "ccld.h"
 #include "ccld_alloc.h"
+#include "ccld_log.h"
 #include "ccld_pending.h"
 #include "ccld_plan.h"
 #include "comm.h"
@@ -9,10 +10,17 @@
 #include "utils.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <inttypes.h>
+#include <mutex>
 #include <new>
+#include <thread>
 #include <strings.h>
+#include <unistd.h>
 
 namespace {
 
@@ -42,10 +50,43 @@ struct CcldState {
   CcldPendingTable<256> pending;
   struct Slot {
     std::atomic<int> phase{0};
+    std::atomic<bool> done{false};
+    std::atomic<bool> eventRecorded{false};
+    std::atomic<uint64_t> endNs{0};
+    hipEvent_t completionEvent = nullptr;
+    std::atomic<bool> eventFailed{false};
     uint64_t seq = 0;
+    uint64_t startNs = 0, lastDumpNs = 0;
+    uint64_t count = 0, bytes = 0;
+    const char* op = nullptr;
+    const char* datatype = nullptr;
+    const char* algorithm = nullptr;
+    const char* protocol = nullptr;
+    int channelLo = 0, channelHi = -1;
+    int parents[CCLD_MAX_CHANNELS] = {};
+    uint64_t lastSend[CCLD_MAX_CHANNELS] = {};
+    uint64_t lastRecv[CCLD_MAX_CHANNELS] = {};
+    uint64_t dumpSend[CCLD_MAX_CHANNELS] = {};
+    uint64_t dumpRecv[CCLD_MAX_CHANNELS] = {};
+    uint64_t changesSend[CCLD_MAX_CHANNELS] = {};
+    uint64_t changesRecv[CCLD_MAX_CHANNELS] = {};
   };
   std::unique_ptr<Slot[]> slots;
+  std::thread sampler;
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::mutex outputMutex;
+  std::atomic<bool> stop{false};
+  std::atomic<int> callbacksOutstanding{0};
+  FILE* output = nullptr;
+  uint64_t commHash = 0;
+  uint64_t pollUs = 200;
+  uint64_t dumpNs = 1000000000ull;
+  int rank = 0, nranks = 0, device = -1;
+  bool useEvent = true;
 };
+
+struct CcldCallback { CcldState* state; unsigned slot; };
 
 static CcldState* ccldState(struct ncclComm* comm) {
   return comm == nullptr ? nullptr : static_cast<CcldState*>(comm->ccldState);
@@ -53,6 +94,160 @@ static CcldState* ccldState(struct ncclComm* comm) {
 
 static bool ccldEnabled() {
   return ccldEnvNumber("NCCL_CCLD_ENABLE", 0, 0, 1) == 1;
+}
+
+static uint64_t ccldNow() { return clockNano(); }
+
+static CcldLogEvent ccldLogBase(CcldState* state, CcldLogType type,
+                                uint64_t seq, uint64_t now) {
+  CcldLogEvent event{};
+  event.magic = 0x444c4343u;
+  event.version = 1;
+  event.type = type;
+  event.hash = state->commHash;
+  event.seq = seq;
+  event.nowNs = now;
+  event.rank = state->rank;
+  event.nranks = state->nranks;
+  return event;
+}
+
+static void ccldWrite(CcldState* state, const CcldLogEvent& event) {
+  std::lock_guard<std::mutex> lock(state->outputMutex);
+  if (state->output != nullptr) {
+    if (fwrite(&event, sizeof(event), 1, state->output) != 1 || fflush(state->output) != 0)
+      WARN("CCL-D rank %d failed to write telemetry", state->rank);
+  }
+}
+
+static void ccldDropped(CcldState* state, uint64_t seq, const char* reason) {
+  CcldLogEvent event = ccldLogBase(state, CcldLogDropped, seq, ccldNow());
+  snprintf(event.reason, sizeof(event.reason), "%s", reason);
+  ccldWrite(state, event);
+}
+
+static uint64_t ccldLoad(const uint64_t* value) {
+  return *reinterpret_cast<const volatile uint64_t*>(value);
+}
+
+static void ccldSample(CcldState* state, unsigned index) {
+  CcldState::Slot& slot = state->slots[index];
+  CcldBlock* block = ccldFrameBlock(state->frame, index, state->frameChannels, state->frameGroups);
+  CcldChannel* channels = reinterpret_cast<CcldChannel*>(
+      reinterpret_cast<unsigned char*>(block) + offsetof(CcldBlock, channel));
+  for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) {
+    uint64_t send = 0, recv = 0;
+    for (unsigned group = 0; group < state->frameGroups; ++group) {
+      const CcldChannel& counts = channels[channel * state->frameGroups + group];
+      send += ccldLoad(&counts.send);
+      recv += ccldLoad(&counts.recv);
+    }
+    if (send != slot.lastSend[channel]) ++slot.changesSend[channel];
+    if (recv != slot.lastRecv[channel]) ++slot.changesRecv[channel];
+    slot.lastSend[channel] = send;
+    slot.lastRecv[channel] = recv;
+  }
+}
+
+static void ccldEmit(CcldState* state, unsigned index, bool complete, uint64_t now) {
+  CcldState::Slot& slot = state->slots[index];
+  const uint64_t window = now > slot.lastDumpNs ? now - slot.lastDumpNs : 1;
+  CcldLogEvent event = ccldLogBase(state, complete ? CcldLogComplete : CcldLogSnapshot,
+                                   slot.seq, now);
+  event.startNs = slot.startNs;
+  event.windowNs = window;
+  event.count = slot.count;
+  event.bytes = slot.bytes;
+  event.nChannels = slot.channelHi - slot.channelLo + 1;
+  snprintf(event.op, sizeof(event.op), "%s", slot.op ? slot.op : "");
+  snprintf(event.algorithm, sizeof(event.algorithm), "%s", slot.algorithm ? slot.algorithm : "");
+  snprintf(event.protocol, sizeof(event.protocol), "%s", slot.protocol ? slot.protocol : "");
+  snprintf(event.datatype, sizeof(event.datatype), "%s", slot.datatype ? slot.datatype : "");
+  for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) {
+    CcldLogChannel& output = event.channels[channel - slot.channelLo];
+    output.id = channel;
+    output.parent = slot.parents[channel];
+    output.send = slot.lastSend[channel];
+    output.recv = slot.lastRecv[channel];
+    output.sendChanges = slot.changesSend[channel];
+    output.recvChanges = slot.changesRecv[channel];
+    output.sendDelta = slot.lastSend[channel] - slot.dumpSend[channel];
+    output.recvDelta = slot.lastRecv[channel] - slot.dumpRecv[channel];
+    slot.dumpSend[channel] = slot.lastSend[channel];
+    slot.dumpRecv[channel] = slot.lastRecv[channel];
+    slot.changesSend[channel] = slot.changesRecv[channel] = 0;
+  }
+  ccldWrite(state, event);
+  slot.lastDumpNs = now;
+}
+
+static void ccldSampler(CcldState* state) {
+  const bool eventDeviceReady = !state->useEvent || hipSetDevice(state->device) == hipSuccess;
+  if (!eventDeviceReady)
+    WARN("CCL-D rank %d sampler could not select device %d", state->rank, state->device);
+  std::unique_lock<std::mutex> lock(state->mutex);
+  while (!state->stop.load(std::memory_order_acquire)) {
+    state->cv.wait_for(lock, std::chrono::microseconds(state->pollUs));
+    const uint64_t now = ccldNow();
+    for (unsigned i = 0; i < state->frameBlocks; ++i) {
+      CcldState::Slot& slot = state->slots[i];
+      if (slot.phase.load(std::memory_order_acquire) != 2) continue;
+      ccldSample(state, i);
+      if (state->useEvent && !eventDeviceReady && slot.eventRecorded.load(std::memory_order_acquire) &&
+          !slot.eventFailed.exchange(true, std::memory_order_acq_rel)) {
+        ccldDropped(state, slot.seq, "completion_event_worker_device_setup_failed");
+      }
+      if (state->useEvent && eventDeviceReady && slot.eventRecorded.load(std::memory_order_acquire) &&
+          !slot.done.load(std::memory_order_relaxed) &&
+          !slot.eventFailed.load(std::memory_order_relaxed)) {
+        hipError_t query = hipEventQuery(slot.completionEvent);
+        if (query == hipSuccess) {
+          ccldSample(state, i);
+          slot.endNs.store(ccldNow(), std::memory_order_relaxed);
+          slot.done.store(true, std::memory_order_release);
+        } else if (query != hipErrorNotReady) {
+          slot.eventFailed.store(true, std::memory_order_release);
+          ccldDropped(state, slot.seq, "completion_event_query_failed");
+        }
+      }
+      if (slot.done.load(std::memory_order_acquire)) {
+        ccldEmit(state, i, true, slot.endNs.load(std::memory_order_relaxed));
+        slot.phase.store(0, std::memory_order_release);
+      } else if (now - slot.lastDumpNs >= state->dumpNs) {
+        ccldEmit(state, i, false, now);
+      }
+    }
+  }
+  for (unsigned i = 0; i < state->frameBlocks; ++i) {
+    CcldState::Slot& slot = state->slots[i];
+    if (slot.phase.load(std::memory_order_acquire) != 2) continue;
+    ccldSample(state, i);
+    if (state->useEvent && eventDeviceReady && slot.eventRecorded.load(std::memory_order_acquire) &&
+        !slot.done.load(std::memory_order_relaxed) &&
+        !slot.eventFailed.load(std::memory_order_relaxed) &&
+        hipEventQuery(slot.completionEvent) == hipSuccess) {
+      ccldSample(state, i);
+      slot.endNs.store(ccldNow(), std::memory_order_relaxed);
+      slot.done.store(true, std::memory_order_release);
+    }
+    if (slot.done.load(std::memory_order_acquire)) {
+      ccldEmit(state, i, true, slot.endNs.load(std::memory_order_relaxed));
+      slot.phase.store(0, std::memory_order_release);
+    } else {
+      ccldEmit(state, i, false, ccldNow());
+    }
+  }
+}
+
+static void ccldDone(void* data) {
+  CcldCallback* callback = static_cast<CcldCallback*>(data);
+  CcldState* state = callback->state;
+  CcldState::Slot& slot = state->slots[callback->slot];
+  slot.endNs.store(ccldNow(), std::memory_order_relaxed);
+  slot.done.store(true, std::memory_order_release);
+  state->cv.notify_one();
+  delete callback;
+  state->callbacksOutstanding.fetch_sub(1, std::memory_order_release);
 }
 
 } // namespace
@@ -75,6 +270,14 @@ void ccldInit(struct ncclComm* comm) {
     return;
   }
   state->mode = mode;
+  state->commHash = comm->commHash;
+  state->rank = comm->rank;
+  state->nranks = comm->nRanks;
+  state->device = comm->cudaDev;
+  state->pollUs = ccldEnvNumber("NCCL_CCLD_POLL_US", 200, 20, 1000000);
+  state->dumpNs = ccldEnvNumber("NCCL_CCLD_DUMP_MS", 1000, 10, 60000) * 1000000ull;
+  const char* completion = ncclGetEnv("NCCL_CCLD_COMPLETION");
+  state->useEvent = completion == nullptr || strcmp(completion, "hostfunc") != 0;
   state->frameChannels = static_cast<unsigned>(comm->nChannels);
   const char* algorithm = ncclGetEnv("NCCL_ALGO");
   state->frameGroups = algorithm != nullptr && strcasecmp(algorithm, "Ring") == 0 ? 1 : CCLD_GROUPS;
@@ -98,18 +301,62 @@ void ccldInit(struct ncclComm* comm) {
   state->frame->mode = mode;
   state->frame->detectChannel = state->frameChannels;
 
-  const bool waitRequested = ccldEnvNumber("NCCL_CCLD_WAIT_ENABLE", 0, 0, 1) == 1;
-  if (waitRequested && state->frameGroups == 1) {
-    state->waitBlockBytes = size_t(state->frameChannels) * sizeof(CcldWaitChannel);
-    state->waitBytes = state->frameBlocks * state->waitBlockBytes;
-    error = ccldMappedHostAlloc(&state->waitAllocation, state->waitBytes);
-    if (error != hipSuccess) {
-      WARN("CCL-D wait frame allocation failed: %s", hipGetErrorString(error));
+  const char* outputDir = ncclGetEnv("NCCL_CCLD_OUT_DIR");
+  if (outputDir != nullptr && *outputDir != '\0') {
+    char path[4096];
+    const int length = snprintf(path, sizeof(path), "%s/ccld-%016" PRIx64 "-rank%d-pid%ld.ccldbin",
+                                outputDir, state->commHash, state->rank, static_cast<long>(getpid()));
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(path) ||
+        (state->output = fopen(path, "wb")) == nullptr) {
+      WARN("CCL-D rank %d could not open telemetry output", state->rank);
       ccldMappedHostFree(&state->frameAllocation);
       delete state;
       return;
     }
-    state->waitFrame = static_cast<CcldWaitChannel*>(state->waitAllocation.host);
+  }
+  if (state->output == nullptr) {
+    WARN("CCL-D requires NCCL_CCLD_OUT_DIR for binary telemetry");
+    ccldMappedHostFree(&state->frameAllocation);
+    delete state;
+    return;
+  }
+
+  if (state->useEvent) {
+    for (unsigned i = 0; i < state->frameBlocks; ++i) {
+      error = hipEventCreateWithFlags(&state->slots[i].completionEvent, hipEventDisableTiming);
+      if (error != hipSuccess) {
+        WARN("CCL-D completion event allocation failed: %s", hipGetErrorString(error));
+        for (unsigned j = 0; j < i; ++j) hipEventDestroy(state->slots[j].completionEvent);
+        ccldMappedHostFree(&state->waitAllocation);
+        ccldMappedHostFree(&state->frameAllocation);
+        if (state->output != nullptr) fclose(state->output);
+        delete state;
+        return;
+      }
+    }
+  }
+  memset(state->frame, 0, state->frameBytes);
+  state->frame->mode = mode;
+  CcldLogEvent init = ccldLogBase(state, CcldLogInit, 0, ccldNow());
+  init.reserved = state->frameBlocks;
+  init.frameBytes = static_cast<uint32_t>(state->frameBytes);
+  init.frameChannels = state->frameChannels;
+  init.frameGroups = state->frameGroups;
+  init.pollUs = static_cast<uint32_t>(state->pollUs);
+  init.mode = static_cast<uint32_t>(state->mode);
+  snprintf(init.reason, sizeof(init.reason), "%s", state->useEvent ? "event_query" : "hostfunc");
+  ccldWrite(state, init);
+  try {
+    state->sampler = std::thread(ccldSampler, state);
+  } catch (const std::exception& errorException) {
+    WARN("CCL-D sampler creation failed: %s", errorException.what());
+    if (state->useEvent) for (unsigned i = 0; i < state->frameBlocks; ++i)
+      hipEventDestroy(state->slots[i].completionEvent);
+    ccldMappedHostFree(&state->waitAllocation);
+    ccldMappedHostFree(&state->frameAllocation);
+    if (state->output != nullptr) fclose(state->output);
+    delete state;
+    return;
   }
   comm->ccldState = state;
 }
@@ -117,7 +364,25 @@ void ccldInit(struct ncclComm* comm) {
 void ccldFree(struct ncclComm* comm) {
   CcldState* state = ccldState(comm);
   if (state == nullptr) return;
+  state->stop.store(true, std::memory_order_release);
+  state->cv.notify_one();
+  if (state->sampler.joinable()) state->sampler.join();
+  bool active = state->callbacksOutstanding.load(std::memory_order_acquire) != 0;
+  for (unsigned i = 0; i < state->frameBlocks; ++i)
+    active = active || state->slots[i].phase.load(std::memory_order_acquire) != 0;
   comm->ccldState = nullptr;
+  if (active) {
+    WARN("CCL-D retains mapped storage while completion callback is active");
+    return;
+  }
+  if (state->useEvent) for (unsigned i = 0; i < state->frameBlocks; ++i)
+    hipEventDestroy(state->slots[i].completionEvent);
+  if (state->output != nullptr) {
+    CcldLogEvent end = ccldLogBase(state, CcldLogEnd, state->sequence.next(), ccldNow());
+    ccldWrite(state, end);
+    fclose(state->output);
+    state->output = nullptr;
+  }
   ccldMappedHostFree(&state->waitAllocation);
   ccldMappedHostFree(&state->frameAllocation);
   delete state;
@@ -149,7 +414,16 @@ uint64_t ccldEnter(struct ncclComm* comm, const struct ncclInfo* info) {
   }
   CcldStart start{clockNano(), static_cast<uint64_t>(info->count), bytes,
                   ncclFuncToString(info->coll), ncclDatatypeToString(info->datatype)};
-  if (!state->pending.publish(seq, start)) return seq;
+  if (!state->pending.publish(seq, start)) {
+    ccldDropped(state, seq, "pending_ring_full_or_counter_wrap");
+    return seq;
+  }
+  CcldLogEvent entered = ccldLogBase(state, CcldLogEntered, seq, start.ns);
+  entered.count = start.count;
+  entered.bytes = start.bytes;
+  snprintf(entered.op, sizeof(entered.op), "%s", start.op ? start.op : "");
+  snprintf(entered.datatype, sizeof(entered.datatype), "%s", start.datatype ? start.datatype : "");
+  ccldWrite(state, entered);
   return seq;
 }
 
@@ -192,15 +466,28 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   const CcldPlanDecision decision = ccldPlanDecision(descriptor);
   if (!decision.supported()) {
     state->pending.forget(plan->ccldSeq);
+    ccldDropped(state, plan->ccldSeq, ccldPlanReasonString(decision.reason));
+    return;
+  }
+  if (plan->ccldFunc != ncclFuncAllReduce || plan->ccldAlgorithm != NCCL_ALGO_RING ||
+      plan->ccldProtocol != NCCL_PROTO_SIMPLE) {
+    state->pending.forget(plan->ccldSeq);
+    ccldDropped(state, plan->ccldSeq, "p4_simple_ring_allreduce_only");
     return;
   }
 
   CcldStart start{};
-  if (!state->pending.take(plan->ccldSeq, &start)) return;
+  if (!state->pending.take(plan->ccldSeq, &start)) {
+    ccldDropped(state, plan->ccldSeq, "pending_metadata_missing");
+    return;
+  }
   const unsigned index = static_cast<unsigned>(plan->ccldSeq % state->frameBlocks);
   CcldState::Slot& slot = state->slots[index];
   int freePhase = 0;
-  if (!slot.phase.compare_exchange_strong(freePhase, 1, std::memory_order_acq_rel)) return;
+  if (!slot.phase.compare_exchange_strong(freePhase, 1, std::memory_order_acq_rel)) {
+    ccldDropped(state, plan->ccldSeq, "frame_slot_busy");
+    return;
+  }
 
   CcldBlock* block = ccldFrameBlock(state->frame, index, state->frameChannels, state->frameGroups);
   memset(block, 0, ccldBlockBytes(state->frameChannels, state->frameGroups));
@@ -210,11 +497,55 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   state->frame->counter = plan->ccldSeq;
   state->frame->detectChannel = descriptor.channelHi - descriptor.channelLo + 1;
   slot.seq = plan->ccldSeq;
+  slot.startNs = start.ns;
+  slot.count = start.count;
+  slot.bytes = start.bytes;
+  slot.op = start.op;
+  slot.datatype = start.datatype;
+  slot.algorithm = plan->ccldAlgorithm == NCCL_ALGO_RING ? "Ring" : "Tree";
+  slot.protocol = plan->ccldProtocol == NCCL_PROTO_SIMPLE ? "Simple" :
+      plan->ccldProtocol == NCCL_PROTO_LL ? "LL" : "LL128";
+  slot.channelLo = static_cast<int>(descriptor.channelLo);
+  slot.channelHi = static_cast<int>(descriptor.channelHi);
+  for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) slot.parents[channel] = -1;
+  slot.lastDumpNs = slot.startNs;
+  slot.done.store(false, std::memory_order_relaxed);
+  slot.eventRecorded.store(false, std::memory_order_relaxed);
+  slot.eventFailed.store(false, std::memory_order_relaxed);
   slot.phase.store(2, std::memory_order_release);
   ncclDevWorkColl* work = reinterpret_cast<ncclDevWorkColl*>(first + 1);
   work->ccldSlotPlus1 = static_cast<uint16_t>(index + 1);
   plan->ccldSlotPlus1 = static_cast<uint16_t>(index + 1);
+  state->cv.notify_one();
 }
 
-void ccldCallbackEnqueue(struct ncclComm* /*comm*/, struct ncclKernelPlan* /*plan*/,
-                         cudaStream_t /*stream*/) {}
+void ccldCallbackEnqueue(struct ncclComm* comm, struct ncclKernelPlan* plan,
+                         cudaStream_t stream) {
+  CcldState* state = ccldState(comm);
+  if (state == nullptr || plan == nullptr || plan->ccldSlotPlus1 == 0) return;
+  const unsigned index = plan->ccldSlotPlus1 - 1;
+  CcldState::Slot& slot = state->slots[index];
+  if (state->useEvent) {
+    hipError_t error = hipEventRecord(slot.completionEvent, stream);
+    if (error == hipSuccess) {
+      slot.eventRecorded.store(true, std::memory_order_release);
+      state->cv.notify_one();
+    } else {
+      slot.eventFailed.store(true, std::memory_order_release);
+      ccldDropped(state, slot.seq, "completion_event_record_failed");
+    }
+    return;
+  }
+  CcldCallback* callback = new (std::nothrow) CcldCallback{state, index};
+  if (callback == nullptr) {
+    ccldDropped(state, slot.seq, "host_callback_allocation_failed");
+    return;
+  }
+  state->callbacksOutstanding.fetch_add(1, std::memory_order_relaxed);
+  hipError_t error = hipLaunchHostFunc(stream, ccldDone, callback);
+  if (error != hipSuccess) {
+    delete callback;
+    state->callbacksOutstanding.fetch_sub(1, std::memory_order_release);
+    ccldDropped(state, slot.seq, "host_callback_enqueue_failed");
+  }
+}
