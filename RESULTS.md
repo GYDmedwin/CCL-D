@@ -200,6 +200,27 @@ All three cases had complete event coverage. In the Ring case the H1
 report appeared 5.33 s after the injected-delay marker at a 5 s threshold.
 The injector and analyzer shared the same host clock for that observation.
 
+## Cross-domain H1 over memory pull
+
+Slurm job 16448 ran a PyTorch TP8×DP2 projection and gradient workload on
+two eight-H100 nodes using instrumented NCCL 2.24.3. The workload supplied
+exact collective IDs at CUDA completion waits. The node agents sampled
+active waits on analyzer pulls, and the H1 threshold was 2 s. Each case
+passed 80 numerical rank-step checks and delivered all 160 expected rank
+completions with complete telemetry coverage.
+
+| Case | Online diagnostic result |
+|---|---|
+| Control | No H1 alarms or wait records |
+| TP entry delay | Seven DP H1 findings linked to their observed waits on TP0 |
+| Simultaneous TP and independent DP entry delays | Both TP0 and DP0 raised H1 at operation 4. Six DP groups linked to TP0, while DP0's independent H1 had no observed link to TP0. |
+| TP delay with an independent DP0 input | DP0 operation 5 linked to TP0 operation 4. TP1 operation 5 linked to seven earlier DP operations. |
+
+The control in job 16447, which emitted wait events at every scope
+transition, carried 220 wait records. Sampling at pull time reduced that
+count to zero in job 16448. These runs exercise H1 attribution with
+explicit training-runtime wait evidence.
+
 ## Two-node collective and training checks
 
 On 2026-11-19, the full, non-fault-injection NCCL build was exercised on two

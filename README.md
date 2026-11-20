@@ -16,6 +16,8 @@ slow and hanging collective operations. It is based on NVIDIA NCCL
 - A node agent and an independent online hang/slow analyzer that pulls
   telemetry from memory, tools for offline trace replay, a one-shot live Ring
   observer, PyTorch training examples, and tests.
+- [Cross-communicator H1 attribution](ccld/docs/live.md#observe-cross-communicator-waits)
+  for waits observed by a training runtime.
 - The ordered patches in [ccld/patches](ccld/patches/README.md), so the
   modifications can be reviewed against the original NCCL release.
 

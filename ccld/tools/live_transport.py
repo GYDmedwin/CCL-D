@@ -1,6 +1,7 @@
 """Node-local telemetry buffer and remote, cursor-based binary pulls."""
 import argparse
 import asyncio
+from collections import Counter, defaultdict
 from contextlib import suppress
 from dataclasses import dataclass
 import hmac
@@ -13,6 +14,7 @@ import struct
 import zlib
 
 from .decode_ccld_binary import RECORD_BYTES
+from .wait_observation import LIMIT, evidence_record, peer_process, receive_wait, wait_socket
 
 PROTOCOL = b'CCLDP002'
 REQUEST = struct.Struct('!8s32sQ')
@@ -42,10 +44,39 @@ class NodeBuffer:
         self.end = 0
         self.failed = 0
         self.active = 0
+        self.process_streams = defaultdict(Counter)
+        self.waits = {}
+        self.published_waits = {}
+        self.next_wait_id = 0
 
     def append(self, raw):
         self.records[self.end % len(self.records)] = raw
         self.end += 1
+
+    def unbind_rank(self, process, identity):
+        bindings = self.process_streams[process]
+        bindings[identity] -= 1
+        if bindings[identity] == 0:
+            del bindings[identity]
+        if not bindings:
+            del self.process_streams[process]
+        comm, rank, _ = identity
+        for wait_id, (owner, records) in list(self.waits.items()):
+            if owner == process and any((c[0], c[2]) == (comm, rank) or (p[0], p[2]) == (comm, rank)
+                                        for c, p, _, _ in records):
+                del self.waits[wait_id]
+
+    def capture_waits(self):
+        """Export transitions between pull views of the active wait scopes."""
+        if not self.waits and not self.published_waits:
+            return
+        for wait_id in sorted(self.published_waits.keys() - self.waits.keys()):
+            for fields in self.published_waits[wait_id][1]:
+                self.append(evidence_record(*fields, state=2))
+        for wait_id in sorted(self.waits.keys() - self.published_waits.keys()):
+            for fields in self.waits[wait_id][1]:
+                self.append(evidence_record(*fields, state=1))
+        self.published_waits = self.waits.copy()
 
     def batch(self, cursor):
         capacity = len(self.records)
@@ -64,7 +95,8 @@ class NodeBuffer:
 
 async def receive_rank(reader, writer, buffer):
     buffer.active += 1
-    identity, ended, remainder = None, False, b''
+    process = peer_process(writer)
+    identity, ended, bound, remainder = None, False, False, b''
     try:
         while data := await reader.read(64 * RECORD_BYTES):
             data = remainder + data
@@ -78,9 +110,15 @@ async def receive_rank(reader, writer, buffer):
                         (identity is None and kind != 1) or
                         (identity is not None and (kind == 1 or identity != rank_identity))):
                     raise ValueError('invalid rank telemetry stream')
+                if process is not None and kind == 1:
+                    buffer.process_streams[process][rank_identity] += 1
+                    bound = True
                 identity = rank_identity
                 ended = kind == 8
                 buffer.append(raw)
+                if ended and bound:
+                    buffer.unbind_rank(process, identity)
+                    bound = False
             remainder = data[boundary:]
         if not ended or remainder:
             buffer.failed += 1
@@ -88,6 +126,8 @@ async def receive_rank(reader, writer, buffer):
         buffer.failed += 1
     finally:
         buffer.active -= 1
+        if bound:
+            buffer.unbind_rank(process, identity)
         writer.close()
         with suppress(OSError):
             await writer.wait_closed()
@@ -98,6 +138,7 @@ async def serve_pull(reader, writer, buffer, token):
         raw = await asyncio.wait_for(reader.readexactly(REQUEST.size), timeout=2)
         protocol, credential, cursor = REQUEST.unpack(raw)
         if protocol == PROTOCOL and hmac.compare_digest(credential, token):
+            buffer.capture_waits()
             header, data = buffer.batch(cursor)
             writer.write(header)
             writer.write(data)
@@ -159,8 +200,9 @@ async def serve(path, bind, port, capacity, token):
     source_directory = path.parent.stat()
     if source_directory.st_uid != os.getuid() or stat.S_IMODE(source_directory.st_mode) & 0o077:
         raise ValueError('the rank socket must be in a private directory owned by the job user')
-    if path.exists() or path.is_symlink():
-        raise ValueError('rank socket already exists')
+    control = Path(wait_socket(path))
+    if any(p.exists() or p.is_symlink() for p in (path, control)):
+        raise ValueError('node socket already exists')
     node = NodeBuffer(capacity)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -168,13 +210,20 @@ async def serve(path, bind, port, capacity, token):
         loop.add_signal_handler(signum, stop.set)
     local = await asyncio.start_unix_server(lambda r, w: receive_rank(r, w, node), str(path), backlog=256)
     try:
-        tcp = await asyncio.start_server(lambda r, w: serve_pull(r, w, node, token), bind, port)
+        waits = await asyncio.start_unix_server(lambda r, w: receive_wait(r, w, node), str(control),
+                                                limit=LIMIT, backlog=256)
         try:
-            print(f'CCLD_NODE_READY {bind}:{tcp.sockets[0].getsockname()[1]}', flush=True)
-            await stop.wait()
+            tcp = await asyncio.start_server(lambda r, w: serve_pull(r, w, node, token), bind, port)
+            try:
+                print(f'CCLD_NODE_READY {bind}:{tcp.sockets[0].getsockname()[1]}', flush=True)
+                await stop.wait()
+            finally:
+                tcp.close()
+                await tcp.wait_closed()
         finally:
-            tcp.close()
-            await tcp.wait_closed()
+            waits.close()
+            await waits.wait_closed()
+            control.unlink(missing_ok=True)
     finally:
         local.close()
         await local.wait_closed()

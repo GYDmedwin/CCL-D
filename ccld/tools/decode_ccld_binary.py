@@ -35,7 +35,7 @@ class Event(ctypes.LittleEndianStructure):
 RECORD_BYTES = 2088
 assert ctypes.sizeof(Channel) == 56 and ctypes.sizeof(Event) == RECORD_BYTES
 KINDS = {1: 'comm_init', 2: 'entered', 3: 'snapshot', 4: 'complete', 5: 'heartbeat',
-         6: 'dropped', 7: 'coverage_gap', 8: 'comm_end'}
+         6: 'dropped', 7: 'coverage_gap', 8: 'comm_end', 9: 'wait_observation'}
 CHANNEL_FIELDS = struct.Struct('<ii6Q')
 CHANNEL_PARENTS = struct.Struct('<ii48x')
 WAIT_CHANNEL_FIELDS = struct.Struct('<ii3Q24x')
@@ -136,6 +136,12 @@ def decode_event(e, raw):
         result['reason'] = text(e.reason)
         if e.type == 6 and result['reason'] == 'binary_queue_overflow':
             result['dropped_records'] = e.count
+    elif e.type == 9:
+        if (e.reserved not in (1, 2) or not e.windowNs or not e.seq or not e.count
+                or e.startNs == e.hash or e.bytes >= 2**32):
+            raise ValueError('invalid wait observation record')
+        result.update(active=e.reserved == 1, wait_id=e.windowNs, producer_comm=f'{e.startNs:016x}',
+                      producer_op=e.count, producer_rank=e.bytes)
     return result
 
 

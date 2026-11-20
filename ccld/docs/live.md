@@ -119,6 +119,43 @@ For an offline recording instead, set `NCCL_CCLD_OUT_DIR` and leave
 `NCCL_CCLD_NODE_SOCKET` unset. The binary decoder and the JSONL analyzer
 support recorded traces.
 
+## Observe cross-communicator waits
+
+The live analyzer evaluates observed waits automatically when an H1 alarm
+identifies a rank that has yet to enter. An observed wait links a missing
+participant to an outstanding operation in another communicator using
+exact trace IDs and rank memberships from the same training process.
+
+An integration supplies the producer and each consumer operation that the
+current thread will issue after the wait. For example, around host
+synchronization on a CUDA event for a known collective:
+
+```python
+from ccld.tools.wait_observation import Operation, observe_wait
+
+producer = Operation(producer_comm_hash, producer_op_count, producer_rank)
+consumer = Operation(consumer_comm_hash, consumer_op_count, consumer_rank)
+with observe_wait(producer, [consumer]):
+    ready_event.synchronize()
+```
+
+`local_communicators()` lists the hashes, local ranks and sizes registered
+by the calling process. The framework maps these registrations to its
+groups and tracks the correct operation IDs at both endpoints. The Linux
+node agent verifies the caller using Unix peer credentials and its
+registered rank streams. It stores active scopes in RAM via a companion
+socket with the suffix `.wait`. Each analyzer pull exports changes in the
+active scopes. Waits that open and close between pulls can elapse without
+adding a telemetry record.
+
+The analyzer emits each domain's H1 alarm and adds `cross_domain` records
+with observed `links`, `upstream_candidates` and `unresolved_ranks`.
+Multiple concurrent symptoms and sources can appear in the same run.
+A producer that completes or loses coverage clears the corresponding
+attribution. The upstream candidates are the ends of the observed
+dependency paths and identify where to continue domain-local diagnosis.
+Use the same agent and analyzer checkout for observed waits.
+
 ## Interpret Tree slow decisions
 
 An online `group_candidate` carries `group_kind` and `candidate_ranks` for

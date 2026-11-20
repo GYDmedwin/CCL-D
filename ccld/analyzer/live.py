@@ -12,6 +12,7 @@ import time
 
 from .ccld_analyze import (add_decision_arguments, analyze_comm, barrier, comparable_groups,
                            decision_config, result_common, slow_decision)
+from .cross_domain import CrossDomainWaits
 from .tree_s1_vote import CLASSIFIED, vote
 from ..tools.decode_async_wait import RECORD_BYTES, WaitDecoder
 from ..tools.live_transport import job_token, pull
@@ -212,6 +213,7 @@ class LiveAnalysis:
     def __init__(self, cfg, emit):
         self.cfg, self.emit = cfg, emit
         self.comms = {}
+        self.cross_domain = CrossDomainWaits()
         self.events = Counter()
         self.completed = Counter()
         self.first_complete_ns = None
@@ -219,6 +221,9 @@ class LiveAnalysis:
 
     def add(self, event):
         self.events[event['event']] += 1
+        if event['event'] == 'wait_observation':
+            self.cross_domain.add(event)
+            return
         if event['event'] == 'complete':
             self.completed[event['op']] += 1
             if self.first_complete_ns is None:
@@ -242,6 +247,8 @@ class LiveAnalysis:
                     state.mark_gap(state.next_op, 'rank streams closed with incomplete operations')
                 self.gaps += int(state.gap)
                 del self.comms[comm]
+        if allow_partial_hang:
+            self.cross_domain.evaluate(self.comms, self.emit)
 
     async def process(self, allow_partial_hang):
         self.evaluate(allow_partial_hang)
@@ -333,7 +340,7 @@ def address(value):
 
 def emit(item):
     now = time.monotonic_ns()
-    if item.get('category') in ('hang', 'slow'):
+    if item.get('category') in ('hang', 'slow', 'cross_domain'):
         item = dict(item, observer_mono_ns=now, timing_note='analyzer local observation time')
     print(json.dumps(item, sort_keys=True), flush=True)
 
