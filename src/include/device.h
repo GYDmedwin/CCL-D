@@ -226,6 +226,8 @@ struct ncclChannelPeer {
 };
 
 struct ncclDevComm;
+struct CcldFrame;
+struct CcldWaitChannel;
 
 #pragma pack(push)  /* push current alignment to stack */
 #pragma pack(8)     /* set alignment to 8 bytes boundary */
@@ -308,6 +310,10 @@ struct alignas(16) ncclDevWorkColl {
   };
   uint64_t redOpArg;
   uint64_t opCount;
+  // 0 disables CCL-D for this work; 1..512 select a mapped frame slot.
+  // Kept as a separate field because RCCL's existing bitfields are full.
+  uint16_t ccldSlotPlus1;
+  uint16_t ccldReserved;
 };
 
 
@@ -499,6 +505,13 @@ struct ncclDevComm {
   struct ncclDevChannel* channels/*[MAXCHANNELS]*/;
   int funcindex;
   uint64_t nBytes;
+
+  // CCL-D frame aliases and dynamic strides. Populated only when the
+  // communicator enables diagnostics; device hooks must tolerate null/zero.
+  struct CcldFrame* ccldFrame;
+  uint32_t ccldBlockBytes, ccldGroups;
+  struct CcldWaitChannel* ccldWaitFrame;
+  uint32_t ccldWaitBlockBytes;
 
 #if defined(ENABLE_NPKIT)
   NpKitEventCollectContext* npKitEventCollectContexts;

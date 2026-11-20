@@ -201,6 +201,9 @@ struct ncclKernelPlan {
   struct ncclDevKernelArgs* kernelArgs;
   size_t kernelArgsSize;
   struct channelMasks channelMask;
+  // Slot-plus-one points to a CCL-D frame slot; zero means uninstrumented.
+  uint16_t ccldSlotPlus1;
+  uint16_t ccldReserved;
   bool hasProxyOps; // does any channel have a non-empty proxyOpQueue
   int threadPerBlock;
 
@@ -218,6 +221,7 @@ struct ncclKernelPlan {
 
 struct ncclTaskColl {
   struct ncclTaskColl* next;
+  uint64_t ccldSeq;
   ncclFunc_t func;
   void const* sendbuff;
   void* recvbuff;
@@ -532,6 +536,9 @@ struct ncclComm {
 
   // Device side of the communicator (for cudaFree's)
   struct ncclDevComm* devComm; // actually = &ncclDevCommAndChannels::comm
+
+  // Opaque host-side CCL-D state, owned by this communicator when enabled.
+  void* ccldState;
 
   uint32_t workArgsBytes; // max size of kernel args
   uint32_t workFifoBytes; // size of workFifoBuf, power of 2
