@@ -1,6 +1,7 @@
 #include "ccld.h"
 #include "ccld_alloc.h"
 #include "ccld_pending.h"
+#include "ccld_plan.h"
 #include "comm.h"
 #include "collectives.h"
 #include "debug.h"
@@ -39,6 +40,11 @@ struct CcldState {
   uint64_t mode = 0;
   CcldSequence sequence;
   CcldPendingTable<256> pending;
+  struct Slot {
+    std::atomic<int> phase{0};
+    uint64_t seq = 0;
+  };
+  std::unique_ptr<Slot[]> slots;
 };
 
 static CcldState* ccldState(struct ncclComm* comm) {
@@ -74,6 +80,12 @@ void ccldInit(struct ncclComm* comm) {
   state->frameGroups = algorithm != nullptr && strcasecmp(algorithm, "Ring") == 0 ? 1 : CCLD_GROUPS;
   state->frameBlocks = static_cast<unsigned>(ccldEnvNumber(
       "NCCL_CCLD_FRAME_BLOCKS", CCLD_BLOCKS, CCLD_BLOCKS, CCLD_MAX_BLOCKS));
+  state->slots.reset(new (std::nothrow) CcldState::Slot[state->frameBlocks]);
+  if (!state->slots) {
+    WARN("CCL-D slot metadata allocation failed");
+    delete state;
+    return;
+  }
   state->frameBytes = ccldFrameBytes(state->frameChannels, state->frameGroups, state->frameBlocks);
 
   hipError_t error = ccldMappedHostAlloc(&state->frameAllocation, state->frameBytes);
@@ -141,7 +153,68 @@ uint64_t ccldEnter(struct ncclComm* comm, const struct ncclInfo* info) {
   return seq;
 }
 
-void ccldPlan(struct ncclComm* /*comm*/, struct ncclKernelPlan* /*plan*/) {}
+void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
+  CcldState* state = ccldState(comm);
+  if (state == nullptr || plan == nullptr || plan->ccldSeq == 0) return;
+
+  CcldPlanDescriptor descriptor;
+  descriptor.persistent = plan->persistent;
+  descriptor.multipleCollectives = plan->ccldTaskCount != 1;
+  descriptor.collective = plan->ccldFunc == ncclFuncAllReduce ? CcldCollective::AllReduce :
+      plan->ccldFunc == ncclFuncAllGather ? CcldCollective::AllGather :
+      plan->ccldFunc == ncclFuncReduceScatter ? CcldCollective::ReduceScatter : CcldCollective::Other;
+  descriptor.algorithm = plan->ccldAlgorithm == NCCL_ALGO_RING ? CcldAlgorithm::Ring :
+      plan->ccldAlgorithm == NCCL_ALGO_TREE ? CcldAlgorithm::Tree : CcldAlgorithm::Other;
+
+  ncclWorkList* first = ncclIntruQueueHead(&plan->workQueue);
+  ncclWorkList* node = first;
+  unsigned workCount = 0;
+  while (node != nullptr) {
+    ++workCount;
+    if (node->workType == ncclDevWorkTypeP2p) descriptor.p2pPresent = true;
+    node = node->next;
+  }
+  descriptor.multipleWork = workCount != 1;
+  if (first != nullptr && first->workType == ncclDevWorkTypeColl) {
+    descriptor.workType = CcldWorkType::Collective;
+  } else if (first != nullptr && first->workType == ncclDevWorkTypeCollReg) {
+    descriptor.workType = CcldWorkType::CollectiveRegistered;
+  }
+
+  if (first != nullptr && !descriptor.p2pPresent &&
+      (first->workType == ncclDevWorkTypeColl || first->workType == ncclDevWorkTypeCollReg)) {
+    ncclDevWorkColl* work = reinterpret_cast<ncclDevWorkColl*>(first + 1);
+    descriptor.channelLo = work->channelLo;
+    descriptor.channelHi = work->channelHi;
+  }
+  descriptor.frameChannels = state->frameChannels;
+  descriptor.frameGroups = state->frameGroups;
+  const CcldPlanDecision decision = ccldPlanDecision(descriptor);
+  if (!decision.supported()) {
+    state->pending.forget(plan->ccldSeq);
+    return;
+  }
+
+  CcldStart start{};
+  if (!state->pending.take(plan->ccldSeq, &start)) return;
+  const unsigned index = static_cast<unsigned>(plan->ccldSeq % state->frameBlocks);
+  CcldState::Slot& slot = state->slots[index];
+  int freePhase = 0;
+  if (!slot.phase.compare_exchange_strong(freePhase, 1, std::memory_order_acq_rel)) return;
+
+  CcldBlock* block = ccldFrameBlock(state->frame, index, state->frameChannels, state->frameGroups);
+  memset(block, 0, ccldBlockBytes(state->frameChannels, state->frameGroups));
+  block->commHash = comm->commHash;
+  block->opCount = plan->ccldSeq;
+  state->frame->kernelIndex = index;
+  state->frame->counter = plan->ccldSeq;
+  state->frame->detectChannel = descriptor.channelHi - descriptor.channelLo + 1;
+  slot.seq = plan->ccldSeq;
+  slot.phase.store(2, std::memory_order_release);
+  ncclDevWorkColl* work = reinterpret_cast<ncclDevWorkColl*>(first + 1);
+  work->ccldSlotPlus1 = static_cast<uint16_t>(index + 1);
+  plan->ccldSlotPlus1 = static_cast<uint16_t>(index + 1);
+}
 
 void ccldCallbackEnqueue(struct ncclComm* /*comm*/, struct ncclKernelPlan* /*plan*/,
                          cudaStream_t /*stream*/) {}

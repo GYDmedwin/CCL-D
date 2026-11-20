@@ -670,6 +670,13 @@ static ncclResult_t scheduleCollTasksToPlan(
     struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collTaskQueue);
     struct ncclWorkList* workNode = ncclIntruQueueHead(&planner->collWorkQueue);
     struct ncclDevWorkColl* devWork = (struct ncclDevWorkColl*)(workNode+1);
+    if (plan->ccldTaskCount == 0) {
+      plan->ccldSeq = task->ccldSeq;
+      plan->ccldFunc = task->func;
+      plan->ccldAlgorithm = task->algorithm;
+      plan->ccldProtocol = task->protocol;
+    }
+    plan->ccldTaskCount += 1;
     size_t elementSize = ncclTypeSize(task->datatype);
 
     int kind = 2*task->isCollnet + task->isNvls + 4*(task->protocol == NCCL_PROTO_SIMPLE ? 1 : 0);

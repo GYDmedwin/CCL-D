@@ -204,6 +204,11 @@ struct ncclKernelPlan {
   // Slot-plus-one points to a CCL-D frame slot; zero means uninstrumented.
   uint16_t ccldSlotPlus1;
   uint16_t ccldReserved;
+  uint64_t ccldSeq;
+  int ccldTaskCount;
+  int ccldFunc;
+  int ccldAlgorithm;
+  int ccldProtocol;
   bool hasProxyOps; // does any channel have a non-empty proxyOpQueue
   int threadPerBlock;
 

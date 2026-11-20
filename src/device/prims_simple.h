@@ -21,6 +21,7 @@ class Primitives<
   > {
   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
   static constexpr int Input=0, Output=1;
+  CcldChannel* ccldChannel;
   static constexpr int RoleWaitRecv = 0x04, // 0x1 0x2 are free to use
                        RoleWaitSend = 0x08,
                        RolePostSend = 0x10,
@@ -380,6 +381,7 @@ private:
       offset += sliceSize;
       slice += 1;
     }
+    ccldCount(ccldChannel, tid, group, Send != 0, Recv != 0);
   }
 
   template <int REDUCE, int COPY, int MULTISRCS, int MULTIDSTS>
@@ -667,6 +669,7 @@ private:
       uint8_t connIndexRecv = 0, uint8_t connIndexSend = 0, struct ncclDevWorkColl* e = nullptr,bool userBufReg=false, int stepSize_=0
     ):
     tid(tid), nthreads(nthreads), tidInBlock(threadIdx.x), group(group),
+    ccldChannel(ccldOutput(e, tid, group)),
     stepSize(stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T) : stepSize_) {
 
     // For send operations, we need an extra warp to overlap the threadfence and the copy

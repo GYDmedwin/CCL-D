@@ -10,6 +10,7 @@
 
 #include "collectives.h"
 #include "device.h"
+#include "ccld.h"
 #include "op128.h"
 #include "reduce_kernel.h"
 #include "device_table.h"
@@ -146,6 +147,7 @@ struct ncclShmemData {
   int nWorks;
   int workSize;
   uint32_t workConsumed;
+  CcldChannel ccldCounts[CCLD_GROUPS];
   struct ncclShmemGroup groups[NCCL_MAX_GROUPS];
   uint64_t redOpArgs[NCCL_MAX_NVLS_ARITY+1];
 
@@ -483,6 +485,10 @@ __device__ __forceinline__ void ncclKernelMain(struct ncclDevKernelArgs const* a
     break;
   default:
     break;
+  }
+  if (tid < CCLD_GROUPS) {
+    ncclShmem.ccldCounts[tid].send = 0;
+    ncclShmem.ccldCounts[tid].recv = 0;
   }
   __syncthreads(); // publish ncclShmem.{args, channelId}
 

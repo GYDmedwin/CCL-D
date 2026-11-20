@@ -12,6 +12,27 @@
 #include "reduce_kernel.h" // for reduction funcs
 #include "common_kernel.h"
 #include "common.h"
+#include "ccld.h"
+
+__device__ __forceinline__ CcldChannel* ccldOutput(ncclDevWorkColl* work, int tid, int group) {
+  if (tid != 0 || work == nullptr || work->ccldSlotPlus1 == 0 || ncclShmem.comm.ccldFrame == nullptr) return nullptr;
+  unsigned g = group == 0 ? 0 : 1;
+  if (g >= ncclShmem.comm.ccldGroups) return nullptr;
+  unsigned char* base = reinterpret_cast<unsigned char*>(ncclShmem.comm.ccldFrame) +
+      offsetof(CcldFrame, blocks) + (work->ccldSlotPlus1 - 1) * ncclShmem.comm.ccldBlockBytes +
+      offsetof(CcldBlock, channel);
+  CcldChannel* channels = reinterpret_cast<CcldChannel*>(base);
+  return &channels[ncclShmem.channelId * ncclShmem.comm.ccldGroups + g];
+}
+
+__device__ __forceinline__ void ccldCount(CcldChannel* channel, int tid, int group,
+                                          bool send, bool recv) {
+  if (tid != 0 || channel == nullptr) return;
+  const unsigned g = group == 0 ? 0 : 1;
+  CcldChannel& local = ncclShmem.ccldCounts[g];
+  if (send) *(volatile uint64_t*)&channel->send = ++local.send;
+  if (recv) *(volatile uint64_t*)&channel->recv = ++local.recv;
+}
 
 #define NCCL_SPINS_BEFORE_CHECK_ABORT 1000000
 
