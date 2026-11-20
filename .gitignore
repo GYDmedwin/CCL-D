@@ -2,4 +2,6 @@
 *.gcov
 /coverage/
 build/
+build-ccld-gfx936/
+build-ccld-gfx936-only/
 ext/
