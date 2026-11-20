@@ -1,163 +1,114 @@
 # CCL-D for NCCL
 
-This repository provides an NCCL-based research implementation of the
-diagnostic ideas in [CCL-D](https://doi.org/10.1145/3774934.3786429), with
-GPU-level communication probes, host-side monitoring, and analysis tools for
-slow and hanging collective operations. It is based on NVIDIA NCCL
-**v2.24.3-1**, commit
-`6aae37927840b2bd7b7d42d2f0050e75f88ee97f`.
+CCL-D for NCCL diagnoses slow and hanging collective operations during
+distributed training with GPU progress probes, host monitoring, and an
+independent online analyzer. This research implementation builds on NVIDIA
+NCCL **v2.24.3-1**. [CCL-D paper](https://doi.org/10.1145/3774934.3786429)
 
-## What is included
+## Quick start
 
-- NCCL source with opt-in mapped-host progress counters, per-communicator host
-  probing, asynchronous telemetry delivery, and periodic hang snapshots.
-- An optional Ring-only wait counter and a three-completed-operation
-  volume-normalized ranking rule, gated on a confirmed slow diagnosis.
-- A node agent and an independent online hang/slow analyzer that pulls
-  telemetry from memory, tools for offline trace replay, a one-shot live Ring
-  observer, PyTorch training examples, and tests.
-- [Cross-communicator H1 attribution](ccld/docs/live.md#observe-cross-communicator-waits)
-  for waits observed by a training runtime.
-- The ordered patches in [ccld/patches](ccld/patches/README.md), so the
-  modifications can be reviewed against the original NCCL release.
+### Build
 
-Telemetry is enabled through environment variables and uses mode 1 for the
-store-only probe. The Ring wait observer combines a slow-detection gate with
-per-rank wait information to identify candidate ranks.
-
-## Build
-
-Build with Linux, a compatible CUDA toolkit and C++ toolchain. The historical
-measurements used CUDA 12.8.2 and NVIDIA H100; this example limits the build
-to H100 (`sm_90`). Set `CUDA_HOME` for your installation and omit or change
-`NVCC_GENCODE` for a different target supported by your toolkit.
+Use Linux with a CUDA toolkit, a C++ toolchain, and Python 3.9 or later.
+The example below builds for H100 (`sm_90`) and uses the CUDA 12.8.2
+toolchain exercised in the validation runs.
 
 ```bash
+git clone https://github.com/GYDmedwin/CCL-D.git
+cd CCL-D
 make -j8 src.build CUDA_HOME=/usr/local/cuda \
   NVCC_GENCODE='-gencode=arch=compute_90,code=sm_90'
-python3 -m unittest discover -s ccld/tests -v
+python3 -m unittest discover -s ccld/tests
 ```
 
-The default output is `build/lib/libnccl.so.*`. Fault simulation can be
-enabled in a separate build as described below. See the upstream
-[NCCL README](README.NVIDIA.md) for other build options.
+Set `CUDA_HOME` for your toolkit and adjust `NVCC_GENCODE` for your GPU
+architecture. The build produces `build/lib/libnccl.so.*`. The upstream
+base is commit `6aae37927840b2bd7b7d42d2f0050e75f88ee97f`.
+See the [NCCL build options](README.NVIDIA.md#build).
 
-## Example: one-node Ring experiment
+### Example: FSDP model training
 
-The following is an example for an isolated eight-GPU Linux allocation and an
-installed CUDA-enabled PyTorch. It forces Ring/Simple for this experiment,
-which may change normal algorithm selection. Choose a fresh output directory.
-`--expect-nccl-prefix` makes the workload fail if the modified NCCL is not the
-library that PyTorch actually mapped.
-
-```bash
-mkdir -p runs/example/bin runs/example/jsonl
-export LD_LIBRARY_PATH="$PWD/build/lib:${LD_LIBRARY_PATH:-}"
-export NCCL_ALGO=Ring NCCL_PROTO=Simple
-export NCCL_CCLD_ENABLE=1 NCCL_CCLD_MODE=1 NCCL_CCLD_WAIT_ENABLE=1
-export NCCL_CCLD_POLL_US=200 NCCL_CCLD_FRAME_BLOCKS=512
-export NCCL_CCLD_QUEUE_SLOTS=2048 NCCL_CCLD_COMPLETION=event
-export NCCL_CCLD_OUT_DIR="$PWD/runs/example/bin"
-torchrun --standalone --nnodes=1 --nproc-per-node=8 \
-  ccld/experiments/torch_collectives.py --op allreduce \
-  --expect-nccl-prefix "$PWD/build" --expect-nccl-version 22403
-python3 ccld/tools/decode_async_wait.py runs/example/bin runs/example/jsonl
-python3 ccld/analyzer/ccld_analyze.py runs/example/jsonl \
-  --baseline-ms 1 --flush-last-window
-```
-
-Set `--baseline-ms` to suit the workload. The Slurm example is in
-[ccld/slurm/single_node_smoke.sh](ccld/slurm/single_node_smoke.sh); set your
-site's account and partition at submission.
-
-For live use, start the decoder with `--follow` while the program is running,
-and analyze its JSONL output with `--follow`. The optional one-shot Ring
-observer below forwards base analyzer events, waits for a confirmed slow
-diagnosis for the same communicator, then evaluates completed operations
-4–6. `CCLD_THRESHOLD` must be calibrated for the exact build and workload.
-
-```bash
-python3 ccld/tools/decode_async_wait.py runs/example/bin runs/live-jsonl --follow &
-python3 ccld/analyzer/online_ring_wait.py runs/live-jsonl \
-  --protocol SIMPLE --threshold "$CCLD_THRESHOLD" \
-  --baseline-ms 1 --window-s 1 --repeats 2
-```
-
-The current observer targets a single-host, eight-rank AllReduce communicator,
-200 µs polling, and completed operations 4–6. The standalone
-`ring_wait.py` accepts `--slow-confirmed` after a matching base slow diagnosis
-has been confirmed.
-
-For a recorded Tree AllReduce run, the optional second stage combines the
-base analyzer's completed group decisions to identify an S1 candidate across
-channels:
-
-```bash
-python3 ccld/analyzer/tree_s1_vote.py runs/tree/jsonl runs/tree/diagnosis.jsonl
-```
-
-It consumes decoded traces and base-analyzer JSONL, and reports a candidate
-only when all eligible channels agree. Other outcomes remain available as
-`not_applicable`, `undetermined`, or `incomplete`.
-
-## Example: FSDP model training
-
-The Slurm example trains a synthetic causal decoder with FSDP, bfloat16 and
-AdamW on two nodes. Each training node keeps its NCCL events in a memory
-buffer. The analyzer runs as a separate process on the batch host for this
-example and retrieves new events from every node over the job network.
-Activate your CUDA-enabled PyTorch environment, build NCCL, and submit with
-your site account and partition:
+Activate your CUDA-enabled PyTorch environment and submit from the repository
+root on shared storage. The supplied launcher requests two nodes with eight
+GPUs per node. It starts one agent on each training node, runs the analyzer
+as a separate process on the batch host, and checks which NCCL library each
+rank loaded.
 
 ```bash
 export CCLD_ROOT="$PWD"
-sbatch --account YOUR_ACCOUNT --partition YOUR_GPU_PARTITION ccld/slurm/fsdp_train.sh
+CCLD_PROFILE=smoke sbatch --account YOUR_ACCOUNT --partition YOUR_GPU_PARTITION \
+  ccld/slurm/fsdp_train.sh
 ```
 
-The script writes analyzer decisions and a final event summary to
-`diagnosis.log`, and each rank's loss, step times and loaded NCCL library to
-`workload/`. It defaults to eight GPUs per node and 32 probe frames. Set
-`CCLD_GPUS_PER_NODE`, `CCLD_PROFILE`, `CCLD_STEPS`, `CCLD_RUN` or
-`NCCL_CCLD_FRAME_BLOCKS` before submission to change those settings.
-The `medium` profile has approximately 117 million parameters and `smoke`
-is a smaller setup check. The model uses synthetic tokens to check training
-consistency.
+The example trains a synthetic causal decoder with FSDP, bfloat16 and AdamW.
+It writes decisions and an event summary to `diagnosis.log` and each rank's
+loss, step times, and loaded library to `workload/` under
+`runs/fsdp-$SLURM_JOB_ID`. Set `CCLD_RUN` for a custom output directory.
+To change the model size or step count, set `CCLD_PROFILE` or `CCLD_STEPS`.
 
-To run the analyzer on a dedicated CPU host or use an existing training
-command, follow the [online deployment guide](ccld/docs/live.md). In that
-deployment the analyzer needs the node endpoints, a job token and Python.
+## Use with your training job
 
-## Validation
+Start one agent per training node and start the analyzer on a CPU host that
+can reach the agents over the job network. The agents and analyzer use the
+same run token. The full launcher commands and tuning options are in the
+[online deployment guide](ccld/docs/live.md).
 
-The online observer has been evaluated with single-node, eight-H100
-AllReduce workloads using Ring/Simple, Ring/LL, and Ring/LL128. Each protocol
-was exercised with five simulated S2 send delays and five no-fault controls.
-Collective correctness and FSDP training have also been exercised across two
-eight-H100 nodes.
-See [RESULTS.md](RESULTS.md) for the test configuration and results.
-
-## Fault simulation
-
-The small workload supports `--fault H1`, `H2`, and `S1`. The source also
-provides bounded H3 and S2 GPU fault simulations, enabled with
-`CCLD_FAULT_INJECTION`. Run fault simulations in an isolated, time-limited
-allocation.
-
-For a separate, explicitly fault-enabled test build on H100:
+On each training node, launch your existing training command with the node's
+agent socket and modified NCCL in the rank environment. For example:
 
 ```bash
-CXXFLAGS='-DCCLD_FAULT_INJECTION=1' make -j8 src.build \
-  CUDA_HOME=/usr/local/cuda BUILDDIR="$PWD/build-fault" \
-  NVCC_GENCODE='-gencode=arch=compute_90,code=sm_90 -DCCLD_FAULT_INJECTION=1'
+export CCLD_NCCL_LIB=/path/to/CCL-D/build/lib
+export NCCL_CCLD_NODE_SOCKET=/path/to/local/agent.sock
+export NCCL_CCLD_ENABLE=1 NCCL_CCLD_MODE=1
+export LD_LIBRARY_PATH="$CCLD_NCCL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_PRELOAD="$CCLD_NCCL_LIB/libnccl.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
 ```
 
-Use `build-fault/lib` only in the isolated test environment. Alongside the
-ordinary probe environment, set `NCCL_CCLD_FAULT_KIND=S2` (send delay) or
-`H3` (bounded stall), `NCCL_CCLD_FAULT_RANK`, `NCCL_CCLD_FAULT_OP`, and
-`NCCL_CCLD_FAULT_CYCLES`; optionally set `NCCL_CCLD_FAULT_REPEATS`.
-The operation number is the recorded communicator operation counter, and GPU
-cycles are not microseconds. Apply a job timeout and confirm the actual
-injection and operation in the collected traces.
+Keep the agents running until the analyzer drains the final records. Set the
+pull interval and buffer size for your workload using the
+[retention guide](ccld/docs/live.md#set-the-pull-interval-and-retention).
+
+## What the analyzer reports
+
+The analyzer compares collective timing and progress within a communicator.
+It reports slow-operation candidates and classifies hangs from rank progress
+and operation metadata.
+
+| Hang class | Evidence used for diagnosis |
+|---|---|
+| H1 | Prior rank progress shows that one or more ranks have yet to enter the collective. |
+| H2 | All ranks have entered. Some complete before the hang threshold while others remain hung, or all hang and a minority has a different operation signature. |
+| H3 | All ranks remain hung on a consistent operation, and comparable progress counts identify candidate ranks. |
+
+For **cross-communicator wait attribution**, the training runtime supplies
+the exact collective IDs on both sides of an observed wait. For an H1 alert,
+this can show why a rank has yet to enter a collective, such as a DP rank
+waiting for an earlier TP operation. The analyzer keeps the original
+per-communicator alerts so independent issues remain visible. See
+[how to register observed waits](ccld/docs/live.md#observe-cross-communicator-waits).
+
+## How it works
+
+```mermaid
+flowchart LR
+    gpu["NCCL GPU probes"] -->|"mapped host frames"| monitor["Rank-local CPU monitor"]
+    monitor -->|"Unix socket"| agent["Node agent<br/>Host-memory buffer"]
+    runtime["Training runtime"] -.->|"optional shared-memory waits"| agent
+    agent -->|"binary batches pulled over TCP"| analyzer["Independent CPU analyzer"]
+```
+
+The GPU publishes raw progress counters. The host samples progress and
+computes metrics, and the analyzer evaluates diagnostic decisions as it
+pulls telemetry. See the [telemetry reference](ccld/docs/telemetry.md).
+
+## Validation and experiments
+
+- [16-H100 collective and FSDP checks](RESULTS.md#two-node-collective-and-training-checks)
+- [Online Ring hang and Tree slow validation](RESULTS.md#online-release-validation)
+- [Single-node Ring S2 checks across three protocols](RESULTS.md#released-online-observer-h100-revalidation)
+- [Cross-communicator H1 and wait registration benchmarks](RESULTS.md#cross-domain-h1-over-memory-pull)
+- [One-node Ring experiment, offline replay, and fault simulation](ccld/docs/experiments.md)
+- [Ordered NCCL patch series](ccld/patches/README.md)
 
 ## License and citation
 
