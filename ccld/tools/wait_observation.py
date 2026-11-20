@@ -1,6 +1,7 @@
 """Report a training framework's actual wait to its node-local CCL-D agent."""
+from array import array
 import asyncio
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import json
 import os
@@ -8,12 +9,18 @@ from pathlib import Path
 import re
 import socket
 import struct
+import threading
 import time
 
 from .decode_ccld_binary import Event
+from .wait_memory import WaitPage, WaitWriter, new_page_fd
 
 LIMIT = 4096
 SOCKET_TIMEOUT = .1
+PAGE_REPLY = b'W'
+_writers = {}
+_retry_after = {}
+_writer_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -81,6 +88,7 @@ async def reply(writer, body):
 
 async def receive_wait(reader, writer, buffer):
     wait_id = None
+    page = None
     try:
         process = peer_process(writer)
         if process is None:
@@ -94,6 +102,21 @@ async def receive_wait(reader, writer, buffer):
             await reply(writer, {'groups': [(f'{comm:016x}', rank, world)
                                            for (comm, rank), world in sorted(groups.items())]})
             return
+        if request.get('command') == 'map':
+            if process in buffer.wait_pages:
+                raise ValueError('process already has a wait page')
+            fd = new_page_fd()
+            try:
+                page = WaitPage(fd)
+                buffer.wait_pages[process] = page
+                peer = writer.get_extra_info('socket')
+                with peer.dup() as control:
+                    control.sendmsg([PAGE_REPLY], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array('i', [fd]))])
+            finally:
+                os.close(fd)
+            await reader.read(1)
+            return
+        # Keep accepting wait sockets from existing training integrations.
         if request.get('command') != 'wait' or not isinstance(request.get('consumers'), list):
             raise ValueError('invalid wait request')
         producer = parse_operation(request.get('producer'))
@@ -114,6 +137,9 @@ async def receive_wait(reader, writer, buffer):
         with suppress(asyncio.TimeoutError, OSError):
             await reply(writer, {'error': 'wait evidence unavailable'})
     finally:
+        if page is not None:
+            del buffer.wait_pages[process]
+            page.close()
         if wait_id is not None:
             buffer.waits.pop(wait_id, None)
             buffer.active -= 1
@@ -143,22 +169,90 @@ def request(body, rank_socket):
 
 def local_communicators(rank_socket=None):
     """Return registered (comm_hash, local rank, world size) for this process."""
-    with request({'command': 'groups'}, rank_socket) as response:
-        return [tuple(group) for group in response['groups']]
+    path = rank_socket or os.environ.get('NCCL_CCLD_NODE_SOCKET')
+    with request({'command': 'groups'}, path) as response:
+        groups = [tuple(group) for group in response['groups']]
+    if groups:
+        wait_writer(path)
+    return groups
+
+
+def attach_wait_page(path):
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(SOCKET_TIMEOUT)
+        conn.connect(wait_socket(path))
+        conn.sendall(b'{"command":"map"}\n')
+        fds = array('i')
+        marker, items, flags, _ = conn.recvmsg(
+            1, socket.CMSG_SPACE(fds.itemsize), getattr(socket, 'MSG_CMSG_CLOEXEC', 0))
+        for level, kind, value in items:
+            if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
+                fds.frombytes(value[:len(value) - len(value) % fds.itemsize])
+        try:
+            if marker != PAGE_REPLY or flags & socket.MSG_CTRUNC or len(fds) != 1:
+                raise OSError('shared wait page is unavailable')
+            os.set_inheritable(fds[0], False)
+            return WaitWriter(WaitPage(fds[0]), conn)
+        finally:
+            for fd in fds:
+                os.close(fd)
+    except BaseException:
+        conn.close()
+        raise
+
+
+def wait_writer(path):
+    writer = _writers.get(path)
+    if writer is not None:
+        return writer
+    with _writer_lock:
+        writer = _writers.get(path)
+        if writer is not None or _retry_after.get(path, 0) > time.monotonic():
+            return writer
+        try:
+            writer = attach_wait_page(path)
+        except (OSError, ValueError):
+            _retry_after[path] = time.monotonic() + 1
+            return None
+        _writers[path] = writer
+        _retry_after.pop(path, None)
+        return writer
+
+
+def reset_writers_after_fork():
+    try:
+        for writer in _writers.values():
+            writer.close()
+        _writers.clear()
+        _retry_after.clear()
+    finally:
+        _writer_lock.release()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(before=_writer_lock.acquire, after_in_parent=_writer_lock.release,
+                        after_in_child=reset_writers_after_fork)
 
 
 @contextmanager
 def observe_wait(producer, consumers, rank_socket=None):
-    """Track a wait scope whose producer and consumers have exact trace IDs."""
-    # Only inter-communicator edges belong in the first-level graph.
-    rows = [consumer.fields() for consumer in consumers if consumer.comm_hash != producer.comm_hash]
-    if not rows:
-        yield
-        return
-    with ExitStack() as scope:
+    """Track an observed wait with exact trace IDs. Yield whether it was recorded."""
+    path = rank_socket or os.environ.get('NCCL_CCLD_NODE_SOCKET')
+    writer, scope = None, None
+    if path:
         try:
-            scope.enter_context(request({'command': 'wait', 'producer': producer.fields(),
-                                         'consumers': rows}, rank_socket))
+            rows = tuple(parse_operation(consumer.fields()) for consumer in consumers
+                         if consumer.comm_hash != producer.comm_hash)
+            if rows and len(rows) == len(set(rows)):
+                reference = parse_operation(producer.fields())
+                writer = wait_writer(path)
+                if writer is not None:
+                    scope = writer.begin(reference, rows)
         except (OSError, ValueError):
             pass
-        yield
+    try:
+        yield scope is not None
+    finally:
+        if scope is not None:
+            writer.end(scope)

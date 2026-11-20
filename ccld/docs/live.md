@@ -141,12 +141,19 @@ with observe_wait(producer, [consumer]):
 
 `local_communicators()` lists the hashes, local ranks and sizes registered
 by the calling process. The framework maps these registrations to its
-groups and tracks the correct operation IDs at both endpoints. The Linux
-node agent verifies the caller using Unix peer credentials and its
-registered rank streams. It stores active scopes in RAM via a companion
-socket with the suffix `.wait`. Each analyzer pull exports changes in the
-active scopes. Waits that open and close between pulls can elapse without
-adding a telemetry record.
+groups and tracks the correct operation IDs at both endpoints. Calling
+this during setup also attaches the process to a 64 KiB shared memory
+region via the `.wait` Unix socket. The node agent verifies the process
+using Unix peer credentials and validates the endpoints against the
+current rank stream bindings. The client updates the active waits in
+memory. Each analyzer pull samples the active scopes and exports changes.
+Waits that open and close between pulls can elapse without adding a
+telemetry record.
+
+Shared wait snapshots use Linux `memfd` and lock-free 64-bit atomics
+from `libatomic.so.1`. `observe_wait()` yields whether the scope was
+recorded locally. An unavailable page or a full snapshot leaves the
+wait evidence unavailable and still runs the original wait.
 
 The analyzer emits each domain's H1 alarm and adds `cross_domain` records
 with observed `links`, `upstream_candidates` and `unresolved_ranks`.

@@ -221,6 +221,35 @@ transition, carried 220 wait records. Sampling at pull time reduced that
 count to zero in job 16448. These runs exercise H1 attribution with
 explicit training-runtime wait evidence.
 
+### Shared-memory wait registration
+
+The training process now attaches to a shared page during setup and
+updates active wait scopes locally. A Linux CPU-only test with eight
+concurrent rank callers at 100 registrations per second each measured
+the complete scope with an empty body. Median time fell from 2.91 ms
+with per-wait socket acknowledgements to 0.21 ms with shared memory.
+P95 fell from 3.47 ms to 0.23 ms. These are the means of the respective
+percentiles over two repetitions per implementation.
+
+Job 16465 ran both implementations sequentially on the same two
+eight-H100 nodes. Each run alternated eight timing blocks with the
+same NCCL probes and online analyzer. The table shows the distribution
+of the longest rank time at each measured step. Each cell uses
+236 measured steps. Each timed rank-step had two wait registrations
+when enabled.
+
+| Wait registration path | Off median | On median | Added median time | Off P95 | On P95 |
+|---|---:|---:|---:|---:|---:|
+| Per-wait socket | 2.43 ms | 5.63 ms | 3.20 ms | 3.23 ms | 10.13 ms |
+| Shared memory | 2.45 ms | 2.63 ms | 0.17 ms | 3.41 ms | 4.12 ms |
+
+Each run passed 8,384 numerical rank-step checks and delivered 16,768
+rank completions. The shared-memory build also passed the four
+diagnostic cases above. The independent TP0 and DP0 H1 alarms stayed
+separate, and DP0 operation 5 still linked to TP0 operation 4. These
+timing results describe the short-step TP8×DP2 workload and its wait
+frequency.
+
 ## Two-node collective and training checks
 
 On 2026-11-19, the full, non-fault-injection NCCL build was exercised on two

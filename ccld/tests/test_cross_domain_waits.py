@@ -1,12 +1,16 @@
 import asyncio
 import json
+from pathlib import Path
+import sys
+from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from ccld.analyzer.cross_domain import CrossDomainWaits
 from ccld.tools.decode_async_wait import WaitDecoder
-from ccld.tools.live_transport import NodeBuffer
+from ccld.tools.live_transport import NodeBuffer, receive_rank
+from ccld.tools.wait_memory import WAIT_ROW
 from ccld.tools.wait_observation import evidence_record, receive_wait
 
 
@@ -71,7 +75,7 @@ class CrossDomainWaitTests(unittest.TestCase):
         buffer = NodeBuffer(16)
         process = (1, 'birth')
         identity = (1, 0, 2)
-        buffer.process_streams[process][identity] = 1
+        buffer.bind_rank(process, identity)
         buffer.waits[1] = (process, [((2,4,1), (1,2,0), 2, 1)])
         buffer.waits.pop(1)
         buffer.capture_waits()
@@ -87,12 +91,39 @@ class CrossDomainWaitTests(unittest.TestCase):
         self.assertFalse(WaitDecoder().consume(buffer.records[1])['active'])
         self.assertFalse(buffer.waits)
 
+    def test_shared_wait_requires_current_same_process_bindings(self):
+        buffer = NodeBuffer(16)
+        owner = (11, 'birth')
+        producer = (1, 0, 2)
+        consumer = (2, 1, 2)
+        with patch('ccld.tools.live_transport.time.monotonic_ns', return_value=10):
+            buffer.bind_rank(owner, producer)
+            buffer.bind_rank((12, 'another'), consumer)
+        page = Mock(snapshot=lambda: WAIT_ROW.pack(1, 11, 1, 2, 0, 2, 3, 1))
+        buffer.wait_pages[owner] = page
+        buffer.capture_waits()
+        self.assertEqual(buffer.end, 0)
+        with patch('ccld.tools.live_transport.time.monotonic_ns', return_value=12):
+            buffer.bind_rank(owner, consumer)
+        buffer.capture_waits()
+        self.assertEqual(buffer.end, 0)
+        page.snapshot = lambda: WAIT_ROW.pack(2, 13, 1, 2, 0, 2, 3, 1)
+        buffer.capture_waits()
+        self.assertEqual(buffer.end, 1)
+        with patch('ccld.tools.live_transport.time.monotonic_ns', return_value=14):
+            buffer.unbind_rank(owner, producer)
+            buffer.bind_rank(owner, producer)
+        buffer.capture_waits()
+        buffer.capture_waits()
+        self.assertEqual(buffer.end, 2)
+        self.assertFalse(WaitDecoder().consume(buffer.records[1])['active'])
+
 
 class LocalWaitRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_endpoints_from_different_processes(self):
         buffer = NodeBuffer(16)
-        buffer.process_streams[(11, 'started')][(1, 0, 2)] = 1
-        buffer.process_streams[(12, 'started')][(2, 0, 2)] = 1
+        buffer.bind_rank((11, 'started'), (1, 0, 2))
+        buffer.bind_rank((12, 'started'), (2, 0, 2))
         reader = asyncio.StreamReader()
         reader.feed_data(json.dumps({'command': 'wait', 'producer': ['0000000000000001', 3, 0],
                                      'consumers': [['0000000000000002', 4, 0]]}).encode() + b'\n')
@@ -105,6 +136,84 @@ class LocalWaitRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('error', json.loads(responses[0]))
         self.assertFalse(buffer.waits)
         self.assertEqual(buffer.active, 0)
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'shared wait sockets use Linux peer credentials')
+class SharedWaitIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scopes_are_local_and_process_exit_retires_evidence(self):
+        child_code = """
+import os, socket, sys, time
+from ccld.tools.decode_ccld_binary import Event
+from ccld.tools.wait_observation import Operation, local_communicators, observe_wait
+
+path = sys.argv[1]
+streams = [socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) for _ in range(3)]
+for index, stream in enumerate(streams, 1):
+    stream.connect(path)
+    event = Event()
+    event.magic, event.version, event.type = 0x444c4343, 1, 1
+    event.hash, event.rank, event.nranks = index, 0, 2
+    stream.sendall(bytes(event))
+for attempt in range(50):
+    if len(local_communicators(path)) == 3:
+        break
+    time.sleep(.01)
+else:
+    raise RuntimeError('missing rank bindings')
+producer = Operation('0000000000000001', 2, 0)
+first = Operation('0000000000000002', 3, 0)
+second = Operation('0000000000000003', 4, 0)
+with observe_wait(producer, [first], path) as recorded:
+    assert recorded
+    forked = os.fork()
+if forked == 0:
+    os._exit(0)
+assert os.waitpid(forked, 0)[1] == 0
+with observe_wait(producer, [first], path) as recorded:
+    assert recorded
+    try:
+        with observe_wait(producer, [second], path) as nested:
+            assert nested
+            print('two waits', flush=True)
+            assert sys.stdin.readline()
+            raise ValueError('stop nested wait')
+    except ValueError:
+        pass
+    print('one wait', flush=True)
+    sys.stdin.readline()
+"""
+        buffer = NodeBuffer(16)
+        with TemporaryDirectory(prefix='ccld-shared-test-') as directory:
+            path = str(Path(directory) / 'rank')
+            ranks = await asyncio.start_unix_server(lambda r, w: receive_rank(r, w, buffer), path)
+            waits = await asyncio.start_unix_server(lambda r, w: receive_wait(r, w, buffer), path+'.wait')
+            async with ranks, waits:
+                child = await asyncio.create_subprocess_exec(
+                    sys.executable, '-c', child_code, path,
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+                try:
+                    self.assertEqual(await asyncio.wait_for(child.stdout.readline(), 5), b'two waits\n')
+                    buffer.capture_waits()
+                    self.assertEqual(buffer.end, 5)
+                    child.stdin.write(b'close nested\n')
+                    await child.stdin.drain()
+                    self.assertEqual(await asyncio.wait_for(child.stdout.readline(), 5), b'one wait\n')
+                    buffer.capture_waits()
+                    self.assertEqual(buffer.end, 6)
+                finally:
+                    if child.returncode is None:
+                        child.kill()
+                    await asyncio.wait_for(child.wait(), 5)
+                for _ in range(100):
+                    if not buffer.wait_pages and not buffer.active:
+                        break
+                    await asyncio.sleep(.01)
+                self.assertFalse(buffer.wait_pages)
+                buffer.capture_waits()
+                events = [WaitDecoder().consume(record) for record in buffer.records[3:7]]
+                self.assertEqual([event['active'] for event in events], [True, True, False, False])
+                self.assertEqual(events[0]['wait_id'], events[-1]['wait_id'])
+                self.assertEqual(events[1]['wait_id'], events[2]['wait_id'])
 
 
 if __name__ == '__main__':

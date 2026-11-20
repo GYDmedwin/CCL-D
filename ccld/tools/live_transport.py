@@ -5,16 +5,20 @@ from collections import Counter, defaultdict
 from contextlib import suppress
 from dataclasses import dataclass
 import hmac
+from itertools import groupby
+from operator import itemgetter
 import os
 from pathlib import Path
 import secrets
 import signal
 import stat
 import struct
+import time
 import zlib
 
 from .decode_ccld_binary import RECORD_BYTES
-from .wait_observation import LIMIT, evidence_record, peer_process, receive_wait, wait_socket
+from .wait_memory import WAIT_ROW
+from .wait_observation import LIMIT, evidence_record, peer_process, process_groups, receive_wait, wait_socket
 
 PROTOCOL = b'CCLDP002'
 REQUEST = struct.Struct('!8s32sQ')
@@ -45,6 +49,9 @@ class NodeBuffer:
         self.failed = 0
         self.active = 0
         self.process_streams = defaultdict(Counter)
+        self.binding_since = defaultdict(dict)
+        self.wait_pages = {}
+        self.shared_wait_ids = {}
         self.waits = {}
         self.published_waits = {}
         self.next_wait_id = 0
@@ -52,6 +59,10 @@ class NodeBuffer:
     def append(self, raw):
         self.records[self.end % len(self.records)] = raw
         self.end += 1
+
+    def bind_rank(self, process, identity):
+        self.process_streams[process][identity] += 1
+        self.binding_since[process][identity[:2]] = time.monotonic_ns()
 
     def unbind_rank(self, process, identity):
         bindings = self.process_streams[process]
@@ -61,13 +72,50 @@ class NodeBuffer:
         if not bindings:
             del self.process_streams[process]
         comm, rank, _ = identity
+        times = self.binding_since[process]
+        if any(key[:2] == (comm, rank) for key in bindings):
+            times[comm, rank] = time.monotonic_ns()
+        else:
+            times.pop((comm, rank), None)
+        if not times:
+            del self.binding_since[process]
         for wait_id, (owner, records) in list(self.waits.items()):
             if owner == process and any((c[0], c[2]) == (comm, rank) or (p[0], p[2]) == (comm, rank)
                                         for c, p, _, _ in records):
                 del self.waits[wait_id]
 
+    def capture_shared_waits(self):
+        active = {}
+        for process, page in self.wait_pages.items():
+            body = page.snapshot()
+            if not body:
+                continue
+            groups = process_groups(self.process_streams.get(process, {}))
+            since = self.binding_since.get(process, {})
+            for scope, rows in groupby(WAIT_ROW.iter_unpack(body), key=itemgetter(0)):
+                records = []
+                for _, started, pc, po, pr, cc, co, cr in rows:
+                    producer, consumer = (pc, pr), (cc, cr)
+                    if (pc == cc or not po or not co or producer not in groups or consumer not in groups
+                            or started < max(since[producer], since[consumer])):
+                        break
+                    records.append(((cc, co, cr), (pc, po, pr), groups[consumer]))
+                else:
+                    key = (page, scope)
+                    wait_id = self.shared_wait_ids.get(key)
+                    if wait_id is None:
+                        self.next_wait_id += 1
+                        wait_id = self.next_wait_id
+                    active[key] = wait_id
+                    self.waits[wait_id] = (process, [(*fields, wait_id) for fields in records])
+        for key in self.shared_wait_ids.keys() - active.keys():
+            self.waits.pop(self.shared_wait_ids[key], None)
+        self.shared_wait_ids = active
+
     def capture_waits(self):
         """Export transitions between pull views of the active wait scopes."""
+        if self.wait_pages or self.shared_wait_ids:
+            self.capture_shared_waits()
         if not self.waits and not self.published_waits:
             return
         for wait_id in sorted(self.published_waits.keys() - self.waits.keys()):
@@ -111,7 +159,7 @@ async def receive_rank(reader, writer, buffer):
                         (identity is not None and (kind == 1 or identity != rank_identity))):
                     raise ValueError('invalid rank telemetry stream')
                 if process is not None and kind == 1:
-                    buffer.process_streams[process][rank_identity] += 1
+                    buffer.bind_rank(process, rank_identity)
                     bound = True
                 identity = rank_identity
                 ended = kind == 8
