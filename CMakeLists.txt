@@ -569,6 +569,7 @@ set(SRC_FILES
   src/misc/argcheck.cc
   src/misc/api_trace.c
   src/misc/api_trace.cc
+  src/misc/ccld.cc
 # src/misc/cudawrap.cc
 # src/misc/gdrwrap.cc
   src/misc/hip_prof_rccl.cc

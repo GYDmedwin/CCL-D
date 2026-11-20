@@ -19,6 +19,7 @@
 #include "graph.h"
 #include "argcheck.h"
 #include "device.h"
+#include "ccld.h"
 #include "collectives.h"
 #if defined(ENABLE_NPKIT)
 #include "npkit/npkit.h"
@@ -381,6 +382,8 @@ static ncclResult_t commFree(ncclComm_t comm) {
   if (comm == NULL)
     return ncclSuccess;
 
+  ccldFree(comm);
+
   /* in commReclaim, we have guaranteed only last rank which calls ncclCommDestroy() will
    * free all intra-process communicators; therefore, we only need to focus on local
    * resource cleanup in commFree(). */
@@ -683,6 +686,9 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   tmpCommAndChans.comm.nNodes = comm->nNodes;
   tmpCommAndChans.comm.abortFlag = comm->abortFlagDev;
   tmpCommAndChans.comm.p2pnChannelsPerPeer = comm->p2pnChannelsPerPeer;
+  ccldDeviceConfig(comm, &tmpCommAndChans.comm.ccldFrame,
+                   &tmpCommAndChans.comm.ccldBlockBytes, &tmpCommAndChans.comm.ccldGroups,
+                   &tmpCommAndChans.comm.ccldWaitFrame, &tmpCommAndChans.comm.ccldWaitBlockBytes);
   for (int p=0; p < NCCL_NUM_PROTOCOLS; p++) {
     tmpCommAndChans.comm.buffSizes[p] = comm->buffSizes[p];
   }
@@ -1857,6 +1863,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       INFO(NCCL_ENV, "NCCL_LAUNCH_MODE set by environment to %s", mode == ncclLaunchModeParallel ? "PARALLEL" : "GROUP");
     }
   }
+
+  ccldInit(comm);
 
   // Call devCommSetup before the last barrier, making sure we don't have a thread running in front and starting to
   // launch NCCL kernels before all cuda mem allocation is complete. That could cause a deadlock.

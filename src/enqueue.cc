@@ -7,6 +7,7 @@
  ************************************************************************/
 
 #include "enqueue.h"
+#include "ccld.h"
 #include "argcheck.h"
 #include "coll_net.h"
 #include "graph/topo.h"
@@ -1426,6 +1427,7 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
       if (planner->nTasksColl == 0 && planner->nTasksP2p != 0) {
         NCCLCHECKGOTO(scheduleP2pTasksToPlan(comm, plan, &budget), result, failure);
       }
+      if (comm->ccldState) ccldPlan(comm, plan);
       finishPlan(comm, plan);
       if (plan->workBytes != 0) {
         ncclIntruQueueEnqueue(&planner->planQueue, plan);
@@ -2377,6 +2379,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       // Must be in thread local group before tasks can be alloc'd in `comm->memScoped`.
       ncclGroupCommJoin(info->comm);
       struct ncclTaskColl* t = ncclMemoryStackAlloc<struct ncclTaskColl>(&comm->memScoped);
+      t->ccldSeq = comm->ccldState ? ccldEnter(comm, info) : 0;
       t->func = info->coll;
       t->sendbuff = info->sendbuff;
       t->recvbuff = info->recvbuff;

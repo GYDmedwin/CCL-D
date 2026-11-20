@@ -46,8 +46,13 @@ static inline CcldBlock* ccldFrameBlock(CcldFrame* frame, unsigned index,
       offsetof(CcldFrame, blocks) + index * ccldBlockBytes(channels, groups));
 }
 
-#ifndef __CUDACC__
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_runtime.h>
+#elif defined(__CUDACC__)
 #include <cuda_runtime.h>
+#else
+typedef void* cudaStream_t;
+#endif
 struct ncclComm;
 struct ncclInfo;
 struct ncclKernelPlan;
@@ -60,6 +65,5 @@ uint64_t ccldEnter(struct ncclComm* comm, const struct ncclInfo* info);
 void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan);
 void ccldCallbackEnqueue(struct ncclComm* comm, struct ncclKernelPlan* plan,
                          cudaStream_t stream);
-#endif
 
 #endif
