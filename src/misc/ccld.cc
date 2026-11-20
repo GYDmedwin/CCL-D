@@ -469,10 +469,24 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
     ccldDropped(state, plan->ccldSeq, ccldPlanReasonString(decision.reason));
     return;
   }
-  if (plan->ccldFunc != ncclFuncAllReduce || plan->ccldAlgorithm != NCCL_ALGO_RING ||
-      plan->ccldProtocol != NCCL_PROTO_SIMPLE) {
+  if (plan->ccldProtocol == NCCL_PROTO_LL128) {
     state->pending.forget(plan->ccldSeq);
-    ccldDropped(state, plan->ccldSeq, "p4_simple_ring_allreduce_only");
+    ccldDropped(state, plan->ccldSeq, "ll128_unsupported_gfx936");
+    return;
+  }
+  if (plan->ccldProtocol != NCCL_PROTO_SIMPLE && plan->ccldProtocol != NCCL_PROTO_LL) {
+    state->pending.forget(plan->ccldSeq);
+    ccldDropped(state, plan->ccldSeq, "unsupported_protocol");
+    return;
+  }
+  const bool ringCollective = plan->ccldAlgorithm == NCCL_ALGO_RING &&
+      (plan->ccldFunc == ncclFuncAllReduce || plan->ccldFunc == ncclFuncAllGather ||
+       plan->ccldFunc == ncclFuncReduceScatter);
+  const bool treeAllReduce = plan->ccldAlgorithm == NCCL_ALGO_TREE &&
+      plan->ccldFunc == ncclFuncAllReduce;
+  if (!ringCollective && !treeAllReduce) {
+    state->pending.forget(plan->ccldSeq);
+    ccldDropped(state, plan->ccldSeq, "unsupported_collective_algorithm");
     return;
   }
 
@@ -507,7 +521,10 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
       plan->ccldProtocol == NCCL_PROTO_LL ? "LL" : "LL128";
   slot.channelLo = static_cast<int>(descriptor.channelLo);
   slot.channelHi = static_cast<int>(descriptor.channelHi);
-  for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) slot.parents[channel] = -1;
+  for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) {
+    slot.parents[channel] = plan->ccldAlgorithm == NCCL_ALGO_TREE
+        ? comm->channels[channel].tree.up : -1;
+  }
   slot.lastDumpNs = slot.startNs;
   slot.done.store(false, std::memory_order_relaxed);
   slot.eventRecorded.store(false, std::memory_order_relaxed);

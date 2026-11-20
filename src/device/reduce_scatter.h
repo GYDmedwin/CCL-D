@@ -30,7 +30,8 @@ namespace {
     int rankDest;
 
     Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0>
-      prims(tid, nthreads, &ring->prev, &ring->next, work->sendbuff, work->recvbuff, work->redOpArg, 0, work->connIndex, work->connIndex);
+      prims(tid, nthreads, &ring->prev, &ring->next, work->sendbuff, work->recvbuff, work->redOpArg, 0,
+            work->connIndex, work->connIndex, work);
 
     for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
       nelem = min(chunkCount, channelCount - elemOffset);

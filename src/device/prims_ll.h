@@ -19,6 +19,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p>:
   static constexpr int MaxRecv = Fan::MaxRecv > 1 ? Fan::MaxRecv : 1;
   static constexpr int MaxSend = Fan::MaxSend;
   static constexpr int Input=0, Output=1;
+  CcldChannel* ccldChannel;
   RedOp redOp;
   const int tid;
   const int nthreads;
@@ -417,6 +418,7 @@ private:
     // Always waitSend in case of cleanup
     nelem = nelem < 0 ? 0 : nelem;
     if (SEND) waitSend(divUp(nelem, EltPerLine)*sizeof(ncclLLFifoLine));
+    if (SEND) ccldCount(ccldChannel, tid, group, true, false);
 
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_LL_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL_DATA_PROCESS_EXIT)
     if (tid == 0) {
@@ -500,6 +502,7 @@ private:
     if (RECV) {
       for (int i=0; i < MaxRecv; i++) incRecv(i);
       postRecv();
+      ccldCount(ccldChannel, tid, group, false, true);
     }
     if (SEND) {
       for (int i=1; i < MaxSend && i < fan.nsend(); i++)
@@ -618,6 +621,7 @@ private:
       bool userBufReg=false, int stepSize_=0
     ):
     redOp(redOpArg),
+    ccldChannel(ccldOutput(e, tid, group)),
     tid(tid), nthreads(nthreads), wid(tid%WARP_SIZE), group(group),
     stepLines(ncclShmem.comm.buffSizes[NCCL_PROTO_LL]/NCCL_STEPS/sizeof(ncclLLFifoLine)) {
     auto *channel = &ncclShmem.channel;

@@ -8,6 +8,9 @@ DECODER=${CCLD_DECODER:-/workspace/nv/CCL-D/ccld/tools/decode_ccld_binary.py}
 RCCL_LIB=${RCCL_LIB:-/workspace/dcu/results/gfx936-20261121/librccl.so.1.0}
 RCCL_BUILD_DIR=${RCCL_BUILD_DIR:-$ROOT/build-ccld-gfx936-only}
 EXPECTED_RANKS=${CCLD_EXPECTED_RANKS:-4}
+PROTO=${CCLD_TEST_PROTO:-Simple}
+ALGO=${CCLD_TEST_ALGO:-Ring}
+EXPECTED_CHANNELS=${CCLD_EXPECTED_CHANNELS:-$([[ "$PROTO" == "LL" ]] && echo 32 || echo 16)}
 WORK=${CCLD_TEST_WORK:-$(mktemp -d /tmp/ccld-gfx936-ring.XXXXXX)}
 KEEP_WORK=${CCLD_KEEP_TEST_WORK:-0}
 
@@ -53,8 +56,8 @@ NCCL_CCLD_ENABLE=1 \
 NCCL_CCLD_OUT_DIR="$WORK/traces" \
 NCCL_CCLD_DUMP_MS=10 \
 NCCL_CCLD_POLL_US=20 \
-NCCL_ALGO=Ring \
-NCCL_PROTO=Simple \
+NCCL_ALGO="$ALGO" \
+NCCL_PROTO="$PROTO" \
 LD_LIBRARY_PATH="$RUNTIME_LIBS" \
   "$WORK/ccld_simple_allreduce_test"
 
@@ -69,7 +72,7 @@ for trace in "${traces[@]}"; do
 done
 
 EXPECTED_SEND_RECV=$((2 * (EXPECTED_RANKS - 1)))
-python3 - "$WORK/decoded" "$EXPECTED_RANKS" "$EXPECTED_SEND_RECV" <<'PY'
+python3 - "$WORK/decoded" "$EXPECTED_RANKS" "$EXPECTED_SEND_RECV" "$PROTO" "$ALGO" "$EXPECTED_CHANNELS" <<'PY'
 import collections
 import json
 import pathlib
@@ -89,13 +92,16 @@ for path in files:
     completes = [row for row in rows if row["event"] == "complete"]
     assert len(completes) == 3, (path, events)
     for event in completes:
-        assert event["algorithm"] == "Ring", event
-        assert event["protocol"] == "Simple", event
+        assert event["algorithm"] == sys.argv[5], event
+        assert event["protocol"] == sys.argv[4], event
         channels = event["channels"][:event["n_channels"]]
         assert event["n_channels"] > 0, event
-        assert len(channels) == 16, event
-        assert {channel["send_count"] for channel in channels} == {expected_count}, event
-        assert {channel["recv_count"] for channel in channels} == {expected_count}, event
-print(f"gfx936 CCL-D Simple Ring validation passed: ranks={expected_ranks}, "
+        assert len(channels) == int(sys.argv[6]), event
+        if sys.argv[5] == "Ring":
+            assert {channel["send_count"] for channel in channels} == {expected_count}, event
+            assert {channel["recv_count"] for channel in channels} == {expected_count}, event
+        else:
+            assert any(channel["tree_parent"] != -1 for channel in channels), event
+print(f"gfx936 CCL-D {sys.argv[5]} validation passed: ranks={expected_ranks}, "
       f"complete_events={len(completes)} per rank, send_recv={expected_count}")
 PY

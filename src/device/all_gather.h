@@ -55,7 +55,8 @@ namespace {
     T *inputBuf = (T*)work->sendbuff;
     T *outputBuf = (T*)work->recvbuff;
     Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0> prims
-      (tid, nthreads, &ring->prev, &ring->next, inputBuf, outputBuf, work->redOpArg, 0, work->connIndex, work->connIndex);
+      (tid, nthreads, &ring->prev, &ring->next, inputBuf, outputBuf, work->redOpArg, 0,
+       work->connIndex, work->connIndex, work);
 
 #if defined(ENABLE_NPKIT)
     if (tid == 0) {
