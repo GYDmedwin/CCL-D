@@ -470,6 +470,7 @@ set(SRC_FILES
   src/include/ccld_pending.h
   src/include/ccld_plan.h
   src/include/ccld_queue.h
+  src/include/ccld_stream.h
   src/include/collectives.h
   src/include/coll_net.h
   src/include/comm.h
@@ -866,6 +867,7 @@ if (ROCTX_ENABLE)
 endif()
 target_link_libraries(rccl PRIVATE   -fgpu-rdc)             # Required when linking relocatable device code
 target_link_libraries(rccl PRIVATE   Threads::Threads)
+target_link_libraries(rccl PRIVATE   atomic)                 # CCL-D lock-free queue atomics
 target_link_libraries(rccl INTERFACE hip::host)
 target_link_libraries(rccl PRIVATE   hip::device)
 target_link_libraries(rccl PRIVATE   dl)

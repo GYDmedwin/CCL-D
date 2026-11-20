@@ -3,6 +3,8 @@
 #include "ccld_log.h"
 #include "ccld_pending.h"
 #include "ccld_plan.h"
+#include "ccld_queue.h"
+#include "ccld_stream.h"
 #include "comm.h"
 #include "collectives.h"
 #include "debug.h"
@@ -77,13 +79,22 @@ struct CcldState {
   std::condition_variable cv;
   std::mutex outputMutex;
   std::atomic<bool> stop{false};
+  std::atomic<bool> writerStop{false};
+  std::atomic<bool> ioFailed{false};
+  std::atomic<uint64_t> logDrops{0};
+  std::atomic<uint64_t> lastDroppedSeq{0};
   std::atomic<int> callbacksOutstanding{0};
+  std::unique_ptr<CcldQueue<CcldLogEvent>> logQueue;
+  size_t queueSlots = 0;
+  std::thread writer;
+  CcldNodeStream nodeStream;
   FILE* output = nullptr;
   uint64_t commHash = 0;
   uint64_t pollUs = 200;
   uint64_t dumpNs = 1000000000ull;
   int rank = 0, nranks = 0, device = -1;
   bool useEvent = true;
+  char host[64] = {};
 };
 
 struct CcldCallback { CcldState* state; unsigned slot; };
@@ -109,14 +120,52 @@ static CcldLogEvent ccldLogBase(CcldState* state, CcldLogType type,
   event.nowNs = now;
   event.rank = state->rank;
   event.nranks = state->nranks;
+  snprintf(event.host, sizeof(event.host), "%s", state->host);
   return event;
 }
 
 static void ccldWrite(CcldState* state, const CcldLogEvent& event) {
-  std::lock_guard<std::mutex> lock(state->outputMutex);
-  if (state->output != nullptr) {
-    if (fwrite(&event, sizeof(event), 1, state->output) != 1 || fflush(state->output) != 0)
-      WARN("CCL-D rank %d failed to write telemetry", state->rank);
+  if (state->logQueue != nullptr && state->logQueue->push(event)) return;
+  state->lastDroppedSeq.store(event.seq, std::memory_order_relaxed);
+  state->logDrops.fetch_add(1, std::memory_order_release);
+}
+
+static void ccldWriter(CcldState* state) {
+  CcldLogEvent batch[16];
+  for (;;) {
+    size_t count = 0;
+    const uint64_t drops = state->logDrops.exchange(0, std::memory_order_acq_rel);
+    if (drops != 0) {
+      batch[count] = ccldLogBase(state, CcldLogDropped,
+                                 state->lastDroppedSeq.load(std::memory_order_relaxed), ccldNow());
+      batch[count].count = drops;
+      snprintf(batch[count].reason, sizeof(batch[count].reason), "%s", "binary_queue_overflow");
+      ++count;
+    }
+    while (count < 16 && state->logQueue->pop(batch[count])) ++count;
+    if (count != 0) {
+      bool ok = false;
+      {
+        std::lock_guard<std::mutex> lock(state->outputMutex);
+        if (state->output != nullptr)
+          ok = fwrite(batch, sizeof(CcldLogEvent), count, state->output) == count && fflush(state->output) == 0;
+      }
+      if (state->output == nullptr && !state->ioFailed.load(std::memory_order_relaxed))
+        ok = state->nodeStream.write(batch, count * sizeof(CcldLogEvent));
+      if (!ok) {
+        state->ioFailed.store(true, std::memory_order_release);
+        state->nodeStream.close();
+      }
+    } else if (state->writerStop.load(std::memory_order_acquire)) {
+      break;
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  }
+  if (state->output == nullptr && !state->ioFailed.load(std::memory_order_acquire)) {
+    CcldLogEvent end = ccldLogBase(state, CcldLogEnd, state->sequence.next(), ccldNow());
+    state->nodeStream.write(&end, sizeof(end));
+    state->nodeStream.close();
   }
 }
 
@@ -274,6 +323,7 @@ void ccldInit(struct ncclComm* comm) {
   state->rank = comm->rank;
   state->nranks = comm->nRanks;
   state->device = comm->cudaDev;
+  gethostname(state->host, sizeof(state->host) - 1);
   state->pollUs = ccldEnvNumber("NCCL_CCLD_POLL_US", 200, 20, 1000000);
   state->dumpNs = ccldEnvNumber("NCCL_CCLD_DUMP_MS", 1000, 10, 60000) * 1000000ull;
   const char* completion = ncclGetEnv("NCCL_CCLD_COMPLETION");
@@ -302,6 +352,15 @@ void ccldInit(struct ncclComm* comm) {
   state->frame->detectChannel = state->frameChannels;
 
   const char* outputDir = ncclGetEnv("NCCL_CCLD_OUT_DIR");
+  const char* nodeSocket = ncclGetEnv("NCCL_CCLD_NODE_SOCKET");
+  state->queueSlots = static_cast<size_t>(ccldEnvNumber("NCCL_CCLD_QUEUE_SLOTS", 128, 128, 4096));
+  state->logQueue.reset(new (std::nothrow) CcldQueue<CcldLogEvent>(state->queueSlots));
+  if (!state->logQueue || !state->logQueue->valid() || !state->logQueue->lockFree()) {
+    WARN("CCL-D binary queue is unavailable");
+    ccldMappedHostFree(&state->frameAllocation);
+    delete state;
+    return;
+  }
   if (outputDir != nullptr && *outputDir != '\0') {
     char path[4096];
     const int length = snprintf(path, sizeof(path), "%s/ccld-%016" PRIx64 "-rank%d-pid%ld.ccldbin",
@@ -314,8 +373,8 @@ void ccldInit(struct ncclComm* comm) {
       return;
     }
   }
-  if (state->output == nullptr) {
-    WARN("CCL-D requires NCCL_CCLD_OUT_DIR for binary telemetry");
+  if (state->output == nullptr && (nodeSocket == nullptr || !state->nodeStream.open(nodeSocket))) {
+    WARN("CCL-D requires NCCL_CCLD_NODE_SOCKET or NCCL_CCLD_OUT_DIR for binary telemetry");
     ccldMappedHostFree(&state->frameAllocation);
     delete state;
     return;
@@ -344,12 +403,19 @@ void ccldInit(struct ncclComm* comm) {
   init.frameGroups = state->frameGroups;
   init.pollUs = static_cast<uint32_t>(state->pollUs);
   init.mode = static_cast<uint32_t>(state->mode);
+  init.bytes = state->queueSlots;
+  init.windowNs = state->logQueue->allocatedBytes();
   snprintf(init.reason, sizeof(init.reason), "%s", state->useEvent ? "event_query" : "hostfunc");
+  init.bytes = state->queueSlots;
+  init.windowNs = state->logQueue->allocatedBytes();
   ccldWrite(state, init);
   try {
+    state->writer = std::thread(ccldWriter, state);
     state->sampler = std::thread(ccldSampler, state);
   } catch (const std::exception& errorException) {
     WARN("CCL-D sampler creation failed: %s", errorException.what());
+    state->writerStop.store(true, std::memory_order_release);
+    if (state->writer.joinable()) state->writer.join();
     if (state->useEvent) for (unsigned i = 0; i < state->frameBlocks; ++i)
       hipEventDestroy(state->slots[i].completionEvent);
     ccldMappedHostFree(&state->waitAllocation);
@@ -367,6 +433,12 @@ void ccldFree(struct ncclComm* comm) {
   state->stop.store(true, std::memory_order_release);
   state->cv.notify_one();
   if (state->sampler.joinable()) state->sampler.join();
+  if (state->output != nullptr) {
+    CcldLogEvent end = ccldLogBase(state, CcldLogEnd, state->sequence.next(), ccldNow());
+    ccldWrite(state, end);
+  }
+  state->writerStop.store(true, std::memory_order_release);
+  if (state->writer.joinable()) state->writer.join();
   bool active = state->callbacksOutstanding.load(std::memory_order_acquire) != 0;
   for (unsigned i = 0; i < state->frameBlocks; ++i)
     active = active || state->slots[i].phase.load(std::memory_order_acquire) != 0;
@@ -378,8 +450,6 @@ void ccldFree(struct ncclComm* comm) {
   if (state->useEvent) for (unsigned i = 0; i < state->frameBlocks; ++i)
     hipEventDestroy(state->slots[i].completionEvent);
   if (state->output != nullptr) {
-    CcldLogEvent end = ccldLogBase(state, CcldLogEnd, state->sequence.next(), ccldNow());
-    ccldWrite(state, end);
     fclose(state->output);
     state->output = nullptr;
   }

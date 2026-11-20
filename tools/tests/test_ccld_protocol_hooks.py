@@ -33,6 +33,29 @@ class LlCounterHooksTest(unittest.TestCase):
         self.assertIn("if (SEND) waitSend(divUp(nelem, EltPerLine)*sizeof(ncclLLFifoLine));", nv)
         self.assertIn("if (RECV) {\n      for (int i=0; i < MaxRecv; i++) incRecv(i);", nv)
 
+    def test_async_writer_is_only_sink_for_telemetry(self):
+        source = (ROOT / "src/misc/ccld.cc").read_text()
+        log = source[source.index("static void ccldWrite"):source.index("static void ccldWriter")]
+        self.assertIn("logQueue->push(event)", log)
+        self.assertNotIn("fwrite", log)
+        self.assertIn("CcldQueue<CcldLogEvent>", source)
+        self.assertIn("state->writer = std::thread(ccldWriter, state)", source)
+        self.assertIn("state->writer.join()", source)
+
+    def test_socket_and_file_are_writer_sinks(self):
+        source = (ROOT / "src/misc/ccld.cc").read_text()
+        writer = source[source.index("static void ccldWriter"):source.index("static uint64_t ccldLoad")]
+        self.assertIn("fwrite(batch, sizeof(CcldLogEvent), count, state->output)", writer)
+        self.assertIn("state->nodeStream.write(batch, count * sizeof(CcldLogEvent))", writer)
+        self.assertIn('"NCCL_CCLD_NODE_SOCKET"', source)
+        self.assertIn('"binary_queue_overflow"', writer)
+
+    def test_gfx936_full_socket_roundtrip_gate_exists(self):
+        script = (ROOT / "tools/tests/run_ccld_gfx936_socket_sink.sh").read_text()
+        self.assertIn("NCCL_CCLD_NODE_SOCKET", script)
+        self.assertIn("decode_ccld_binary.py", script)
+        self.assertIn("comm_end", script)
+
 
 if __name__ == "__main__":
     unittest.main()
