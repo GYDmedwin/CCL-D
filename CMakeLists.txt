@@ -465,6 +465,7 @@ set(SRC_FILES
   src/include/channel.h
   src/include/checks.h
   src/include/ccld.h
+  src/include/ccld_alloc.h
   src/include/ccld_log.h
   src/include/ccld_pending.h
   src/include/ccld_plan.h
