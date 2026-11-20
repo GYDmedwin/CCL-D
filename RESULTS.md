@@ -250,6 +250,38 @@ separate, and DP0 operation 5 still linked to TP0 operation 4. These
 timing results describe the short-step TP8×DP2 workload and its wait
 frequency.
 
+### Warmed wait registration
+
+The writer now caches validated communicator IDs and invalidates the
+shared page directly when its last wait ends. A Linux benchmark compared
+the two shared-memory versions on the same allocated CPU cores.
+
+| Complete registration scope with an empty body | Initial shared memory | Cached IDs and direct invalidation |
+|---|---:|---:|
+| Warm, one process | 16.18 µs | 9.86 µs |
+| Eight callers at 100/s each, median | 216.62 µs | 162.28 µs |
+| Eight callers at 100/s each, P95 | 233.82 µs | 166.13 µs |
+
+The warmed value is the best mean of three 2,000-scope batches. The
+rate-controlled percentiles are averaged across two repetitions and
+include CPU wake-up and scheduling effects.
+
+Job 16469 ran both shared-memory versions on the same two eight-H100
+nodes. Each version alternated eight timing blocks of 128 steps, with
+492 measured steps per mode. The longest rank time per step had these
+medians.
+
+| Version | Registration off | Registration on | Added median time |
+|---|---:|---:|---:|
+| Initial shared memory | 2.389 ms | 2.516 ms | 0.127 ms |
+| Cached IDs and direct invalidation | 2.378 ms | 2.476 ms | 0.098 ms |
+
+The paired differences varied across blocks. Each version passed
+16,576 numerical rank-step checks and delivered 33,152 rank
+completions. The new writer also passed all four diagnostic cases,
+including separate H1 alarms for independent delays and the
+cross-step DP0 to TP0 wait.
+
 ## Two-node collective and training checks
 
 On 2026-11-19, the full, non-fault-injection NCCL build was exercised on two

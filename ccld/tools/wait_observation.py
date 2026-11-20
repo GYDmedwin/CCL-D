@@ -3,6 +3,7 @@ from array import array
 import asyncio
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -50,13 +51,25 @@ def peer_process(writer):
         return None
 
 
-def parse_operation(raw):
-    if (not isinstance(raw, list) or len(raw) != 3 or not isinstance(raw[0], str)
-            or not re.fullmatch(r'[0-9a-f]{16}', raw[0])
-            or type(raw[1]) is not int or not 0 < raw[1] < 2**64
-            or type(raw[2]) is not int or not 0 <= raw[2] < 2**32):
+@lru_cache(maxsize=1024)
+def communicator_id(comm_hash):
+    if not re.fullmatch(r'[0-9a-f]{16}', comm_hash):
         raise ValueError('invalid wait operation reference')
-    return int(raw[0], 16), raw[1], raw[2]
+    return int(comm_hash, 16)
+
+
+def operation_reference(comm_hash, op_count, rank):
+    if (not isinstance(comm_hash, str)
+            or type(op_count) is not int or not 0 < op_count < 2**64
+            or type(rank) is not int or not 0 <= rank < 2**32):
+        raise ValueError('invalid wait operation reference')
+    return communicator_id(str.__str__(comm_hash)), op_count, rank
+
+
+def parse_operation(raw):
+    if not isinstance(raw, list) or len(raw) != 3:
+        raise ValueError('invalid wait operation reference')
+    return operation_reference(*raw)
 
 
 def evidence_record(consumer, producer, world, wait_id, state):
@@ -242,10 +255,11 @@ def observe_wait(producer, consumers, rank_socket=None):
     writer, scope = None, None
     if path:
         try:
-            rows = tuple(parse_operation(consumer.fields()) for consumer in consumers
+            rows = tuple(operation_reference(consumer.comm_hash, consumer.op_count, consumer.rank)
+                         for consumer in consumers
                          if consumer.comm_hash != producer.comm_hash)
-            if rows and len(rows) == len(set(rows)):
-                reference = parse_operation(producer.fields())
+            if rows and (len(rows) == 1 or len(rows) == len(set(rows))):
+                reference = operation_reference(producer.comm_hash, producer.op_count, producer.rank)
                 writer = wait_writer(path)
                 if writer is not None:
                     scope = writer.begin(reference, rows)

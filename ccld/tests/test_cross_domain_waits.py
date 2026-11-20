@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -10,7 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from ccld.analyzer.cross_domain import CrossDomainWaits
 from ccld.tools.decode_async_wait import WaitDecoder
 from ccld.tools.live_transport import NodeBuffer, receive_rank
-from ccld.tools.wait_memory import WAIT_ROW
+from ccld.tools.wait_memory import WAIT_ROW, WaitPage, WaitWriter, new_page_fd
 from ccld.tools.wait_observation import evidence_record, receive_wait
 
 
@@ -140,6 +141,22 @@ class LocalWaitRequestTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(sys.platform == 'linux', 'shared wait sockets use Linux peer credentials')
 class SharedWaitIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def test_cleared_page_can_be_reused_without_exposing_old_scope(self):
+        fd = new_page_fd()
+        self.addCleanup(os.close, fd)
+        page, reader = WaitPage(fd), WaitPage(fd)
+        self.addCleanup(page.close)
+        self.addCleanup(reader.close)
+        writer = WaitWriter(page, None)
+        producer = (1, 2, 0)
+        first = writer.begin(producer, ((2, 3, 0),))
+        self.assertEqual(WAIT_ROW.unpack(reader.snapshot())[0], first)
+        writer.end(first)
+        self.assertEqual(reader.snapshot(), b'')
+        second = writer.begin(producer, ((2, 4, 0),))
+        row = WAIT_ROW.unpack(reader.snapshot())
+        self.assertEqual((row[0], row[6]), (second, 4))
+
     async def test_scopes_are_local_and_process_exit_retires_evidence(self):
         child_code = """
 import os, socket, sys, time

@@ -60,23 +60,29 @@ class WaitPage:
         self.memory = mmap.mmap(fd, PAGE_BYTES, access=mmap.ACCESS_WRITE)
         self.address = ctypes.addressof(ctypes.c_ubyte.from_buffer(self.memory))
         self.version = 0
+        self.invalidated = False
 
     def close(self):
         self.memory.close()
 
-    def publish(self, body):
-        # The exchange orders later payload stores after the odd version.
-        # Publishing the even version releases the complete snapshot.
+    def clear(self):
+        # An odd version hides the previous snapshot and fences any later
+        # payload writes. Keep it odd while there are no active waits.
         self.exchange(self.address, self.version + 1, SEQ_CST)
+        self.invalidated = True
+
+    def publish(self, body):
+        if not self.invalidated:
+            self.clear()
+        LENGTH.pack_into(self.memory, 8, len(body))
+        self.memory[BODY_OFFSET:BODY_OFFSET + len(body)] = body
+        self.version += 2
+        self.invalidated = False
         try:
-            LENGTH.pack_into(self.memory, 8, len(body))
-            self.memory[BODY_OFFSET:BODY_OFFSET + len(body)] = body
-        except BaseException:
-            LENGTH.pack_into(self.memory, 8, 0)
-            raise
-        finally:
-            self.version += 2
             self.store(self.address, self.version, SEQ_CST)
+        except BaseException:
+            self.clear()
+            raise
 
     def snapshot(self):
         version = self.load(self.address, SEQ_CST)
@@ -115,11 +121,15 @@ class WaitWriter:
             self.next_id += 1
             scope = self.next_id
             started = time.monotonic_ns()
-            self.scopes[scope] = b''.join(WAIT_ROW.pack(scope, started, *producer, *consumer)
-                                          for consumer in consumers)
+            if len(consumers) == 1:
+                records = WAIT_ROW.pack(scope, started, *producer, *consumers[0])
+            else:
+                records = b''.join(WAIT_ROW.pack(scope, started, *producer, *consumer)
+                                   for consumer in consumers)
+            self.scopes[scope] = records
             self.size += size
             try:
-                self.page.publish(b''.join(self.scopes.values()))
+                self.page.publish(records if self.size == size else b''.join(self.scopes.values()))
             except BaseException:
                 self.size -= len(self.scopes.pop(scope))
                 raise
@@ -130,4 +140,7 @@ class WaitWriter:
             return
         with self.lock:
             self.size -= len(self.scopes.pop(scope))
-            self.page.publish(b''.join(self.scopes.values()))
+            if self.scopes:
+                self.page.publish(b''.join(self.scopes.values()))
+            else:
+                self.page.clear()
