@@ -61,12 +61,13 @@ def mark_fault(args, rank, iteration):
     print('INJECT ' + json.dumps(event, sort_keys=True), flush=True)
 
 
-def collective(op, n, rank, world, bad_count=False):
+def collective(op, n, rank, world, count_override=None):
     device = torch.device('cuda', int(os.environ['LOCAL_RANK']))
     if op == 'allreduce':
         # A one-element mismatch can still fit the same NCCL transfer chunks;
         # use a substantial count mismatch for the H2 experiment.
-        x = torch.full((max(1, n // 4) if bad_count else n,), float(rank + 1), device=device)
+        count = n if count_override is None else count_override
+        x = torch.full((count,), float(rank + 1), device=device)
         dist.all_reduce(x, op=dist.ReduceOp.SUM)
         return x, float(world * (world + 1) // 2)
     if op == 'allgather':
@@ -104,6 +105,7 @@ def main():
     p.add_argument('--fault', choices=('none', 'H1', 'H2', 'S1'), default='none')
     p.add_argument('--fault-rank', type=int, default=0)
     p.add_argument('--fault-iteration', type=int, default=3)
+    p.add_argument('--h2-delta-bytes', type=int, default=1024, help='bytes removed from the injected H2 rank count')
     p.add_argument('--sleep-ms', type=int, default=1000)
     p.add_argument('--gap-ms', type=int, default=0, help='delay between collective rounds')
     p.add_argument('--hang-seconds', type=int, default=20)
@@ -115,7 +117,7 @@ def main():
     args = p.parse_args()
     rank, world = int(os.environ['RANK']), int(os.environ['WORLD_SIZE'])
     local_rank = int(os.environ['LOCAL_RANK'])
-    if args.numel < 2 or args.iters < 1 or args.warmup < 0 or args.gap_ms < 0 or not 0 <= args.fault_rank < world:
+    if args.numel < 2 or args.iters < 1 or args.warmup < 0 or args.gap_ms < 0 or args.h2_delta_bytes < 4 or args.h2_delta_bytes % 4 != 0 or args.h2_delta_bytes // 4 >= args.numel or not 0 <= args.fault_rank < world:
         p.error('invalid size, iteration count, round delay, or fault rank')
     if args.fault == 'H2' and args.op != 'allreduce':
         p.error('H2 count mismatch is implemented only for AllReduce')
@@ -150,8 +152,8 @@ def main():
         elif injected and args.fault == 'H2':
             mark_fault(args, rank, iteration)
         collective_start_ns = time.monotonic_ns()
-        x, expected = collective(args.op, args.numel, rank, world,
-                                 bad_count=(injected and args.fault == 'H2'))
+        h2_count = args.numel - args.h2_delta_bytes // 4 if injected and args.fault == 'H2' and rank == args.fault_rank else None
+        x, expected = collective(args.op, args.numel, rank, world, count_override=h2_count)
         torch.cuda.synchronize()
         collective_end_ns = time.monotonic_ns()
         mismatched_round = args.fault == 'H2' and iteration >= args.fault_iteration
@@ -160,7 +162,8 @@ def main():
         log_workload(args, rank, {'rank': rank, 'iteration': iteration, 'verified': not mismatched_round,
                                   'collective_start_ns': collective_start_ns,
                                   'collective_end_ns': collective_end_ns,
-                                  'collective_duration_ns': collective_end_ns - collective_start_ns})
+                                  'collective_duration_ns': collective_end_ns - collective_start_ns,
+                                  'count_override': h2_count, 'count_delta_bytes': args.h2_delta_bytes if h2_count is not None else 0})
         if args.gap_ms and iteration + 1 < args.warmup + args.iters:
             time.sleep(args.gap_ms / 1000)
     dist.destroy_process_group()

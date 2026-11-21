@@ -25,6 +25,7 @@ PROTO=${CCLD_PROTO:-Simple}
 FAULT=${CCLD_WORKLOAD_FAULT:-none}
 FAULT_RANK=${CCLD_WORKLOAD_FAULT_RANK:-0}
 FAULT_ITERATION=${CCLD_WORKLOAD_FAULT_ITERATION:-3}
+H2_DELTA_BYTES=${CCLD_WORKLOAD_H2_DELTA_BYTES:-1024}
 SLEEP_MS=${CCLD_WORKLOAD_SLEEP_MS:-1000}
 HANG_SECONDS=${CCLD_WORKLOAD_HANG_SECONDS:-20}
 TIMEOUT_SECONDS=${CCLD_WORKLOAD_TIMEOUT_SECONDS:-90}
@@ -56,7 +57,7 @@ if [[ -n "${NCCL_CCLD_FAULT_RANK:-}" ]]; then export NCCL_CCLD_FAULT_RANK; fi
 if [[ -n "${NCCL_CCLD_FAULT_OP:-}" ]]; then export NCCL_CCLD_FAULT_OP; fi
 if [[ -n "${NCCL_CCLD_FAULT_REPEATS:-}" ]]; then export NCCL_CCLD_FAULT_REPEATS; fi
 if [[ -n "${NCCL_CCLD_FAULT_CYCLES:-}" ]]; then export NCCL_CCLD_FAULT_CYCLES; fi
-if [[ "$NODE_RANK" == 0 && -n "${NCCL_CCLD_FAULT_KIND:-}" ]]; then
+if [[ "$NODE_RANK" == 0 && ( -n "${NCCL_CCLD_FAULT_KIND:-}" || "$FAULT" != none ) ]]; then
   python3 "$ROOT/tools/tests/write_ccld_fault_config.py" "$RUN/fault-config.json"
 fi
 
@@ -65,7 +66,7 @@ exec "$TORCHRUN" \
   --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
   "$WORKLOAD" --op "$OP" --numel "$NUMEL" --warmup "$WARMUP" --iters "$ITERS" \
   --gap-ms "$GAP_MS" --fault "$FAULT" --fault-rank "$FAULT_RANK" \
-  --fault-iteration "$FAULT_ITERATION" --sleep-ms "$SLEEP_MS" --hang-seconds "$HANG_SECONDS" \
+  --fault-iteration "$FAULT_ITERATION" --h2-delta-bytes "$H2_DELTA_BYTES" --sleep-ms "$SLEEP_MS" --hang-seconds "$HANG_SECONDS" \
   --timeout-seconds "$TIMEOUT_SECONDS" \
   --workload-log-dir "$RUN/workload" --fault-log-dir "$RUN/fault-events" \
   --expect-nccl-prefix "$RCCL_BUILD_DIR" --expect-nccl-version 22203
