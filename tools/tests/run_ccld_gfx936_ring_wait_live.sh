@@ -18,7 +18,7 @@ FAULT_CYCLES=${CCLD_S2_CYCLES:-50000000}
 THRESHOLD=${CCLD_WAIT_THRESHOLD:?set calibrated CCLD_WAIT_THRESHOLD for topology/protocol}
 BASELINE_MS=${CCLD_BASELINE_MS:-1}
 WINDOW_S=${CCLD_WINDOW_S:-0.5}
-RUN=${CCLD_RUN:-$ROOT/../../results/ccld-p9-live-${TOPOLOGY}-${PROTO,,}-rank${FAULT_RANK}-$(date +%Y%m%d-%H%M%S)}
+RUN=${CCLD_RUN:-$ROOT/../results/ccld-p9-live-${TOPOLOGY}-${PROTO,,}-rank${FAULT_RANK}-$(date +%Y%m%d-%H%M%S)}
 CASE="Ring-${PROTO}-allreduce"
 
 [[ -f "$RCCL_LIB" && -f "$NODE_DECODER" && -f "$ANALYZER" && -f "$ADAPTER" ]] || { echo "RCCL/NV CCL-D inputs are missing" >&2; exit 2; }
