@@ -28,6 +28,8 @@ def main():
         'workload_h2_count_divisor': int(os.environ.get('CCLD_WORKLOAD_H2_COUNT_DIVISOR', '0')),
         'workload_h2_mismatch': os.environ.get('CCLD_WORKLOAD_H2_MISMATCH', 'count'),
         'workload_h2_operation': os.environ.get('CCLD_WORKLOAD_H2_OPERATION', 'reducescatter'),
+        'workload_h2_sim_stall_ranks': os.environ.get('CCLD_H2_SIM_STALL_RANKS', ''),
+        'workload_h2_sim_stall_cycles': int(os.environ.get('CCLD_H2_SIM_CYCLES', '0')),
     }
     ccld_fault = bool(config['fault_kind'])
     workload_fault = config['workload_fault_kind'] != 'none'
