@@ -7,3 +7,5 @@ build-ccld-gfx936-only/
 ext/
 
 /tools/tests/__pycache__/
+
+/build-ccld-gfx936-fault/
