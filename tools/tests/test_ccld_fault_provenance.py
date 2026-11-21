@@ -24,6 +24,7 @@ class FaultProvenanceTests(unittest.TestCase):
         self.assertIn('fault run continues to trace decode/analyzer', text)
         self.assertIn('CCLD_SKIP_POST_DECODE', DUAL.read_text())
         self.assertTrue((ROOT / 'tools/tests/run_ccld_gfx936_h3_live.sh').exists())
+        self.assertIn('CCLD_S2_RANK must be in', (ROOT / 'tools/tests/run_ccld_gfx936_ring_wait_live.sh').read_text())
 
 
     def test_writer_records_explicit_environment(self):

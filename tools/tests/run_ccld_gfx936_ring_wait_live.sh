@@ -24,6 +24,11 @@ CASE="Ring-${PROTO}-allreduce"
 [[ -f "$RCCL_LIB" && -f "$NODE_DECODER" && -f "$ANALYZER" && -f "$ADAPTER" ]] || { echo "RCCL/NV CCL-D inputs are missing" >&2; exit 2; }
 grep -q '^CCLD_FAULT_INJECTION:BOOL=ON$' "$RCCL_BUILD_DIR/CMakeCache.txt" || { echo "fault-enabled RCCL build required" >&2; exit 2; }
 [[ "$TOPOLOGY" == single || "$TOPOLOGY" == dual ]] || { echo "CCLD_TOPOLOGY must be single or dual" >&2; exit 2; }
+WORLD_SIZE=4
+[[ "$TOPOLOGY" == dual ]] && WORLD_SIZE=8
+[[ "$FAULT_RANK" =~ ^[0-9]+$ && "$FAULT_RANK" -lt "$WORLD_SIZE" ]] || {
+  echo "CCLD_S2_RANK must be in [0,$((WORLD_SIZE - 1))] for $TOPOLOGY topology" >&2; exit 2;
+}
 mkdir -p "$RUN/$CASE/bin" "$RUN/$CASE/jsonl" "$RUN/$CASE/jsonl-final" "$RUN/$CASE/workload" "$RUN/$CASE/fault-events"
 TRACE="$RUN/$CASE/jsonl"
 
@@ -31,7 +36,7 @@ python3 "$NODE_DECODER" "$RUN/$CASE/bin" "$TRACE" --follow --interval-s 0.05 \
   >"$RUN/$CASE/decoder-live.log" 2>&1 &
 decoder_pid=$!
 python3 -u "$ADAPTER" "$TRACE" --protocol "${PROTO^^}" \
-  --world-size "$([[ "$TOPOLOGY" == single ]] && echo 4 || echo 8)" \
+  --world-size "$WORLD_SIZE" \
   --threshold "$THRESHOLD" --interval-s 0.1 --baseline-ms "$BASELINE_MS" \
   --window-s "$WINDOW_S" --repeats 2 --hang-s 10 \
   >"$RUN/$CASE/adapter-live.jsonl" 2>"$RUN/$CASE/adapter-live.err" &
