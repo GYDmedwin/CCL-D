@@ -114,10 +114,11 @@ def main():
     p.add_argument('--numel', type=int, default=1 << 18, help='elements per rank/chunk')
     p.add_argument('--warmup', type=int, default=3)
     p.add_argument('--iters', type=int, default=10)
-    p.add_argument('--fault', choices=('none', 'H1', 'H2', 'S1'), default='none')
+    p.add_argument('--fault', choices=('none', 'H1', 'H2', 'S1', 'POST'), default='none')
     p.add_argument('--fault-rank', type=int, default=0)
     p.add_argument('--fault-iteration', type=int, default=3)
-    p.add_argument('--h2-count-divisor', type=int, default=4, help='NV CCL-D H2 count divisor for the injected rank')
+    p.add_argument('--h2-delta-bytes', type=int, default=1024, help='Ant-CCL 5.1 H2 bytes removed from the injected rank count')
+    p.add_argument('--h2-count-divisor', type=int, default=0, help='optional platform stress divisor; zero uses h2-delta-bytes')
     p.add_argument('--h2-mismatch', choices=('count', 'operation'), default='count', help='H2 scenario from NV count fault or Ant-CCL operation mismatch')
     p.add_argument('--h2-operation', choices=('allgather', 'reducescatter'), default='reducescatter', help='operation used by the injected H2 rank')
     p.add_argument('--sleep-ms', type=int, default=1000)
@@ -131,7 +132,10 @@ def main():
     args = p.parse_args()
     rank, world = int(os.environ['RANK']), int(os.environ['WORLD_SIZE'])
     local_rank = int(os.environ['LOCAL_RANK'])
-    if args.numel < 2 or args.iters < 1 or args.warmup < 0 or args.gap_ms < 0 or args.h2_count_divisor < 2 or args.h2_count_divisor > args.numel or not 0 <= args.fault_rank < world:
+    if (args.numel < 2 or args.iters < 1 or args.warmup < 0 or args.gap_ms < 0 or
+            args.h2_delta_bytes < 4 or args.h2_delta_bytes % 4 != 0 or args.h2_delta_bytes // 4 >= args.numel or
+            args.h2_count_divisor == 1 or args.h2_count_divisor < 0 or args.h2_count_divisor > args.numel or
+            not 0 <= args.fault_rank < world):
         p.error('invalid size, iteration count, round delay, or fault rank')
     if args.fault == 'H2' and args.op != 'allreduce':
         p.error('H2 scenarios require AllReduce as the majority operation')
@@ -165,9 +169,15 @@ def main():
             os._exit(77)
         elif injected and args.fault == 'H2':
             mark_fault(args, rank, iteration)
+        elif injected and args.fault == 'POST':
+            mark_fault(args, rank, iteration)
+            # Hang after the previous collective has completed, before entering
+            # the next collective. This is the Ant-CCL non-collective boundary.
+            time.sleep(args.hang_seconds)
+            os._exit(77)
         collective_start_ns = time.monotonic_ns()
         h2_target = injected and args.fault == 'H2' and rank == args.fault_rank
-        h2_count = h2_injected_count(args.numel, args.h2_count_divisor) if h2_target and args.h2_mismatch == 'count' else None
+        h2_count = (args.numel - args.h2_delta_bytes // 4 if args.h2_count_divisor == 0 else h2_injected_count(args.numel, args.h2_count_divisor)) if h2_target and args.h2_mismatch == 'count' else None
         operation = h2_operation_for_rank(args.op, h2_target, rank, args.fault_rank, args.h2_mismatch, args.h2_operation)
         x, expected = collective(operation, args.numel, rank, world, count_override=h2_count)
         torch.cuda.synchronize()
@@ -181,8 +191,10 @@ def main():
                                   'collective_duration_ns': collective_end_ns - collective_start_ns,
                                   'operation': operation,
                                   'h2_mismatch': args.h2_mismatch if args.fault == 'H2' and iteration >= args.fault_iteration else '',
+                                  'fault_kind': args.fault if injected else '',
                                   'count_override': h2_count,
                                   'count_divisor': args.h2_count_divisor if h2_count is not None else 0,
+                                  'count_delta_requested_bytes': args.h2_delta_bytes if h2_count is not None else 0,
                                   'count_delta_elements': args.numel - h2_count if h2_count is not None else 0,
                                   'count_delta_bytes': (args.numel - h2_count) * 4 if h2_count is not None else 0})
         if args.gap_ms and iteration + 1 < args.warmup + args.iters:

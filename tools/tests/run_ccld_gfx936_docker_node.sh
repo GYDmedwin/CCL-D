@@ -25,7 +25,8 @@ PROTO=${CCLD_PROTO:-Simple}
 FAULT=${CCLD_WORKLOAD_FAULT:-none}
 FAULT_RANK=${CCLD_WORKLOAD_FAULT_RANK:-0}
 FAULT_ITERATION=${CCLD_WORKLOAD_FAULT_ITERATION:-3}
-H2_COUNT_DIVISOR=${CCLD_WORKLOAD_H2_COUNT_DIVISOR:-4}
+H2_DELTA_BYTES=${CCLD_WORKLOAD_H2_DELTA_BYTES:-1024}
+H2_COUNT_DIVISOR=${CCLD_WORKLOAD_H2_COUNT_DIVISOR:-0}
 H2_MISMATCH=${CCLD_WORKLOAD_H2_MISMATCH:-count}
 H2_OPERATION=${CCLD_WORKLOAD_H2_OPERATION:-reducescatter}
 SLEEP_MS=${CCLD_WORKLOAD_SLEEP_MS:-1000}
@@ -69,7 +70,7 @@ set +e
   --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
   "$WORKLOAD" --op "$OP" --numel "$NUMEL" --warmup "$WARMUP" --iters "$ITERS" \
   --gap-ms "$GAP_MS" --fault "$FAULT" --fault-rank "$FAULT_RANK" \
-  --fault-iteration "$FAULT_ITERATION" --h2-count-divisor "$H2_COUNT_DIVISOR" \
+  --fault-iteration "$FAULT_ITERATION" --h2-delta-bytes "$H2_DELTA_BYTES" --h2-count-divisor "$H2_COUNT_DIVISOR" \
   --h2-mismatch "$H2_MISMATCH" --h2-operation "$H2_OPERATION" --sleep-ms "$SLEEP_MS" --hang-seconds "$HANG_SECONDS" \
   --timeout-seconds "$TIMEOUT_SECONDS" \
   --workload-log-dir "$RUN/workload" --fault-log-dir "$RUN/fault-events" \
