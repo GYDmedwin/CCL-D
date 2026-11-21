@@ -76,7 +76,7 @@ run_case() {
     echo "RCCL logs did not confirm IB on both nodes for $case_name" >&2
     exit 1
   fi
-  if [[ "${NCCL_CCLD_ENABLE:-1}" == 1 ]]; then
+  if [[ "${NCCL_CCLD_ENABLE:-1}" == 1 && "${CCLD_SKIP_POST_DECODE:-0}" != 1 ]]; then
     python3 "$DECODER" "$case_run/bin" "$case_run/jsonl"
     if [[ "$FAULT" == none && -z "${NCCL_CCLD_FAULT_KIND:-}" ]]; then
       python3 "$VALIDATOR" "$case_run" --world-size 8 --warmup "$WARMUP" --iters "$ITERS" \
@@ -84,6 +84,8 @@ run_case() {
     else
       printf 'fault run: numerical completion validator skipped; node exit statuses=%s,%s\n' "$node0_status" "$node1_status"
     fi
+  elif [[ "${NCCL_CCLD_ENABLE:-1}" == 1 ]]; then
+    printf 'post decode skipped because an external live decoder owns %s/jsonl\n' "$case_run"
   fi
   if [[ -n "${CCLD_BASELINE_MS:-}" ]]; then
     python3 "$ANALYZER" "$case_run/jsonl" --baseline-ms "$CCLD_BASELINE_MS" \

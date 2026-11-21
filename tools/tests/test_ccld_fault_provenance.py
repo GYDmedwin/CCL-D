@@ -7,6 +7,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 NODE = ROOT / 'tools/tests/run_ccld_gfx936_docker_node.sh'
+DUAL = ROOT / 'tools/tests/run_ccld_gfx936_docker_2node.sh'
 WRITER = ROOT / 'tools/tests/write_ccld_fault_config.py'
 
 
@@ -21,6 +22,8 @@ class FaultProvenanceTests(unittest.TestCase):
         self.assertIn('--h2-count-divisor', text)
         self.assertIn('workload-exit-status-node-', text)
         self.assertIn('fault run continues to trace decode/analyzer', text)
+        self.assertIn('CCLD_SKIP_POST_DECODE', DUAL.read_text())
+        self.assertTrue((ROOT / 'tools/tests/run_ccld_gfx936_h3_live.sh').exists())
 
 
     def test_writer_records_explicit_environment(self):

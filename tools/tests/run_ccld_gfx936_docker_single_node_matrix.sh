@@ -44,7 +44,9 @@ run_case() {
     CCLD_WORKLOAD_HANG_SECONDS="$HANG_SECONDS" CCLD_WORKLOAD_TIMEOUT_SECONDS="$TIMEOUT_SECONDS" \
     "$NODE_SCRIPT" >"$case_run/torchrun.log" 2>&1
   node_status=$(cat "$case_run/workload-exit-status-node-0" 2>/dev/null || printf '1')
-  python3 "$DECODER" "$case_run/bin" "$case_run/jsonl"
+  if [[ "${CCLD_SKIP_POST_DECODE:-0}" != 1 ]]; then
+    python3 "$DECODER" "$case_run/bin" "$case_run/jsonl"
+  fi
   if [[ "$FAULT" == none && -z "${NCCL_CCLD_FAULT_KIND:-}" ]]; then
     python3 "$VALIDATOR" "$case_run" --world-size 4 --warmup "$WARMUP" --iters "$ITERS" \
       --op "$op" --algorithm "$algorithm" --protocol "$protocol"
