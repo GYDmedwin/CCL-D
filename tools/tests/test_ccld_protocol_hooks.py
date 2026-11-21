@@ -56,6 +56,46 @@ class LlCounterHooksTest(unittest.TestCase):
         self.assertIn("decode_ccld_binary.py", script)
         self.assertIn("comm_end", script)
 
+    def test_wait_probe_hooks_follow_nv_wait_sites(self):
+        nv_simple = (NV / "src/device/prims_simple.h").read_text()
+        nv_ll = (NV / "src/device/prims_ll.h").read_text()
+        simple = (ROOT / "src/device/prims_simple.h").read_text()
+        ll = (ROOT / "src/device/prims_ll.h").read_text()
+        self.assertIn("const bool track = ccldWaitChannel && index == 0;", nv_simple)
+        self.assertIn("const bool track = ccldWaitChannel != nullptr && index == 0;", simple)
+        self.assertIn("const bool track = tid == 0 && ccldWaitChannel;", nv_ll)
+        self.assertIn("const bool track = tid == 0 && ccldWaitChannel != nullptr;", ll)
+        self.assertIn("NCCL_CCLD_WAIT_ENABLE", (ROOT / "src/misc/ccld.cc").read_text())
+
+    def test_tree_primitive_work_binding_matches_nv(self):
+        nv = (NV / "src/device/all_reduce.h").read_text()
+        rccl = (ROOT / "src/device/all_reduce.h").read_text()
+        self.assertIn("work->redOpArg, 0, 0, 0, work)", nv)
+        self.assertIn("work->redOpArg, 0, 0, 0, work)", rccl)
+        self.assertIn("0*Proto::MaxGroupWidth, 0, 0, work)", nv)
+        self.assertIn("0*Proto::MaxGroupWidth, 0, 0, work)", rccl)
+        self.assertIn("1*Proto::MaxGroupWidth, 0, 0, work)", nv)
+        self.assertIn("1*Proto::MaxGroupWidth, 0, 0, work)", rccl)
+
+    def test_fault_injection_isolated_and_nv_mapped(self):
+        primitive = (ROOT / "src/device/primitives.h").read_text()
+        simple = (ROOT / "src/device/prims_simple.h").read_text()
+        ll = (ROOT / "src/device/prims_ll.h").read_text()
+        work = (ROOT / "src/include/device.h").read_text()
+        host = (ROOT / "src/misc/ccld.cc").read_text()
+        cmake = (ROOT / "CMakeLists.txt").read_text()
+        self.assertIn("#ifdef CCLD_FAULT_INJECTION", primitive)
+        self.assertIn("ccldInject(ccldFaultKind, ccldFaultCycles, tid, ccldHangDone)", simple)
+        self.assertIn("ccldInject(ccldFaultKind, ccldFaultCycles, tid, ccldHangDone)", ll)
+        self.assertIn("uint64_t ccldFaultCycles", work)
+        self.assertIn('"NCCL_CCLD_FAULT_KIND"', host)
+        self.assertIn("CCLD_FAULT_INJECTION", cmake)
+        self.assertIn('option(CCLD_FAULT_INJECTION', cmake)
+        self.assertIn('"Enable isolated CCL-D H3/S2 fault simulation"  OFF)', cmake)
+        fault_script = (ROOT / "tools/tests/run_ccld_gfx936_fault_injection.sh").read_text()
+        self.assertIn("CCLD_FAULT_INJECTION=ON", fault_script)
+        self.assertIn("NCCL_CCLD_FAULT_KIND=S2", fault_script)
+
 
 if __name__ == "__main__":
     unittest.main()

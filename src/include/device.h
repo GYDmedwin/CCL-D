@@ -314,6 +314,10 @@ struct alignas(16) ncclDevWorkColl {
   // Kept as a separate field because RCCL's existing bitfields are full.
   uint16_t ccldSlotPlus1;
   uint16_t ccldReserved;
+#ifdef CCLD_FAULT_INJECTION
+  uint64_t ccldFaultCycles;
+  uint32_t ccldFaultKind;
+#endif
 };
 
 

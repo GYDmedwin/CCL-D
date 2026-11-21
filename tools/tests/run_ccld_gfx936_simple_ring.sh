@@ -102,6 +102,7 @@ for path in files:
             assert {channel["recv_count"] for channel in channels} == {expected_count}, event
         else:
             assert any(channel["tree_parent"] != -1 for channel in channels), event
+            assert all(channel["send_count"] > 0 and channel["recv_count"] > 0 for channel in channels), event
 print(f"gfx936 CCL-D {sys.argv[5]} validation passed: ranks={expected_ranks}, "
       f"complete_events={len(completes)} per rank, send_recv={expected_count}")
 PY

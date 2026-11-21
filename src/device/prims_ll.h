@@ -20,6 +20,12 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p>:
   static constexpr int MaxSend = Fan::MaxSend;
   static constexpr int Input=0, Output=1;
   CcldChannel* ccldChannel;
+  CcldWaitChannel* ccldWaitChannel;
+#ifdef CCLD_FAULT_INJECTION
+  uint64_t ccldFaultCycles;
+  uint32_t ccldFaultKind;
+  bool ccldHangDone;
+#endif
   RedOp redOp;
   const int tid;
   const int nthreads;
@@ -102,11 +108,15 @@ private:
 #endif
     if (sendConnHeadPtr) {
       int spins = 0;
+      const bool track = tid == 0 && ccldWaitChannel != nullptr;
+      uint64_t waitSpins = 0;
       while (sendConnHeadCache + NCCL_STEPS < sendConnHead + 1) {
         __builtin_amdgcn_s_sleep(1);
         sendConnHeadCache = atomicAdd((unsigned long long *)sendConnHeadPtr, 0);
+        if (track && (++waitSpins & 1023) == 0) ccldWaitAdd(ccldWaitChannel, group, true, 1024);
         if (checkAbort(spins, 1)) break;
       }
+      if (track) ccldWaitAdd(ccldWaitChannel, group, true, waitSpins & 1023);
       if (sendConnFifo) {
         int size = ((sendConnHead & NCCL_LL_CLEAN_MASK) == NCCL_LL_CLEAN_MASK) ? stepLines*sizeof(union ncclLLFifoLine) : nbytes;
         sendConnFifo[sendConnHead%NCCL_STEPS].size = size;
@@ -144,6 +154,8 @@ private:
     uint32_t flag = recvFlag(i);
     uint32_t data1, flag1, data2, flag2;
     int spins = 0;
+    const bool track = tid == 0 && i == 0 && ccldWaitChannel != nullptr;
+    uint64_t waitSpins = 0;
 
 #if defined(ENABLE_NPKIT) && (defined(ENABLE_NPKIT_EVENT_PRIM_LL_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL_DATA_PROCESS_EXIT) || defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME))
     int npkitWaitRecvSpins = 0;
@@ -162,11 +174,14 @@ private:
       i4.v[0] = __builtin_nontemporal_load(src->v);
       i4.v[1] = __builtin_nontemporal_load(src->v+1);
 #endif
+      if (track && ((i4.flag1 != flag) || (i4.flag2 != flag)) && (++waitSpins & 1023) == 0)
+        ccldWaitAdd(ccldWaitChannel, group, false, 1024);
 #if defined(ENABLE_NPKIT) && (defined(ENABLE_NPKIT_EVENT_PRIM_LL_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL_DATA_PROCESS_EXIT) || defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME))
       npkitWaitRecvSpins++;
 #endif
       if (checkAbort(spins, 0)) break;
     } while ((i4.flag1 != flag) || (i4.flag2 != flag));
+    if (track) ccldWaitAdd(ccldWaitChannel, group, false, waitSpins & 1023);
     uint64_t val64 = (uint64_t)(i4.data1) + (((uint64_t)i4.data2) << 32);
 #else
     do {
@@ -418,6 +433,9 @@ private:
     // Always waitSend in case of cleanup
     nelem = nelem < 0 ? 0 : nelem;
     if (SEND) waitSend(divUp(nelem, EltPerLine)*sizeof(ncclLLFifoLine));
+#ifdef CCLD_FAULT_INJECTION
+    if (SEND) ccldInject(ccldFaultKind, ccldFaultCycles, tid, ccldHangDone);
+#endif
     if (SEND) ccldCount(ccldChannel, tid, group, true, false);
 
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_LL_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL_DATA_PROCESS_EXIT)
@@ -620,8 +638,13 @@ private:
       uint8_t connIndexRecv=0, uint8_t connIndexSend=0, struct ncclDevWorkColl* e = nullptr,
       bool userBufReg=false, int stepSize_=0
     ):
-    redOp(redOpArg),
     ccldChannel(ccldOutput(e, tid, group)),
+    ccldWaitChannel(ccldWaitOutput(e, group)),
+#ifdef CCLD_FAULT_INJECTION
+    ccldFaultCycles(e ? e->ccldFaultCycles : 0),
+    ccldFaultKind(e ? e->ccldFaultKind : 0), ccldHangDone(false),
+#endif
+    redOp(redOpArg),
     tid(tid), nthreads(nthreads), wid(tid%WARP_SIZE), group(group),
     stepLines(ncclShmem.comm.buffSizes[NCCL_PROTO_LL]/NCCL_STEPS/sizeof(ncclLLFifoLine)) {
     auto *channel = &ncclShmem.channel;

@@ -22,6 +22,12 @@ class Primitives<
   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
   static constexpr int Input=0, Output=1;
   CcldChannel* ccldChannel;
+  CcldWaitChannel* ccldWaitChannel;
+#ifdef CCLD_FAULT_INJECTION
+  uint64_t ccldFaultCycles;
+  uint32_t ccldFaultKind;
+  bool ccldHangDone;
+#endif
   static constexpr int RoleWaitRecv = 0x04, // 0x1 0x2 are free to use
                        RoleWaitSend = 0x08,
                        RolePostSend = 0x10,
@@ -115,10 +121,13 @@ private:
     if (((flags & (Recv*RoleWaitRecv)) && !noRecvWait) ||
         ((flags & (Send*RoleWaitSend)) && !noSendWait)) {
       int spins = 0;
+      const bool track = ccldWaitChannel != nullptr && index == 0;
+      uint64_t waitSpins = 0;
       repeat = 50;
       while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
         __builtin_amdgcn_s_sleep(1);
         connStepCache = loadStepValue(connStepPtr);
+        if (track && (++waitSpins & 1023) == 0) ccldWaitAdd(ccldWaitChannel, group, isSendNotRecv, 1024);
         if (checkAbort(spins)) break;
         //if (spins == 0) printf("r=%d b=%d t=%d SPUN OUT got=%d want=%d\n", ncclShmem.comm.rank, blockIdx.x, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
         if (spins == 0 && repeat > 0) {
@@ -126,6 +135,7 @@ private:
           traceData(__LINE__, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
         }
       }
+      if (track) ccldWaitAdd(ccldWaitChannel, group, isSendNotRecv, waitSpins & 1023);
       __asm__ __volatile__("s_wakeup");
     }
 
@@ -188,6 +198,9 @@ private:
   __device__ __forceinline__ void genericOp(
       intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp
     ) {
+#ifdef CCLD_FAULT_INJECTION
+    if (Send) ccldInject(ccldFaultKind, ccldFaultCycles, tid, ccldHangDone);
+#endif
     constexpr int DirectRecv = /*1 &&*/ Direct && DirectRecv1;
     constexpr int DirectSend = /*1 &&*/ Direct && DirectSend1;
     constexpr int Src = SrcBuf != -1;
@@ -668,8 +681,13 @@ private:
       void const *inputBuf, void *outputBuf, uint64_t redOpArg, uint8_t group=0,
       uint8_t connIndexRecv = 0, uint8_t connIndexSend = 0, struct ncclDevWorkColl* e = nullptr,bool userBufReg=false, int stepSize_=0
     ):
-    tid(tid), nthreads(nthreads), tidInBlock(threadIdx.x), group(group),
     ccldChannel(ccldOutput(e, tid, group)),
+    ccldWaitChannel(ccldWaitOutput(e, group)),
+#ifdef CCLD_FAULT_INJECTION
+    ccldFaultCycles(e ? e->ccldFaultCycles : 0),
+    ccldFaultKind(e ? e->ccldFaultKind : 0), ccldHangDone(false),
+#endif
+    tid(tid), nthreads(nthreads), tidInBlock(threadIdx.x), group(group),
     stepSize(stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T) : stepSize_) {
 
     // For send operations, we need an extra warp to overlap the threadfence and the copy

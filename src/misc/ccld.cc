@@ -66,6 +66,8 @@ struct CcldState {
     const char* protocol = nullptr;
     int channelLo = 0, channelHi = -1;
     int parents[CCLD_MAX_CHANNELS] = {};
+    int ringPrev[CCLD_MAX_CHANNELS] = {}, ringNext[CCLD_MAX_CHANNELS] = {};
+    uint64_t waitData[CCLD_MAX_CHANNELS] = {}, waitCredit[CCLD_MAX_CHANNELS] = {};
     uint64_t lastSend[CCLD_MAX_CHANNELS] = {};
     uint64_t lastRecv[CCLD_MAX_CHANNELS] = {};
     uint64_t dumpSend[CCLD_MAX_CHANNELS] = {};
@@ -95,6 +97,9 @@ struct CcldState {
   int rank = 0, nranks = 0, device = -1;
   bool useEvent = true;
   char host[64] = {};
+#ifdef CCLD_FAULT_INJECTION
+  uint64_t faultKind = 0, faultRank = UINT64_MAX, faultOp = 0, faultCycles = 0, faultRepeats = 1;
+#endif
 };
 
 struct CcldCallback { CcldState* state; unsigned slot; };
@@ -195,6 +200,13 @@ static void ccldSample(CcldState* state, unsigned index) {
     if (recv != slot.lastRecv[channel]) ++slot.changesRecv[channel];
     slot.lastSend[channel] = send;
     slot.lastRecv[channel] = recv;
+    if (state->waitFrame != nullptr) {
+      const CcldWaitChannel* waits = reinterpret_cast<const CcldWaitChannel*>(
+          reinterpret_cast<const unsigned char*>(state->waitFrame) + index * state->waitBlockBytes);
+      const CcldWaitChannel& wait = waits[channel * state->frameGroups];
+      slot.waitData[channel] = ccldLoad(&wait.data);
+      slot.waitCredit[channel] = ccldLoad(&wait.credit);
+    }
   }
 }
 
@@ -212,6 +224,21 @@ static void ccldEmit(CcldState* state, unsigned index, bool complete, uint64_t n
   snprintf(event.algorithm, sizeof(event.algorithm), "%s", slot.algorithm ? slot.algorithm : "");
   snprintf(event.protocol, sizeof(event.protocol), "%s", slot.protocol ? slot.protocol : "");
   snprintf(event.datatype, sizeof(event.datatype), "%s", slot.datatype ? slot.datatype : "");
+  if (state->waitFrame != nullptr) {
+    CcldLogEvent wait = ccldLogBase(state, CcldLogRingWait, slot.seq, now);
+    wait.reserved = event.type;
+    wait.nChannels = event.nChannels;
+    snprintf(event.reason, sizeof(event.reason), "%s", "ring_wait_v1");
+    for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) {
+      CcldLogChannel& output = wait.channels[channel - slot.channelLo];
+      output.id = channel;
+      output.parent = slot.ringPrev[channel];
+      output.send = slot.waitData[channel];
+      output.recv = slot.waitCredit[channel];
+      output.sendChanges = static_cast<uint64_t>(slot.ringNext[channel]);
+    }
+    ccldWrite(state, wait);
+  }
   for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) {
     CcldLogChannel& output = event.channels[channel - slot.channelLo];
     output.id = channel;
@@ -328,9 +355,29 @@ void ccldInit(struct ncclComm* comm) {
   state->dumpNs = ccldEnvNumber("NCCL_CCLD_DUMP_MS", 1000, 10, 60000) * 1000000ull;
   const char* completion = ncclGetEnv("NCCL_CCLD_COMPLETION");
   state->useEvent = completion == nullptr || strcmp(completion, "hostfunc") != 0;
+#ifdef CCLD_FAULT_INJECTION
+  const char* faultKind = ncclGetEnv("NCCL_CCLD_FAULT_KIND");
+  if (faultKind != nullptr && strcmp(faultKind, "H3") == 0) state->faultKind = 1;
+  else if (faultKind != nullptr && strcmp(faultKind, "S2") == 0) state->faultKind = 2;
+  state->faultRank = ccldEnvNumber("NCCL_CCLD_FAULT_RANK", UINT64_MAX, 0,
+                                   static_cast<uint64_t>(comm->nRanks - 1));
+  state->faultOp = ccldEnvNumber("NCCL_CCLD_FAULT_OP", 0, 1, UINT64_MAX);
+  state->faultRepeats = ccldEnvNumber("NCCL_CCLD_FAULT_REPEATS", 1, 1, 100);
+  state->faultCycles = ccldEnvNumber("NCCL_CCLD_FAULT_CYCLES", 0, 1, 30000000000ull);
+  if (state->faultKind != 0 && (state->faultRank == UINT64_MAX || state->faultOp == 0 || state->faultCycles == 0)) {
+    WARN("CCL-D fault simulation disabled: rank, operation and bounded cycles are required");
+    state->faultKind = 0;
+  }
+#else
+  if (ncclGetEnv("NCCL_CCLD_FAULT_KIND") != nullptr)
+    WARN("CCL-D fault injection is not compiled into this build");
+#endif
   state->frameChannels = static_cast<unsigned>(comm->nChannels);
   const char* algorithm = ncclGetEnv("NCCL_ALGO");
   state->frameGroups = algorithm != nullptr && strcasecmp(algorithm, "Ring") == 0 ? 1 : CCLD_GROUPS;
+  const bool waitRequested = ccldEnvNumber("NCCL_CCLD_WAIT_ENABLE", 0, 0, 1) == 1;
+  if (waitRequested && state->frameGroups != 1)
+    WARN("CCL-D wait probe requires NCCL_ALGO=Ring");
   state->frameBlocks = static_cast<unsigned>(ccldEnvNumber(
       "NCCL_CCLD_FRAME_BLOCKS", CCLD_BLOCKS, CCLD_BLOCKS, CCLD_MAX_BLOCKS));
   state->slots.reset(new (std::nothrow) CcldState::Slot[state->frameBlocks]);
@@ -350,6 +397,19 @@ void ccldInit(struct ncclComm* comm) {
   state->frame = static_cast<CcldFrame*>(state->frameAllocation.host);
   state->frame->mode = mode;
   state->frame->detectChannel = state->frameChannels;
+  if (waitRequested && state->frameGroups == 1) {
+    state->waitBlockBytes = state->frameChannels * state->frameGroups * sizeof(CcldWaitChannel);
+    state->waitBytes = state->frameBlocks * state->waitBlockBytes;
+    error = ccldMappedHostAlloc(&state->waitAllocation, state->waitBytes);
+    if (error != hipSuccess) {
+      WARN("CCL-D wait frame allocation failed: %s", hipGetErrorString(error));
+      ccldMappedHostFree(&state->frameAllocation);
+      delete state;
+      return;
+    }
+    state->waitFrame = static_cast<CcldWaitChannel*>(state->waitAllocation.host);
+    memset(state->waitFrame, 0, state->waitBytes);
+  }
 
   const char* outputDir = ncclGetEnv("NCCL_CCLD_OUT_DIR");
   const char* nodeSocket = ncclGetEnv("NCCL_CCLD_NODE_SOCKET");
@@ -357,6 +417,7 @@ void ccldInit(struct ncclComm* comm) {
   state->logQueue.reset(new (std::nothrow) CcldQueue<CcldLogEvent>(state->queueSlots));
   if (!state->logQueue || !state->logQueue->valid() || !state->logQueue->lockFree()) {
     WARN("CCL-D binary queue is unavailable");
+    ccldMappedHostFree(&state->waitAllocation);
     ccldMappedHostFree(&state->frameAllocation);
     delete state;
     return;
@@ -368,6 +429,7 @@ void ccldInit(struct ncclComm* comm) {
     if (length < 0 || static_cast<size_t>(length) >= sizeof(path) ||
         (state->output = fopen(path, "wb")) == nullptr) {
       WARN("CCL-D rank %d could not open telemetry output", state->rank);
+      ccldMappedHostFree(&state->waitAllocation);
       ccldMappedHostFree(&state->frameAllocation);
       delete state;
       return;
@@ -375,6 +437,7 @@ void ccldInit(struct ncclComm* comm) {
   }
   if (state->output == nullptr && (nodeSocket == nullptr || !state->nodeStream.open(nodeSocket))) {
     WARN("CCL-D requires NCCL_CCLD_NODE_SOCKET or NCCL_CCLD_OUT_DIR for binary telemetry");
+    ccldMappedHostFree(&state->waitAllocation);
     ccldMappedHostFree(&state->frameAllocation);
     delete state;
     return;
@@ -403,11 +466,10 @@ void ccldInit(struct ncclComm* comm) {
   init.frameGroups = state->frameGroups;
   init.pollUs = static_cast<uint32_t>(state->pollUs);
   init.mode = static_cast<uint32_t>(state->mode);
+  init.count = state->waitBytes;
   init.bytes = state->queueSlots;
   init.windowNs = state->logQueue->allocatedBytes();
   snprintf(init.reason, sizeof(init.reason), "%s", state->useEvent ? "event_query" : "hostfunc");
-  init.bytes = state->queueSlots;
-  init.windowNs = state->logQueue->allocatedBytes();
   ccldWrite(state, init);
   try {
     state->writer = std::thread(ccldWriter, state);
@@ -573,10 +635,23 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
     return;
   }
 
+  ncclDevWorkColl* work = reinterpret_cast<ncclDevWorkColl*>(first + 1);
   CcldBlock* block = ccldFrameBlock(state->frame, index, state->frameChannels, state->frameGroups);
   memset(block, 0, ccldBlockBytes(state->frameChannels, state->frameGroups));
+  if (state->waitFrame != nullptr)
+    memset(reinterpret_cast<unsigned char*>(state->waitFrame) + index * state->waitBlockBytes,
+           0, state->waitBlockBytes);
   block->commHash = comm->commHash;
   block->opCount = plan->ccldSeq;
+#ifdef CCLD_FAULT_INJECTION
+  work->ccldFaultKind = 0;
+  work->ccldFaultCycles = 0;
+  if (state->faultKind != 0 && state->faultRank == static_cast<uint64_t>(state->rank) &&
+      plan->ccldSeq >= state->faultOp && plan->ccldSeq - state->faultOp < state->faultRepeats) {
+    work->ccldFaultKind = static_cast<uint32_t>(state->faultKind);
+    work->ccldFaultCycles = state->faultCycles;
+  }
+#endif
   state->frame->kernelIndex = index;
   state->frame->counter = plan->ccldSeq;
   state->frame->detectChannel = descriptor.channelHi - descriptor.channelLo + 1;
@@ -594,13 +669,16 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) {
     slot.parents[channel] = plan->ccldAlgorithm == NCCL_ALGO_TREE
         ? comm->channels[channel].tree.up : -1;
+    slot.ringPrev[channel] = comm->channels[channel].ring.prev;
+    slot.ringNext[channel] = comm->channels[channel].ring.next;
+    slot.waitData[channel] = 0;
+    slot.waitCredit[channel] = 0;
   }
   slot.lastDumpNs = slot.startNs;
   slot.done.store(false, std::memory_order_relaxed);
   slot.eventRecorded.store(false, std::memory_order_relaxed);
   slot.eventFailed.store(false, std::memory_order_relaxed);
   slot.phase.store(2, std::memory_order_release);
-  ncclDevWorkColl* work = reinterpret_cast<ncclDevWorkColl*>(first + 1);
   work->ccldSlotPlus1 = static_cast<uint16_t>(index + 1);
   plan->ccldSlotPlus1 = static_cast<uint16_t>(index + 1);
   state->cv.notify_one();

@@ -34,6 +34,37 @@ __device__ __forceinline__ void ccldCount(CcldChannel* channel, int tid, int gro
   if (recv) *(volatile uint64_t*)&channel->recv = ++local.recv;
 }
 
+__device__ __forceinline__ CcldWaitChannel* ccldWaitOutput(ncclDevWorkColl* work, int group) {
+  if (work == nullptr || work->ccldSlotPlus1 == 0 || ncclShmem.comm.ccldWaitFrame == nullptr) return nullptr;
+  const unsigned g = group == 0 ? 0 : 1;
+  if (g >= ncclShmem.comm.ccldGroups) return nullptr;
+  unsigned char* base = reinterpret_cast<unsigned char*>(ncclShmem.comm.ccldWaitFrame) +
+      (work->ccldSlotPlus1 - 1) * ncclShmem.comm.ccldWaitBlockBytes +
+      (ncclShmem.channelId * ncclShmem.comm.ccldGroups + g) * sizeof(CcldWaitChannel);
+  return reinterpret_cast<CcldWaitChannel*>(base);
+}
+
+__device__ __forceinline__ void ccldWaitAdd(CcldWaitChannel* output, int group, bool credit, uint64_t delta) {
+  if (output == nullptr || delta == 0) return;
+  CcldWaitChannel& local = ncclShmem.ccldWaitCounts[group == 0 ? 0 : 1];
+  if (credit) *(volatile uint64_t*)&output->credit = (local.credit += delta);
+  else *(volatile uint64_t*)&output->data = (local.data += delta);
+}
+
+#ifdef CCLD_FAULT_INJECTION
+// NV CCL-D H3/S2 experiment: bounded, abort-aware device delay. H3 executes
+// once per primitive subgroup; S2 executes for each send operation.
+__device__ __forceinline__ void ccldInject(uint32_t kind, uint64_t cycles, int tid, bool& hangDone) {
+  if (tid != 0 || kind == 0 || cycles == 0) return;
+  if (kind == 1 && hangDone) return;
+  if (kind == 1) hangDone = true;
+  const unsigned long long started = clock64();
+  while (clock64() - started < cycles) {
+    if (*ncclShmem.comm.abortFlag) break;
+  }
+}
+#endif
+
 #define NCCL_SPINS_BEFORE_CHECK_ABORT 1000000
 
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)

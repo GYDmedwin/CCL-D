@@ -26,6 +26,11 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
 
   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
   static constexpr int Input=0, Output=1;
+#ifdef CCLD_FAULT_INJECTION
+  uint64_t ccldFaultCycles;
+  uint32_t ccldFaultKind;
+  bool ccldHangDone;
+#endif
   RedOp redOp;
   const int tid;
   const int nthreads;
@@ -347,6 +352,9 @@ private:
     nelem = nelem < 0 ? 0 : nelem;
 
     if (SEND) waitSend(divUp(nelem, DataEltPerSlice)*WireWordPerSlice*sizeof(uint64_t));
+#ifdef CCLD_FAULT_INJECTION
+    if (SEND) ccldInject(ccldFaultKind, ccldFaultCycles, tid, ccldHangDone);
+#endif
     barrier();
     nelem -= DataEltPerSlice*warp;
     srcPtr += DataEltPerSlice*warp;
@@ -501,6 +509,10 @@ public:
       uint8_t connIndexRecv=0, uint8_t connIndexSend=0, struct ncclDevWorkColl* e = nullptr,
       bool userBufReg=false, int stepSize_=0
     ):
+#ifdef CCLD_FAULT_INJECTION
+    ccldFaultCycles(e ? e->ccldFaultCycles : 0),
+    ccldFaultKind(e ? e->ccldFaultKind : 0), ccldHangDone(false),
+#endif
     redOp(redOpArg),
     tid(tid), nthreads(nthreads), wid(tid%WARP_SIZE), warp(tid/WARP_SIZE),
     warpInBlock(threadIdx.x/WARP_SIZE),

@@ -419,7 +419,8 @@ namespace {
     if (tree->up == -1) {
       // Reduce and broadcast. Max number of recv is 2, max number of send is 2
       Primitives<T, RedOp, FanSymmetric<NCCL_MAX_DEV_ARITY>, /*Direct=*/0, Proto, 0>
-        prims(tid, nthreads, tree->down, tree->down, work->sendbuff, work->recvbuff, work->redOpArg);
+        prims(tid, nthreads, tree->down, tree->down, work->sendbuff, work->recvbuff,
+              work->redOpArg, 0, 0, 0, work);
 
 #if defined(ENABLE_NPKIT)
       if (isNpKitThread) {
@@ -459,7 +460,8 @@ namespace {
        * but the ctor above for tree roots would be DirectRecv=0 DirectSend=1.
        */
       Primitives<T, RedOp, FanAsymmetric<NCCL_MAX_DEV_ARITY, 1>, /*Direct=*/0, Proto, 0>
-        prims(tid, nthreadsSplit, tree->down, &tree->up, work->sendbuff, work->recvbuff, work->redOpArg, 0*Proto::MaxGroupWidth);
+        prims(tid, nthreadsSplit, tree->down, &tree->up, work->sendbuff, work->recvbuff,
+              work->redOpArg, 0*Proto::MaxGroupWidth, 0, 0, work);
 
 #if defined(ENABLE_NPKIT)
       if (isNpKitThread) {
@@ -502,7 +504,7 @@ namespace {
       // Broadcast down. Max number of recv is 1, max number of send is 3 (binary tree + local)
       Primitives<T, RedOp, FanAsymmetric<1, NCCL_MAX_DEV_ARITY>, /*Direct=*/0, Proto, 0>
         prims(tid-nthreadsSplit, nthreads-nthreadsSplit, &tree->up, tree->down, work->sendbuff, work->recvbuff,
-            work->redOpArg, 1*Proto::MaxGroupWidth);
+            work->redOpArg, 1*Proto::MaxGroupWidth, 0, 0, work);
 
 #if defined(ENABLE_NPKIT)
       if (isNpKitThread) {

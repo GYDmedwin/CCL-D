@@ -148,6 +148,7 @@ struct ncclShmemData {
   int workSize;
   uint32_t workConsumed;
   CcldChannel ccldCounts[CCLD_GROUPS];
+  CcldWaitChannel ccldWaitCounts[CCLD_GROUPS];
   struct ncclShmemGroup groups[NCCL_MAX_GROUPS];
   uint64_t redOpArgs[NCCL_MAX_NVLS_ARITY+1];
 
@@ -489,6 +490,8 @@ __device__ __forceinline__ void ncclKernelMain(struct ncclDevKernelArgs const* a
   if (tid < CCLD_GROUPS) {
     ncclShmem.ccldCounts[tid].send = 0;
     ncclShmem.ccldCounts[tid].recv = 0;
+    ncclShmem.ccldWaitCounts[tid].data = 0;
+    ncclShmem.ccldWaitCounts[tid].credit = 0;
   }
   __syncthreads(); // publish ncclShmem.{args, channelId}
 
