@@ -20,6 +20,13 @@ int main() {
   assert(ccldBlockBytes(channels, groups) == blockBytes);
   assert(ccldFrameBytes(channels, groups, blocks) == 32 + blocks * blockBytes);
 
+  CcldWaitChannel waitGroups[2] = {{11, 13}, {17, 19}};
+  uint64_t waitData = 0, waitCredit = 0;
+  ccldWaitTotals(waitGroups, 2, &waitData, &waitCredit);
+  assert(waitData == 28 && waitCredit == 32);
+  ccldWaitTotals(waitGroups, 1, &waitData, &waitCredit);
+  assert(waitData == 11 && waitCredit == 13);
+
   unsigned char storage[32 + blocks * blockBytes] = {};
   CcldFrame* frame = reinterpret_cast<CcldFrame*>(storage);
   for (unsigned i = 0; i < blocks; ++i) {

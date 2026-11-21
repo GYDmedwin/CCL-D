@@ -19,6 +19,17 @@ struct CcldWaitChannel {
   uint64_t data, credit;
 };
 
+static inline void ccldWaitTotals(const CcldWaitChannel* waits, unsigned groups,
+                                  uint64_t* data, uint64_t* credit) {
+  uint64_t dataTotal = 0, creditTotal = 0;
+  for (unsigned group = 0; group < groups; ++group) {
+    dataTotal += *reinterpret_cast<const volatile uint64_t*>(&waits[group].data);
+    creditTotal += *reinterpret_cast<const volatile uint64_t*>(&waits[group].credit);
+  }
+  *data = dataTotal;
+  *credit = creditTotal;
+}
+
 struct CcldBlock {
   uint64_t commHash, opCount;
   struct CcldChannel channel[1];

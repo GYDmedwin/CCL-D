@@ -203,9 +203,8 @@ static void ccldSample(CcldState* state, unsigned index) {
     if (state->waitFrame != nullptr) {
       const CcldWaitChannel* waits = reinterpret_cast<const CcldWaitChannel*>(
           reinterpret_cast<const unsigned char*>(state->waitFrame) + index * state->waitBlockBytes);
-      const CcldWaitChannel& wait = waits[channel * state->frameGroups];
-      slot.waitData[channel] = ccldLoad(&wait.data);
-      slot.waitCredit[channel] = ccldLoad(&wait.credit);
+      ccldWaitTotals(waits + channel * state->frameGroups, state->frameGroups,
+                     &slot.waitData[channel], &slot.waitCredit[channel]);
     }
   }
 }
