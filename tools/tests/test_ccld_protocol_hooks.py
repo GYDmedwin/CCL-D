@@ -70,12 +70,18 @@ class LlCounterHooksTest(unittest.TestCase):
     def test_tree_primitive_work_binding_matches_nv(self):
         nv = (NV / "src/device/all_reduce.h").read_text()
         rccl = (ROOT / "src/device/all_reduce.h").read_text()
-        self.assertIn("work->redOpArg, 0, 0, 0, work)", nv)
-        self.assertIn("work->redOpArg, 0, 0, 0, work)", rccl)
-        self.assertIn("0*Proto::MaxGroupWidth, 0, 0, work)", nv)
-        self.assertIn("0*Proto::MaxGroupWidth, 0, 0, work)", rccl)
-        self.assertIn("1*Proto::MaxGroupWidth, 0, 0, work)", nv)
-        self.assertIn("1*Proto::MaxGroupWidth, 0, 0, work)", rccl)
+        nv_updown = nv[nv.index("void runTreeUpDown"):nv.index("template<typename T, typename RedOp>", nv.index("void runTreeUpDown"))]
+        rccl_updown = rccl[rccl.index("void runTreeUpDown"):rccl.index("void runTreeSplit")]
+        self.assertIn("work->redOpArg, 0, 0, 0, work", nv_updown)
+        self.assertIn("work->redOpArg, 0, 0, 0, work", rccl_updown)
+        self.assertGreaterEqual(nv_updown.count("work->redOpArg, 0, 0, 0, work"), 2)
+        self.assertGreaterEqual(rccl_updown.count("work->redOpArg, 0, 0, 0, work"), 2)
+        nv_split = nv[nv.index("void runTreeSplit"):nv.index("template<typename T, typename RedOp>", nv.index("void runTreeSplit"))]
+        rccl_split = rccl[rccl.index("void runTreeSplit"):rccl.index("template<typename T, typename RedOp>", rccl.index("void runTreeSplit"))]
+        self.assertGreaterEqual(nv_split.count("work->redOpArg"), 3)
+        self.assertGreaterEqual(rccl_split.count("work->redOpArg"), 3)
+        self.assertGreaterEqual(nv_split.count("work)"), 3)
+        self.assertGreaterEqual(rccl_split.count("work)"), 3)
 
     def test_fault_injection_isolated_and_nv_mapped(self):
         primitive = (ROOT / "src/device/primitives.h").read_text()

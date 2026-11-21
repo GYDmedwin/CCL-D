@@ -253,7 +253,8 @@ namespace {
 
     { // Reduce : max number of recv is 3, max number of send is 1 (binary tree + local)
       Primitives<T, RedOp, FanAsymmetric<NCCL_MAX_DEV_ARITY, 1>, /*Direct=*/0, Proto, 0> prims
-        (tid, nthreads, tree->down, &tree->up, work->sendbuff, work->recvbuff, work->redOpArg);
+        (tid, nthreads, tree->down, &tree->up, work->sendbuff, work->recvbuff,
+         work->redOpArg, 0, 0, 0, work);
 
 #if defined(ENABLE_NPKIT)
       if (tid == 0) {
@@ -302,7 +303,8 @@ namespace {
 
     { // Broadcast : max number of recv is 1, max number of send is 3 (binary tree + local)
       Primitives<T, RedOp, FanAsymmetric<1, NCCL_MAX_DEV_ARITY>, /*Direct=*/0, Proto, 0> prims
-        (tid, nthreads, &tree->up, tree->down, work->sendbuff, work->recvbuff, work->redOpArg);
+        (tid, nthreads, &tree->up, tree->down, work->sendbuff, work->recvbuff,
+         work->redOpArg, 0, 0, 0, work);
 
 #if defined(ENABLE_NPKIT)
       if (tid == 0) {
