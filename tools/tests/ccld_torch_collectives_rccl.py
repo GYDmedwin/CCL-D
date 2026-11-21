@@ -114,7 +114,7 @@ def main():
     p.add_argument('--numel', type=int, default=1 << 18, help='elements per rank/chunk')
     p.add_argument('--warmup', type=int, default=3)
     p.add_argument('--iters', type=int, default=10)
-    p.add_argument('--fault', choices=('none', 'H1', 'H2', 'S1', 'POST'), default='none')
+    p.add_argument('--fault', choices=('none', 'H1', 'H2', 'H2_SIM', 'S1', 'POST'), default='none')
     p.add_argument('--fault-rank', type=int, default=0)
     p.add_argument('--fault-iteration', type=int, default=3)
     p.add_argument('--h2-delta-bytes', type=int, default=1024, help='Ant-CCL 5.1 H2 bytes removed from the injected rank count')
@@ -137,7 +137,7 @@ def main():
             args.h2_count_divisor == 1 or args.h2_count_divisor < 0 or args.h2_count_divisor > args.numel or
             not 0 <= args.fault_rank < world):
         p.error('invalid size, iteration count, round delay, or fault rank')
-    if args.fault == 'H2' and args.op != 'allreduce':
+    if args.fault in ('H2', 'H2_SIM') and args.op != 'allreduce':
         p.error('H2 scenarios require AllReduce as the majority operation')
     profile = os.environ.get('CCLD_RESTRICTED_BUILD', '')
     supported = {'1': {'allreduce'}, 'expanded': {'allreduce', 'allgather', 'reducescatter'},
@@ -145,6 +145,19 @@ def main():
     if profile and (profile not in supported or args.op not in supported[profile]):
         p.error(f'operation {args.op} is not allowed for restricted NCCL profile {profile!r}')
     torch.cuda.set_device(local_rank)
+    # Strict H2 simulator: preserve the 1024-byte count mismatch on the target
+    # rank and inject a bounded in-kernel stall on every other rank. This is
+    # an analyzer/diagnostic semantic test; it is separate from RCCL's natural
+    # count-mismatch behavior, which may complete on gfx936.
+    if args.fault == 'H2_SIM' and rank != args.fault_rank:
+        os.environ['NCCL_CCLD_FAULT_KIND'] = 'H3'
+        os.environ['NCCL_CCLD_FAULT_RANK'] = str(rank)
+        os.environ['NCCL_CCLD_FAULT_OP'] = str(args.fault_iteration + 1)
+        os.environ['NCCL_CCLD_FAULT_REPEATS'] = '1'
+        os.environ['NCCL_CCLD_FAULT_CYCLES'] = os.environ.get('CCLD_H2_SIM_CYCLES', '30000000000')
+    elif args.fault == 'H2_SIM':
+        for key in ('NCCL_CCLD_FAULT_KIND', 'NCCL_CCLD_FAULT_RANK', 'NCCL_CCLD_FAULT_OP', 'NCCL_CCLD_FAULT_REPEATS', 'NCCL_CCLD_FAULT_CYCLES'):
+            os.environ.pop(key, None)
     dist.init_process_group('nccl', timeout=timedelta(seconds=args.timeout_seconds))
     mapped = mapped_nccl()
     if args.expect_nccl_prefix and not any(str(Path(p).resolve()).startswith(args.expect_nccl_prefix) for p in mapped):
@@ -167,7 +180,7 @@ def main():
             # the launcher must terminate the job after the configured timeout.
             time.sleep(args.hang_seconds)
             os._exit(77)
-        elif injected and args.fault == 'H2':
+        elif injected and args.fault in ('H2', 'H2_SIM'):
             mark_fault(args, rank, iteration)
         elif injected and args.fault == 'POST':
             mark_fault(args, rank, iteration)
@@ -176,13 +189,13 @@ def main():
             time.sleep(args.hang_seconds)
             os._exit(77)
         collective_start_ns = time.monotonic_ns()
-        h2_target = injected and args.fault == 'H2' and rank == args.fault_rank
+        h2_target = injected and args.fault in ('H2', 'H2_SIM') and rank == args.fault_rank
         h2_count = (args.numel - args.h2_delta_bytes // 4 if args.h2_count_divisor == 0 else h2_injected_count(args.numel, args.h2_count_divisor)) if h2_target and args.h2_mismatch == 'count' else None
         operation = h2_operation_for_rank(args.op, h2_target, rank, args.fault_rank, args.h2_mismatch, args.h2_operation)
         x, expected = collective(operation, args.numel, rank, world, count_override=h2_count)
         torch.cuda.synchronize()
         collective_end_ns = time.monotonic_ns()
-        mismatched_round = args.fault == 'H2' and iteration >= args.fault_iteration
+        mismatched_round = args.fault in ('H2', 'H2_SIM') and iteration >= args.fault_iteration
         if not mismatched_round and not verify(args.op, x, expected, args.numel, rank, world):
             raise RuntimeError(f'numerical verification failed rank={rank} iteration={iteration}')
         log_workload(args, rank, {'rank': rank, 'iteration': iteration, 'verified': not mismatched_round,
@@ -190,7 +203,7 @@ def main():
                                   'collective_end_ns': collective_end_ns,
                                   'collective_duration_ns': collective_end_ns - collective_start_ns,
                                   'operation': operation,
-                                  'h2_mismatch': args.h2_mismatch if args.fault == 'H2' and iteration >= args.fault_iteration else '',
+                                  'h2_mismatch': args.h2_mismatch if args.fault in ('H2', 'H2_SIM') and iteration >= args.fault_iteration else '',
                                   'fault_kind': args.fault if injected else '',
                                   'count_override': h2_count,
                                   'count_divisor': args.h2_count_divisor if h2_count is not None else 0,
