@@ -61,6 +61,18 @@ def mark_fault(args, rank, iteration):
     print('INJECT ' + json.dumps(event, sort_keys=True), flush=True)
 
 
+
+def h2_injected_count(numel, divisor=4):
+    """Match NV CCL-D torch_collectives.py's max(1, numel // 4) fault."""
+    return max(1, numel // divisor)
+
+
+def h2_operation_for_rank(op, active, rank, fault_rank, mismatch, mismatch_op):
+    if active and mismatch == 'operation' and rank == fault_rank:
+        return mismatch_op
+    return op
+
+
 def collective(op, n, rank, world, count_override=None):
     device = torch.device('cuda', int(os.environ['LOCAL_RANK']))
     if op == 'allreduce':
@@ -105,7 +117,9 @@ def main():
     p.add_argument('--fault', choices=('none', 'H1', 'H2', 'S1'), default='none')
     p.add_argument('--fault-rank', type=int, default=0)
     p.add_argument('--fault-iteration', type=int, default=3)
-    p.add_argument('--h2-delta-bytes', type=int, default=1024, help='bytes removed from the injected H2 rank count')
+    p.add_argument('--h2-count-divisor', type=int, default=4, help='NV CCL-D H2 count divisor for the injected rank')
+    p.add_argument('--h2-mismatch', choices=('count', 'operation'), default='count', help='H2 scenario from NV count fault or Ant-CCL operation mismatch')
+    p.add_argument('--h2-operation', choices=('allgather', 'reducescatter'), default='reducescatter', help='operation used by the injected H2 rank')
     p.add_argument('--sleep-ms', type=int, default=1000)
     p.add_argument('--gap-ms', type=int, default=0, help='delay between collective rounds')
     p.add_argument('--hang-seconds', type=int, default=20)
@@ -117,10 +131,10 @@ def main():
     args = p.parse_args()
     rank, world = int(os.environ['RANK']), int(os.environ['WORLD_SIZE'])
     local_rank = int(os.environ['LOCAL_RANK'])
-    if args.numel < 2 or args.iters < 1 or args.warmup < 0 or args.gap_ms < 0 or args.h2_delta_bytes < 4 or args.h2_delta_bytes % 4 != 0 or args.h2_delta_bytes // 4 >= args.numel or not 0 <= args.fault_rank < world:
+    if args.numel < 2 or args.iters < 1 or args.warmup < 0 or args.gap_ms < 0 or args.h2_count_divisor < 2 or args.h2_count_divisor > args.numel or not 0 <= args.fault_rank < world:
         p.error('invalid size, iteration count, round delay, or fault rank')
     if args.fault == 'H2' and args.op != 'allreduce':
-        p.error('H2 count mismatch is implemented only for AllReduce')
+        p.error('H2 scenarios require AllReduce as the majority operation')
     profile = os.environ.get('CCLD_RESTRICTED_BUILD', '')
     supported = {'1': {'allreduce'}, 'expanded': {'allreduce', 'allgather', 'reducescatter'},
                  'p2p': {'allreduce', 'alltoall'}}
@@ -152,8 +166,10 @@ def main():
         elif injected and args.fault == 'H2':
             mark_fault(args, rank, iteration)
         collective_start_ns = time.monotonic_ns()
-        h2_count = args.numel - args.h2_delta_bytes // 4 if injected and args.fault == 'H2' and rank == args.fault_rank else None
-        x, expected = collective(args.op, args.numel, rank, world, count_override=h2_count)
+        h2_target = injected and args.fault == 'H2' and rank == args.fault_rank
+        h2_count = h2_injected_count(args.numel, args.h2_count_divisor) if h2_target and args.h2_mismatch == 'count' else None
+        operation = h2_operation_for_rank(args.op, h2_target, rank, args.fault_rank, args.h2_mismatch, args.h2_operation)
+        x, expected = collective(operation, args.numel, rank, world, count_override=h2_count)
         torch.cuda.synchronize()
         collective_end_ns = time.monotonic_ns()
         mismatched_round = args.fault == 'H2' and iteration >= args.fault_iteration
@@ -163,7 +179,12 @@ def main():
                                   'collective_start_ns': collective_start_ns,
                                   'collective_end_ns': collective_end_ns,
                                   'collective_duration_ns': collective_end_ns - collective_start_ns,
-                                  'count_override': h2_count, 'count_delta_bytes': args.h2_delta_bytes if h2_count is not None else 0})
+                                  'operation': operation,
+                                  'h2_mismatch': args.h2_mismatch if args.fault == 'H2' and iteration >= args.fault_iteration else '',
+                                  'count_override': h2_count,
+                                  'count_divisor': args.h2_count_divisor if h2_count is not None else 0,
+                                  'count_delta_elements': args.numel - h2_count if h2_count is not None else 0,
+                                  'count_delta_bytes': (args.numel - h2_count) * 4 if h2_count is not None else 0})
         if args.gap_ms and iteration + 1 < args.warmup + args.iters:
             time.sleep(args.gap_ms / 1000)
     dist.destroy_process_group()

@@ -5,3 +5,5 @@ build/
 build-ccld-gfx936/
 build-ccld-gfx936-only/
 ext/
+
+/tools/tests/__pycache__/

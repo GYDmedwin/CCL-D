@@ -23,10 +23,14 @@ def main():
         'workload_fault_kind': os.environ.get('CCLD_WORKLOAD_FAULT', 'none'),
         'workload_fault_rank': int(os.environ.get('CCLD_WORKLOAD_FAULT_RANK', '-1')),
         'workload_fault_iteration': int(os.environ.get('CCLD_WORKLOAD_FAULT_ITERATION', '-1')),
-        'workload_h2_delta_bytes': int(os.environ.get('CCLD_WORKLOAD_H2_DELTA_BYTES', '1024')),
+        'workload_numel': int(os.environ.get('CCLD_NUMEL', '262144')),
+        'workload_h2_count_divisor': int(os.environ.get('CCLD_WORKLOAD_H2_COUNT_DIVISOR', '4')),
+        'workload_h2_mismatch': os.environ.get('CCLD_WORKLOAD_H2_MISMATCH', 'count'),
+        'workload_h2_operation': os.environ.get('CCLD_WORKLOAD_H2_OPERATION', 'reducescatter'),
     }
     ccld_fault = bool(config['fault_kind'])
     workload_fault = config['workload_fault_kind'] != 'none'
+    config['workload_h2_injected_count'] = max(1, config['workload_numel'] // config['workload_h2_count_divisor'])
     if not ccld_fault and not workload_fault:
         raise SystemExit('at least one fault mode must be configured')
     if ccld_fault and (config['fault_rank'] < 0 or config['fault_first_op'] < 1 or config['fault_repeats'] < 1 or config['fault_cycles'] < 1):

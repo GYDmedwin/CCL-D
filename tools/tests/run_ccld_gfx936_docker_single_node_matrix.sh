@@ -16,6 +16,9 @@ GAP_MS=${CCLD_GAP_MS:-0}
 FAULT=${CCLD_WORKLOAD_FAULT:-none}
 FAULT_RANK=${CCLD_WORKLOAD_FAULT_RANK:-0}
 FAULT_ITERATION=${CCLD_WORKLOAD_FAULT_ITERATION:-3}
+H2_COUNT_DIVISOR=${CCLD_WORKLOAD_H2_COUNT_DIVISOR:-4}
+H2_MISMATCH=${CCLD_WORKLOAD_H2_MISMATCH:-count}
+H2_OPERATION=${CCLD_WORKLOAD_H2_OPERATION:-reducescatter}
 SLEEP_MS=${CCLD_WORKLOAD_SLEEP_MS:-1000}
 HANG_SECONDS=${CCLD_WORKLOAD_HANG_SECONDS:-20}
 TIMEOUT_SECONDS=${CCLD_WORKLOAD_TIMEOUT_SECONDS:-90}
@@ -35,15 +38,22 @@ run_case() {
     CCLD_ALGO="$algorithm" CCLD_PROTO="$protocol" CCLD_OP="$op" \
     CCLD_NUMEL="$NUMEL" CCLD_WARMUP="$WARMUP" CCLD_ITERS="$ITERS" CCLD_GAP_MS="$GAP_MS" \
     CCLD_WORKLOAD_FAULT="$FAULT" CCLD_WORKLOAD_FAULT_RANK="$FAULT_RANK" \
-    CCLD_WORKLOAD_FAULT_ITERATION="$FAULT_ITERATION" CCLD_WORKLOAD_SLEEP_MS="$SLEEP_MS" \
+    CCLD_WORKLOAD_FAULT_ITERATION="$FAULT_ITERATION" CCLD_WORKLOAD_H2_COUNT_DIVISOR="$H2_COUNT_DIVISOR" \
+    CCLD_WORKLOAD_H2_MISMATCH="$H2_MISMATCH" CCLD_WORKLOAD_H2_OPERATION="$H2_OPERATION" \
+    CCLD_WORKLOAD_SLEEP_MS="$SLEEP_MS" \
     CCLD_WORKLOAD_HANG_SECONDS="$HANG_SECONDS" CCLD_WORKLOAD_TIMEOUT_SECONDS="$TIMEOUT_SECONDS" \
     "$NODE_SCRIPT" >"$case_run/torchrun.log" 2>&1
+  node_status=$(cat "$case_run/workload-exit-status-node-0" 2>/dev/null || printf '1')
   python3 "$DECODER" "$case_run/bin" "$case_run/jsonl"
-  python3 "$VALIDATOR" "$case_run" --world-size 4 --warmup "$WARMUP" --iters "$ITERS" \
-    --op "$op" --algorithm "$algorithm" --protocol "$protocol"
+  if [[ "$FAULT" == none && -z "${NCCL_CCLD_FAULT_KIND:-}" ]]; then
+    python3 "$VALIDATOR" "$case_run" --world-size 4 --warmup "$WARMUP" --iters "$ITERS" \
+      --op "$op" --algorithm "$algorithm" --protocol "$protocol"
+  else
+    printf 'fault run: numerical completion validator skipped; node exit status=%s\n' "$node_status"
+  fi
   if [[ -n "${CCLD_BASELINE_MS:-}" ]]; then
     python3 "$ANALYZER" "$case_run/jsonl" --baseline-ms "$CCLD_BASELINE_MS" \
-      --flush-last-window >"$case_run/analysis.jsonl"
+      --hang-s "${CCLD_HANG_S:-300}" --flush-last-window >"$case_run/analysis.jsonl"
   fi
   if [[ -f "$case_run/analysis.jsonl" ]]; then python3 - "$case_run/analysis.jsonl" <<'PY'
 import collections, json, pathlib, sys
@@ -52,7 +62,11 @@ counts = collections.Counter((row.get("category"), row.get("kind")) for row in r
 print("NV CCL-D analyzer output:", dict(sorted(counts.items())))
 PY
   fi
-  printf '%s\n' "case=$case_name ranks=4 host=$(hostname -s) artifacts=$case_run"
+  printf '%s\n' "case=$case_name ranks=4 host=$(hostname -s) workload_exit_status=$node_status artifacts=$case_run"
+  if [[ "$FAULT" == none && -z "${NCCL_CCLD_FAULT_KIND:-}" && "$node_status" != 0 ]]; then
+    echo "workload failed for $case_name (exit status $node_status)" >&2
+    exit 1
+  fi
 }
 
 # Same NV collective cases as the two-node matrix; gfx936 excludes LL128.

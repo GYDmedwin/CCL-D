@@ -25,7 +25,9 @@ PROTO=${CCLD_PROTO:-Simple}
 FAULT=${CCLD_WORKLOAD_FAULT:-none}
 FAULT_RANK=${CCLD_WORKLOAD_FAULT_RANK:-0}
 FAULT_ITERATION=${CCLD_WORKLOAD_FAULT_ITERATION:-3}
-H2_DELTA_BYTES=${CCLD_WORKLOAD_H2_DELTA_BYTES:-1024}
+H2_COUNT_DIVISOR=${CCLD_WORKLOAD_H2_COUNT_DIVISOR:-4}
+H2_MISMATCH=${CCLD_WORKLOAD_H2_MISMATCH:-count}
+H2_OPERATION=${CCLD_WORKLOAD_H2_OPERATION:-reducescatter}
 SLEEP_MS=${CCLD_WORKLOAD_SLEEP_MS:-1000}
 HANG_SECONDS=${CCLD_WORKLOAD_HANG_SECONDS:-20}
 TIMEOUT_SECONDS=${CCLD_WORKLOAD_TIMEOUT_SECONDS:-90}
@@ -61,12 +63,21 @@ if [[ "$NODE_RANK" == 0 && ( -n "${NCCL_CCLD_FAULT_KIND:-}" || "$FAULT" != none 
   python3 "$ROOT/tools/tests/write_ccld_fault_config.py" "$RUN/fault-config.json"
 fi
 
-exec "$TORCHRUN" \
+set +e
+"$TORCHRUN" \
   --nnodes="$NNODES" --nproc-per-node="$NPROC_PER_NODE" \
   --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
   "$WORKLOAD" --op "$OP" --numel "$NUMEL" --warmup "$WARMUP" --iters "$ITERS" \
   --gap-ms "$GAP_MS" --fault "$FAULT" --fault-rank "$FAULT_RANK" \
-  --fault-iteration "$FAULT_ITERATION" --h2-delta-bytes "$H2_DELTA_BYTES" --sleep-ms "$SLEEP_MS" --hang-seconds "$HANG_SECONDS" \
+  --fault-iteration "$FAULT_ITERATION" --h2-count-divisor "$H2_COUNT_DIVISOR" \
+  --h2-mismatch "$H2_MISMATCH" --h2-operation "$H2_OPERATION" --sleep-ms "$SLEEP_MS" --hang-seconds "$HANG_SECONDS" \
   --timeout-seconds "$TIMEOUT_SECONDS" \
   --workload-log-dir "$RUN/workload" --fault-log-dir "$RUN/fault-events" \
   --expect-nccl-prefix "$RCCL_BUILD_DIR" --expect-nccl-version 22203
+workload_status=$?
+printf '%s\n' "$workload_status" > "$RUN/workload-exit-status-node-$NODE_RANK"
+if [[ "$FAULT" != none || -n "${NCCL_CCLD_FAULT_KIND:-}" ]]; then
+  printf 'workload_exit_status=%s node_rank=%s; fault run continues to trace decode/analyzer\n' "$workload_status" "$NODE_RANK"
+  exit 0
+fi
+exit "$workload_status"

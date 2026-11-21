@@ -18,7 +18,9 @@ class FaultProvenanceTests(unittest.TestCase):
         self.assertIn('NCCL_CCLD_FAULT_OP', text)
         self.assertIn('NCCL_CCLD_FAULT_CYCLES', text)
         self.assertIn('write_ccld_fault_config.py', text)
-        self.assertIn('--h2-delta-bytes', text)
+        self.assertIn('--h2-count-divisor', text)
+        self.assertIn('workload-exit-status-node-', text)
+        self.assertIn('fault run continues to trace decode/analyzer', text)
 
 
     def test_writer_records_explicit_environment(self):
@@ -47,14 +49,19 @@ class FaultProvenanceTests(unittest.TestCase):
                 'NCCL_ALGO': 'Ring', 'NCCL_PROTO': 'Simple', 'CCLD_NNODES': '1',
                 'CCLD_NPROC_PER_NODE': '4', 'CCLD_WORKLOAD_FAULT': 'H2',
                 'CCLD_WORKLOAD_FAULT_RANK': '1', 'CCLD_WORKLOAD_FAULT_ITERATION': '3',
-                'CCLD_WORKLOAD_H2_DELTA_BYTES': '1024', 'RCCL_LIB': '/tmp/librccl.so',
+                'CCLD_WORKLOAD_H2_COUNT_DIVISOR': '4', 'CCLD_WORKLOAD_H2_MISMATCH': 'operation',
+                'CCLD_WORKLOAD_H2_OPERATION': 'reducescatter', 'CCLD_NUMEL': '262144', 'RCCL_LIB': '/tmp/librccl.so',
                 'RCCL_BUILD_DIR': '/tmp/build',
             })
             subprocess.run(['python3', str(WRITER), str(path)], env=env, check=True)
             loaded = json.loads(path.read_text())
             self.assertEqual(loaded['workload_fault_kind'], 'H2')
             self.assertEqual(loaded['workload_fault_rank'], 1)
-            self.assertEqual(loaded['workload_h2_delta_bytes'], 1024)
+            self.assertEqual(loaded['workload_h2_count_divisor'], 4)
+            self.assertEqual(loaded['workload_numel'], 262144)
+            self.assertEqual(loaded['workload_h2_injected_count'], 65536)
+            self.assertEqual(loaded['workload_h2_mismatch'], 'operation')
+            self.assertEqual(loaded['workload_h2_operation'], 'reducescatter')
 
     def test_fault_config_schema_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
