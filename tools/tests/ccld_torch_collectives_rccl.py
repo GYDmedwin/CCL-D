@@ -61,6 +61,26 @@ def mark_fault(args, rank, iteration):
     print('INJECT ' + json.dumps(event, sort_keys=True), flush=True)
 
 
+def mark_device_fault(rank, iteration):
+    """Record the first operation carrying a CCL-D device fault injection."""
+    kind = os.environ.get('NCCL_CCLD_FAULT_KIND', '')
+    if kind not in ('H3', 'S2') or rank != int(os.environ.get('NCCL_CCLD_FAULT_RANK', '-1')):
+        return False
+    op = int(os.environ.get('NCCL_CCLD_FAULT_OP', '0'))
+    if op <= 0 or iteration + 1 != op:
+        return False
+    root = Path(os.environ.get('CCLD_FAULT_LOG_DIR', 'fault-events'))
+    root.mkdir(parents=True, exist_ok=True)
+    event = {'kind': kind, 'rank': rank, 'iteration': iteration,
+             'host': socket.gethostname(), 'mono_ns': time.monotonic_ns(),
+             'device_fault_op': op}
+    with (root / f'rank-{rank}.ndjson').open('a', encoding='utf-8') as out:
+        out.write(json.dumps(event, sort_keys=True) + '\n')
+        out.flush()
+    print('INJECT ' + json.dumps(event, sort_keys=True), flush=True)
+    return True
+
+
 
 def h2_injected_count(numel, divisor=4):
     """Match NV CCL-D torch_collectives.py's max(1, numel // 4) fault."""
@@ -171,6 +191,7 @@ def main():
                               'runtime_nccl_version': runtime_version, 'mapped_nccl': mapped, 'op': args.op})
     for iteration in range(args.warmup + args.iters):
         injected = rank == args.fault_rank and iteration >= args.fault_iteration
+        mark_device_fault(rank, iteration)
         if injected and args.fault == 'S1':
             mark_fault(args, rank, iteration)
             time.sleep(args.sleep_ms / 1000)
