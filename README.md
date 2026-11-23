@@ -62,6 +62,10 @@ torchrun --standalone --nproc-per-node=4 train.py
 
 在 Ring 上额外启用方向等待计数时，设置 `NCCL_ALGO=Ring NCCL_CCLD_WAIT_ENABLE=1`。用正常训练标定 `--baseline-ms` 和 slow 窗口。用 `--slow-warmup-ops` 按 communicator 跳过启动期的慢诊断和基线学习，hang 诊断和签名检查仍实时运行。设置 `NCCL_CCLD_OUT_DIR` 可改用落盘的二进制记录供回放。
 
+混合大小或操作的训练可给分析器加上 `--baseline-scope signature`。每种操作签名分别学习耗时基线和累计 slow 窗口，达到该签名的学习门槛后开始 slow 诊断。`--baseline-rounds` 和 `--baseline-s` 分别设置样本数和学习时长。
+
+同机 Ring 的混合慢诊断可在训练侧设置 `NCCL_CCLD_WAIT_ENABLE=1 NCCL_CCLD_DUMP_MS=1`，并给分析器加上 `--ring-wait-phases`。分析器以最后一个 rank 的入场时刻为界，用前后两侧的等待快照核对通信根因。快照间隔和拉取周期可按训练负载调整。分析器和二进制解码器应与训练库使用同一版本。
+
 ## 运行 Evaluation 5.1
 
 运行全部单节点场景前，先按拓扑、协议和消息大小标定等待阈值，再通过 `CCLD_WAIT_THRESHOLD` 传入。
