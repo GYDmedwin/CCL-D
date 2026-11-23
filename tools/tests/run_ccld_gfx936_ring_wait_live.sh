@@ -64,7 +64,7 @@ else
   "$DUAL" >"$RUN/launcher.log" 2>&1
 fi
 for _ in $(seq 1 80); do
-  if [[ -s "$RUN/$CASE/adapter-live.jsonl" ]] && rg -q '"kind": "three_round_decision"' "$RUN/$CASE/adapter-live.jsonl"; then break; fi
+  if [[ -s "$RUN/$CASE/adapter-live.jsonl" ]] && grep -q '"kind": "three_round_decision"' "$RUN/$CASE/adapter-live.jsonl"; then break; fi
   sleep 0.25
 done
 sleep 0.5

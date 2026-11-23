@@ -74,7 +74,7 @@ run_case() {
   remote_pid=''
   node0_status=$(cat "$case_run/workload-exit-status-node-0" 2>/dev/null || printf '1')
   node1_status=$(cat "$case_run/workload-exit-status-node-1" 2>/dev/null || printf '1')
-  if ! rg -q 'NET/IB[ :]' "$case_run/node0.log" || ! rg -q 'NET/IB[ :]' "$case_run/node1.log"; then
+  if ! grep -q 'NET/IB[ :]' "$case_run/node0.log" || ! grep -q 'NET/IB[ :]' "$case_run/node1.log"; then
     echo "RCCL logs did not confirm IB on both nodes for $case_name" >&2
     exit 1
   fi

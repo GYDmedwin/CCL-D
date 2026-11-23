@@ -7,7 +7,6 @@ TESTS="$ROOT/tools/tests"
 DECODER=${CCLD_DECODER:-${CCLD_NV_ROOT:-$ROOT}/ccld/tools/decode_async_wait.py}
 TOPOLOGY=${CCLD_TOPOLOGY:-single}
 CASE=${CCLD_EVAL51_CASE:-all}
-RUN=${CCLD_RUN:-$ROOT/../results/antccl-eval51-${TOPOLOGY}-$(date +%Y%m%d-%H%M%S)}
 RCCL_BUILD_DIR=${RCCL_BUILD_DIR:-$ROOT/build-ccld-gfx936-fault}
 RCCL_LIB=${RCCL_LIB:-$RCCL_BUILD_DIR/librccl.so.1.0}
 RANK=${CCLD_FAULT_RANK:-2}
@@ -45,6 +44,7 @@ if [[ "$TOPOLOGY" == dual ]]; then
   MATRIX_RUNNER=$DUAL_MATRIX
   WORLD_SIZE=8
 fi
+RUN=${CCLD_RUN:-$ROOT/../results/antccl-eval51-${TOPOLOGY}-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$RUN"
 export RCCL_BUILD_DIR RCCL_LIB CCLD_TOPOLOGY="$TOPOLOGY" CCLD_H1_RANK="$RANK"
 
