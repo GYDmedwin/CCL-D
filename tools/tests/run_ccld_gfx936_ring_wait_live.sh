@@ -7,6 +7,7 @@ DUAL="$ROOT/tools/tests/run_ccld_gfx936_docker_2node.sh"
 NODE_DECODER=${CCLD_DECODER:-/workspace/nv/CCL-D/ccld/tools/decode_async_wait.py}
 ANALYZER=${CCLD_ANALYZER:-/workspace/nv/CCL-D/ccld/analyzer/ccld_analyze.py}
 ADAPTER="$ROOT/tools/tests/ccld_gfx936_online_ring_wait.py"
+S2_GATE="$ROOT/tools/tests/validate_ccld_s2_detected.py"
 RCCL_BUILD_DIR=${RCCL_BUILD_DIR:-$ROOT/build-ccld-gfx936-fault}
 RCCL_LIB=${RCCL_LIB:-$RCCL_BUILD_DIR/librccl.so.1.0}
 TOPOLOGY=${CCLD_TOPOLOGY:-single}
@@ -70,20 +71,14 @@ sleep 0.5
 cleanup
 trap - EXIT
 python3 "$NODE_DECODER" "$RUN/$CASE/bin" "$RUN/$CASE/jsonl-final"
-python3 "$ANALYZER" "$RUN/$CASE/jsonl-final" --baseline-ms "$BASELINE_MS" \
+python3 "$ANALYZER" "$RUN/$CASE/jsonl-final" --baseline-ms "${CCLD_FINAL_BASELINE_MS:-1}" \
   --hang-s 10 --window-s "$WINDOW_S" --repeats 2 --flush-last-window \
   >"$RUN/$CASE/analysis-final.jsonl"
-python3 - "$RUN/$CASE/adapter-live.jsonl" "$FAULT_RANK" "$RUN/$CASE/fault-config.json" <<'PY'
-import json
-from pathlib import Path
-import sys
-rows=[json.loads(x) for x in Path(sys.argv[1]).read_text().splitlines() if x.strip()]
-target=int(sys.argv[2])
-results=[x for x in rows if x.get('category')=='online_wait' and x.get('kind')=='three_round_decision']
-assert results and results[-1].get('status')=='evaluated', rows
-assert results[-1].get('candidate_ranks')==[target], results[-1]
-manifest=json.loads(Path(sys.argv[3]).read_text())
-assert manifest['fault_kind']=='S2' and manifest['fault_rank']==target, manifest
-print(json.dumps({'decision':results[-1], 'manifest':manifest}, sort_keys=True))
+python3 "$S2_GATE" "$RUN/$CASE/analysis-final.jsonl" "$RUN/$CASE/fault-config.json" --target-rank "$FAULT_RANK"
+python3 - "$RUN/$CASE/adapter-live.jsonl" <<'PY'
+import json,sys
+rows=[json.loads(x) for x in open(sys.argv[1]) if x.strip()]
+decisions=[x for x in rows if x.get('category')=='online_wait' and x.get('kind')=='three_round_decision']
+print(json.dumps({'online_wait_decision':decisions[-1] if decisions else None}, sort_keys=True))
 PY
 printf 'Ring-wait live artifacts: %s\n' "$RUN/$CASE"
