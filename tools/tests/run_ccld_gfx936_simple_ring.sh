@@ -4,7 +4,7 @@ set -euo pipefail
 # This test deliberately builds and runs one target: gfx936.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 HIPCC=${HIPCC:-/opt/dtk/bin/hipcc}
-DECODER=${CCLD_DECODER:-${CCLD_NV_ROOT:-/workspace/nv/CCL-D}/ccld/tools/decode_ccld_binary.py}
+DECODER=${CCLD_DECODER:-${CCLD_NV_ROOT:-$ROOT}/ccld/tools/decode_ccld_binary.py}
 RCCL_LIB=${RCCL_LIB:-/workspace/dcu/results/gfx936-20261121/librccl.so.1.0}
 RCCL_BUILD_DIR=${RCCL_BUILD_DIR:-$ROOT/build-ccld-gfx936-only}
 EXPECTED_RANKS=${CCLD_EXPECTED_RANKS:-4}

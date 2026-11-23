@@ -63,7 +63,7 @@ CCLD_WAIT_THRESHOLD="$CALIBRATED_WAIT_THRESHOLD" \
 
 ## 依赖与结果
 
-验收入口、分析适配器和源码对照单测通过 `CCLD_NV_ROOT` 指定 NCCL 版 CCL-D 源码。默认目录为 `/workspace/nv/CCL-D`。本分支的参考版本为 NCCL 版 CCL-D 提交 `38e21d1`。
+本分支自带二进制 decoder、节点代理和分析器，来源是 NCCL 版 CCL-D 提交 `38e21d1`。验收入口默认使用当前检出的工具。用 `CCLD_NV_ROOT` 可以指定另一个分析器版本，也可用它为源码对照单测提供 NCCL 检出。
 
 ```bash
 export CCLD_NV_ROOT=/path/to/nccl-CCL-D

@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 HIPCC=${HIPCC:-/opt/dtk/bin/hipcc}
-DECODER=${CCLD_DECODER:-${CCLD_NV_ROOT:-/workspace/nv/CCL-D}/ccld/tools/decode_ccld_binary.py}
+DECODER=${CCLD_DECODER:-${CCLD_NV_ROOT:-$ROOT}/ccld/tools/decode_ccld_binary.py}
 RCCL_LIB=${RCCL_LIB:-$ROOT/build-ccld-gfx936-only/lib/librccl.so.1.0}
 RCCL_BUILD_DIR=${RCCL_BUILD_DIR:-$ROOT/build-ccld-gfx936-only}
 WORK=${CCLD_TEST_WORK:-$(mktemp -d /tmp/ccld-gfx936-fault.XXXXXX)}

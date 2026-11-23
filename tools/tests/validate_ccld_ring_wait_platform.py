@@ -7,7 +7,7 @@ import statistics
 import sys
 from pathlib import Path
 
-NV_ANALYZER = Path(os.environ.get('CCLD_NV_ROOT', '/workspace/nv/CCL-D')) / 'ccld/analyzer'
+NV_ANALYZER = Path(os.environ.get('CCLD_NV_ROOT', str(Path(__file__).resolve().parents[2]))) / 'ccld/analyzer'
 sys.path.insert(0, str(NV_ANALYZER))
 from ring_wait import decide, graph_wait_scores  # noqa: E402
 

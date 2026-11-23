@@ -4,7 +4,7 @@ set -euo pipefail
 # Single public entry point for the AntCCL Evaluation 5.1 fault experiments.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TESTS="$ROOT/tools/tests"
-DECODER=${CCLD_DECODER:-${CCLD_NV_ROOT:-/workspace/nv/CCL-D}/ccld/tools/decode_async_wait.py}
+DECODER=${CCLD_DECODER:-${CCLD_NV_ROOT:-$ROOT}/ccld/tools/decode_async_wait.py}
 TOPOLOGY=${CCLD_TOPOLOGY:-single}
 CASE=${CCLD_EVAL51_CASE:-all}
 RUN=${CCLD_RUN:-$ROOT/../results/antccl-eval51-${TOPOLOGY}-$(date +%Y%m%d-%H%M%S)}

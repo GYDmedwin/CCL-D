@@ -2,7 +2,7 @@
 """Validate a strict per-send S2 fault with NV Ring-wait scores over 10 rounds."""
 import argparse, json, os, statistics, sys
 from pathlib import Path
-nv_root = Path(os.environ.get('CCLD_NV_ROOT', '/workspace/nv/CCL-D'))
+nv_root = Path(os.environ.get('CCLD_NV_ROOT', str(Path(__file__).resolve().parents[2])))
 sys.path.insert(0, str(nv_root / 'ccld/analyzer'))
 from ring_wait import graph_wait_scores
 
