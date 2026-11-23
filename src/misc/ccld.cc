@@ -558,6 +558,13 @@ uint64_t ccldEnter(struct ncclComm* comm, const struct ncclInfo* info) {
   return seq;
 }
 
+void ccldDiscardGroupedTask(struct ncclComm* comm, uint64_t seq) {
+  CcldState* state = ccldState(comm);
+  if (state != nullptr && state->pending.forget(seq)) {
+    ccldDropped(state, seq, "multiple_collectives");
+  }
+}
+
 void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   CcldState* state = ccldState(comm);
   if (state == nullptr || plan == nullptr || plan->ccldSeq == 0) return;
@@ -596,8 +603,9 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   descriptor.frameGroups = state->frameGroups;
   const CcldPlanDecision decision = ccldPlanDecision(descriptor);
   if (!decision.supported()) {
-    state->pending.forget(plan->ccldSeq);
-    ccldDropped(state, plan->ccldSeq, ccldPlanReasonString(decision.reason));
+    if (state->pending.forget(plan->ccldSeq)) {
+      ccldDropped(state, plan->ccldSeq, ccldPlanReasonString(decision.reason));
+    }
     return;
   }
   if (plan->ccldProtocol == NCCL_PROTO_LL128) {

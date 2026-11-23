@@ -73,6 +73,7 @@ void ccldDeviceConfig(struct ncclComm* comm, CcldFrame** frame, uint32_t* blockB
                       uint32_t* groups, CcldWaitChannel** waitFrame,
                       uint32_t* waitBlockBytes);
 uint64_t ccldEnter(struct ncclComm* comm, const struct ncclInfo* info);
+void ccldDiscardGroupedTask(struct ncclComm* comm, uint64_t seq);
 void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan);
 void ccldCallbackEnqueue(struct ncclComm* comm, struct ncclKernelPlan* plan,
                          cudaStream_t stream);

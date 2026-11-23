@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #define HIP_CHECK(call) do { \
@@ -21,7 +22,12 @@
   } \
 } while (0)
 
-int main() {
+int main(int argc, char** argv) {
+  const bool groupedStress = argc == 2 && std::strcmp(argv[1], "--grouped-stress") == 0;
+  if (argc != 1 && !groupedStress) {
+    fprintf(stderr, "usage: %s [--grouped-stress]\n", argv[0]);
+    return 1;
+  }
   int deviceCount = 0;
   HIP_CHECK(hipGetDeviceCount(&deviceCount));
   if (deviceCount < 2) {
@@ -44,12 +50,16 @@ int main() {
     HIP_CHECK(hipMemcpy(input[rank], hostInput.data(), count * sizeof(float), hipMemcpyHostToDevice));
   }
 
-  for (int iteration = 0; iteration < 3; ++iteration) {
+  const int groupedRounds = groupedStress ? 132 : 0;
+  for (int iteration = 0; iteration < groupedRounds + 3; ++iteration) {
+    const int operations = iteration < groupedRounds ? 2 : 1;
     RCCL_CHECK(ncclGroupStart());
     for (int rank = 0; rank < ranks; ++rank) {
       HIP_CHECK(hipSetDevice(rank));
-      RCCL_CHECK(ncclAllReduce(input[rank], output[rank], count, ncclFloat, ncclSum,
-                               comms[rank], streams[rank]));
+      for (int op = 0; op < operations; ++op) {
+        RCCL_CHECK(ncclAllReduce(input[rank], output[rank], count, ncclFloat, ncclSum,
+                                 comms[rank], streams[rank]));
+      }
     }
     RCCL_CHECK(ncclGroupEnd());
   }
@@ -65,7 +75,8 @@ int main() {
       }
     }
   }
-  printf("Simple Ring AllReduce passed: ranks=%d count=%zu iterations=3\n", ranks, count);
+  printf("AllReduce passed: ranks=%d count=%zu grouped_rounds=%d single_rounds=3\n",
+         ranks, count, groupedRounds);
 
   for (int rank = 0; rank < ranks; ++rank) {
     HIP_CHECK(hipSetDevice(rank));
