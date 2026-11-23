@@ -12,6 +12,7 @@ struct CcldStart {
   uint64_t bytes;
   const char* op;
   const char* datatype;
+  uint32_t builtinReduction = 0;
 };
 
 // Rank-local operation sequence used to correlate API entry and kernel plan.

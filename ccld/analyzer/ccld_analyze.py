@@ -119,6 +119,14 @@ GROUPED_PLAN_SKIP = 'multiple_collectives'
 RECOVERABLE_DROP_REASONS = {GROUPED_PLAN_SKIP, 'frame_slot_busy'}
 
 
+def signature_fields(states, fields=SIGNATURE_FIELDS):
+    if states and states.get(0, {}).get('reduction_op') and all(
+            isinstance(e.get('reduction_op'), str) and e['reduction_op'].strip()
+            for e in states.values()):
+        return fields + ('reduction_op',)
+    return fields
+
+
 def acknowledged_exclusion(entry, dropped):
     """Recognize a producer's explicit omission of one recorded operation."""
     reason = dropped.get('reason')
@@ -143,7 +151,8 @@ def aligned_exclusion(states, world):
     if reason == GROUPED_PLAN_SKIP and any(e['event'] != 'skipped' for e in states.values()):
         return None
     first = states[0]
-    if all(all(e.get(k) == first.get(k) for k in ENTRY_FIELDS) for e in states.values()):
+    fields = signature_fields(states, ENTRY_FIELDS)
+    if all(all(e.get(k) == first.get(k) for k in fields) for e in states.values()):
         return reason
     return None
 
@@ -183,6 +192,7 @@ def operation_signature_partition(states: dict[int, dict], world_size: int,
     if set(states) != set(range(world_size)):
         return {'status': 'incomplete', 'groups': []}
     groups: dict[tuple, list[int]] = defaultdict(list)
+    fields = signature_fields(states)
     for rank in range(world_size):
         event = states[rank]
         op, count, dtype, algorithm, protocol = (event.get(k) for k in SIGNATURE_FIELDS)
@@ -190,6 +200,8 @@ def operation_signature_partition(states: dict[int, dict], world_size: int,
                 any(not isinstance(x, str) or not x.strip() for x in (op, dtype, algorithm, protocol))):
             return {'status': 'incomplete', 'groups': []}
         key = (op.strip().lower(), count, dtype.strip().lower(), algorithm.strip().lower(), protocol.strip().lower())
+        if len(fields) > len(SIGNATURE_FIELDS):
+            key += (event['reduction_op'].strip().lower(),)
         groups[key].append(rank)
     reported = [{'signature': list(key), 'ranks': ranks} for key, ranks in sorted(groups.items())]
     if len(groups) == 1:
@@ -326,7 +338,8 @@ def result_common(comm: str, op_count: int | None, category: str) -> dict:
 def completed_mismatch(comm, op, states, world):
     """Check metadata disagreement even when every rank reports completion."""
     first = states[0]
-    if all(event is first or all(event.get(k) == first.get(k) for k in SIGNATURE_FIELDS)
+    fields = signature_fields(states)
+    if all(event is first or all(event.get(k) == first.get(k) for k in fields)
            for event in states.values()):
         return None
     started = time.perf_counter_ns()
@@ -389,7 +402,7 @@ def slow_decision(comm, op, states, label, window, members, cid, base, baseline,
     return item
 
 
-PROFILE_FIELDS = ('op', 'count', 'datatype', 'algorithm', 'protocol', 'n_channels')
+PROFILE_FIELDS = ('op', 'count', 'datatype', 'algorithm', 'protocol', 'n_channels', 'reduction_op')
 
 
 def operation_profile(event):
@@ -402,7 +415,8 @@ def operation_profile(event):
             any(not isinstance(name, str) or not name.strip() for name in names)):
         return None
     op, datatype, algorithm, protocol = (name.strip().lower() for name in names)
-    return op, count, datatype, algorithm, protocol, channels
+    reduction = str(event.get('reduction_op', '')).strip().lower()
+    return op, count, datatype, algorithm, protocol, channels, reduction
 
 
 class SlowProfile:
@@ -616,8 +630,8 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
             # Preserve the per-rank operation metadata even when all ranks
             # hang and channel counts cannot be compared. This is evidence,
             # not an automatic classification or root-cause decision.
-            signatures = {r: [e.get(x) for x in SIGNATURE_FIELDS]
-                          for r, e in states.items()}
+            fields = signature_fields(states)
+            signatures = {r: [e.get(x) for x in fields] for r, e in states.items()}
             hang['operation_signatures'] = signatures
             # A completion after the hang threshold is not evidence that this
             # rank was un-hung: an error/abort can release a pending callback.

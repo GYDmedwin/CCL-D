@@ -10,6 +10,7 @@
 constexpr unsigned CCLD_RECORD_CHANNELS = 32;
 constexpr uint32_t CCLD_FRAGMENT_VERSION = 2;
 constexpr uint32_t CCLD_OBSERVED_PROGRESS = 1u << 31;
+constexpr uint32_t CCLD_BUILTIN_REDUCTION = 1u << 30;
 enum CcldLogType : uint32_t {
   CcldLogInit = 1,
   CcldLogEntered = 2,
@@ -44,6 +45,12 @@ inline void ccldLogFirstProgress(CcldLogEvent& event, uint64_t monoNs) {
   event.mode |= CCLD_OBSERVED_PROGRESS;
   event.frameBytes = static_cast<uint32_t>(monoNs);
   event.frameChannels = static_cast<uint32_t>(monoNs >> 32);
+}
+
+inline void ccldLogReduction(CcldLogEvent& event, uint32_t reduction) {
+  if (reduction == 0) return;
+  event.mode |= CCLD_BUILTIN_REDUCTION;
+  event.frameGroups = reduction;
 }
 
 #endif

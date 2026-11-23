@@ -66,6 +66,7 @@ struct CcldState {
     uint64_t seq = 0;
     uint64_t startNs = 0, lastDumpNs = 0, firstProgressNs = 0;
     uint64_t count = 0, bytes = 0;
+    uint32_t builtinReduction = 0;
     const char* op = nullptr;
     const char* datatype = nullptr;
     const char* algorithm = nullptr;
@@ -231,6 +232,7 @@ static size_t ccldEmitPart(CcldState* state, CcldState::Slot& slot, CcldLogType 
   event.windowNs = now > slot.lastDumpNs ? now - slot.lastDumpNs : 1;
   if (slot.firstProgressNs >= slot.startNs && slot.firstProgressNs < now)
     ccldLogFirstProgress(event, slot.firstProgressNs);
+  ccldLogReduction(event, slot.builtinReduction);
   event.count = slot.count;
   event.bytes = slot.bytes;
   const unsigned offset = part * CCLD_RECORD_CHANNELS;
@@ -571,6 +573,9 @@ uint64_t ccldEnter(struct ncclComm* comm, const struct ncclInfo* info) {
   }
   CcldStart start{clockNano(), static_cast<uint64_t>(info->count), bytes,
                   ncclFuncToString(info->coll), ncclDatatypeToString(info->datatype)};
+  if ((info->coll == ncclFuncAllReduce || info->coll == ncclFuncReduceScatter ||
+       info->coll == ncclFuncReduce) && info->op >= ncclSum && info->op < ncclNumOps)
+    start.builtinReduction = static_cast<uint32_t>(info->op) + 1;
   if (!state->pending.publish(seq, start)) {
     ccldDropped(state, seq, "pending_ring_full_or_counter_wrap");
     return seq;
@@ -578,6 +583,7 @@ uint64_t ccldEnter(struct ncclComm* comm, const struct ncclInfo* info) {
   CcldLogEvent entered = ccldLogBase(state, CcldLogEntered, seq, start.ns);
   entered.count = start.count;
   entered.bytes = start.bytes;
+  ccldLogReduction(entered, start.builtinReduction);
   snprintf(entered.op, sizeof(entered.op), "%s", start.op ? start.op : "");
   snprintf(entered.datatype, sizeof(entered.datatype), "%s", start.datatype ? start.datatype : "");
   ccldWrite(state, entered);
@@ -693,6 +699,7 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   slot.firstProgressNs = 0;
   slot.count = start.count;
   slot.bytes = start.bytes;
+  slot.builtinReduction = start.builtinReduction;
   slot.op = start.op;
   slot.datatype = start.datatype;
   slot.algorithm = plan->ccldAlgorithm == NCCL_ALGO_RING ? "Ring" : "Tree";

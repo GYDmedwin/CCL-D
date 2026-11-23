@@ -92,6 +92,21 @@ class LiveDecisionTests(unittest.TestCase):
         self.assertEqual([(r['category'], r['kind'], r['roots']) for r in results],
                          [('coverage', 'skipped', []), ('hang', 'H1', [1])])
 
+    def test_completed_collective_distinguishes_builtin_reductions_at_the_same_shape(self):
+        reports, decoder = [], WaitDecoder()
+        analysis = LiveAnalysis(Config(), reports.append)
+        for rank in range(4):
+            raw = Event.from_buffer_copy(event(1, rank, 0, 0))
+            raw.nranks = 4
+            analysis.add(decoder.consume(bytes(raw)))
+        for rank in range(4):
+            raw = Event.from_buffer_copy(event(4, rank, 1, 200, 100))
+            raw.nranks, raw.mode, raw.frameGroups = 4, 1 << 30, 3 if rank == 2 else 1
+            analysis.add(decoder.consume(bytes(raw)))
+        analysis.evaluate()
+        self.assertEqual([(r['category'], r['kind'], r['roots']) for r in reports],
+                         [('collective_mismatch', 'H2', [2])])
+
     def test_same_host_linear_tree_reads_identity_from_initialization(self):
         for different_hosts in (False, True):
             with self.subTest(different_hosts=different_hosts):

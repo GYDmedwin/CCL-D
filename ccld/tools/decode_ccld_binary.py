@@ -13,6 +13,8 @@ MAX_CHANNELS = 128
 FRAGMENT_VERSION = 2
 FRAGMENT_KINDS = (3, 4, 7)
 OBSERVED_PROGRESS = 1 << 31
+BUILTIN_REDUCTION = 1 << 30
+REDUCTIONS = ('sum', 'prod', 'max', 'min', 'avg')
 
 
 class Channel(ctypes.LittleEndianStructure):
@@ -154,6 +156,10 @@ def decode_event(e, raw, allow_fragment=False):
             raise ValueError('invalid wait observation record')
         result.update(active=e.reserved == 1, wait_id=e.windowNs, producer_comm=f'{e.startNs:016x}',
                       producer_op=e.count, producer_rank=e.bytes)
+    if e.type in (2, 3, 4) and e.mode & BUILTIN_REDUCTION:
+        if not 1 <= e.frameGroups <= len(REDUCTIONS):
+            raise ValueError('invalid builtin reduction')
+        result['reduction_op'] = REDUCTIONS[e.frameGroups - 1]
     return result
 
 
