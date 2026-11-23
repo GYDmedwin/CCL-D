@@ -22,7 +22,65 @@ def event(kind):
     return e
 
 
+def fragments(channel_count, wait=False):
+    total = (channel_count + 31) // 32
+    for index in range(total):
+        progress = event(4)
+        progress.version = 2
+        progress.reserved = (total << 16) | (index << 8) | 4
+        progress.op, progress.algorithm, progress.protocol = b'AllReduce', b'RING', b'SIMPLE'
+        progress.windowNs = 200
+        progress.nChannels = min(32, channel_count - index * 32)
+        for offset in range(progress.nChannels):
+            cid = index * 32 + offset
+            progress.channels[offset].id = cid
+            progress.channels[offset].send = cid + 1
+        if wait:
+            waiting = Event.from_buffer_copy(bytes(progress))
+            waiting.type = 7
+            progress.reason = b'ring_wait_v1'
+            for offset in range(waiting.nChannels):
+                waiting.channels[offset].parent = 7
+                waiting.channels[offset].sendChanges = 1
+                waiting.channels[offset].recv = 40
+            yield waiting
+        yield progress
+
+
 class WaitDecoderTests(unittest.TestCase):
+    def test_wide_progress_requires_all_parts_and_preserves_wait_pairs(self):
+        for count, waits in ((33, False), (65, True), (128, True)):
+            with self.subTest(count=count, waits=waits):
+                records = list(fragments(count, waits))
+                decoder = WaitDecoder(defer_channels=True)
+                for record in records[:-1]:
+                    self.assertIsNone(decoder.consume(bytes(record)))
+                data = decoder.consume(bytes(records[-1]))
+                decoder.finish()
+                self.assertEqual(data['n_channels'], count)
+                self.assertIsNone(data['channels']._decoded)
+                self.assertEqual(list(data['channels'].parents()), list(range(count)))
+                self.assertEqual(data['channels'][-1]['send_count'], count)
+                if waits:
+                    self.assertEqual(data['channels'][-1]['wait_credit_spins'], 40)
+
+    def test_partial_or_inconsistent_fragments_have_no_completion(self):
+        first, last = fragments(33)
+        decoder = WaitDecoder()
+        self.assertIsNone(decoder.consume(bytes(first)))
+        with self.assertRaisesRegex(ValueError, 'incomplete final progress'):
+            decoder.finish()
+        last.channels[0].id = 31
+        with self.assertRaisesRegex(ValueError, 'invalid channels'):
+            decoder.consume(bytes(last))
+        with self.assertRaisesRegex(ValueError, 'out of order'):
+            WaitDecoder().consume(bytes(last))
+        decoder = WaitDecoder()
+        decoder.consume(bytes(first))
+        last.count += 1
+        with self.assertRaisesRegex(ValueError, 'inconsistent progress'):
+            decoder.consume(bytes(last))
+
     def test_deferred_ring_wait_metrics_match_eager_after_pickling(self):
         wait, done = event(7), event(4)
         wait.reserved = 4

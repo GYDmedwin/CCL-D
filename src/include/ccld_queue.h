@@ -41,23 +41,33 @@ class CcldQueue {
   bool lockFree() const { return producer.is_lock_free(); }
 
   bool push(const T& value) {
-    if (!cells) return false;
+    return pushBatch(&value, 1);
+  }
+
+  bool pushBatch(const T* values, size_t count) {
+    if (!cells || count == 0 || count > capacity) return false;
     size_t pos = producer.load(std::memory_order_relaxed);
-    Cell* cell;
     for (;;) {
-      cell = &cells[pos % capacity];
-      const size_t sequence = cell->sequence.load(std::memory_order_acquire);
-      const intptr_t diff = intptr_t(sequence) - intptr_t(pos);
-      if (diff == 0) {
-        if (producer.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) break;
-      } else if (diff < 0) {
-        return false;
-      } else {
+      size_t available = 0;
+      for (; available < count; ++available) {
+        const size_t index = pos + available;
+        const size_t sequence = cells[index % capacity].sequence.load(std::memory_order_acquire);
+        const intptr_t diff = intptr_t(sequence - index);
+        if (diff < 0) return false;
+        if (diff > 0) break;
+      }
+      if (available != count) {
         pos = producer.load(std::memory_order_relaxed);
+      } else if (producer.compare_exchange_weak(pos, pos + count, std::memory_order_relaxed)) {
+        break;
       }
     }
-    cell->value = value;
-    cell->sequence.store(pos + 1, std::memory_order_release);
+    for (size_t offset = count; offset > 0; --offset) {
+      // Publish the first cell last so the consumer sees the whole batch.
+      Cell& cell = cells[(pos + offset - 1) % capacity];
+      cell.value = values[offset - 1];
+      cell.sequence.store(pos + offset, std::memory_order_release);
+    }
     return true;
   }
 

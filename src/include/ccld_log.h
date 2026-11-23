@@ -5,7 +5,10 @@
 #include <type_traits>
 #include "ccld.h"
 
-// Fixed-size V1 records are shared with the current NCCL CCL-D decoder.
+// Keep the fixed wire stride. V2 snapshots use consecutive parts when
+// the active channels do not fit in one V1 record.
+constexpr unsigned CCLD_RECORD_CHANNELS = 32;
+constexpr uint32_t CCLD_FRAGMENT_VERSION = 2;
 enum CcldLogType : uint32_t {
   CcldLogInit = 1,
   CcldLogEntered = 2,
@@ -27,7 +30,7 @@ struct CcldLogEvent {
   uint64_t hash, seq, nowNs, startNs, count, bytes, windowNs;
   uint32_t rank, nranks, frameBytes, frameChannels, frameGroups, pollUs, mode, nChannels;
   char host[64], op[16], algorithm[16], protocol[16], datatype[16], reason[64];
-  CcldLogChannel channels[CCLD_MAX_CHANNELS];
+  CcldLogChannel channels[CCLD_RECORD_CHANNELS];
 };
 
 static_assert(sizeof(CcldLogChannel) == 56, "binary channel layout changed");

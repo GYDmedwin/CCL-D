@@ -8,7 +8,6 @@
 // Its variable tail stores only the communicator's active channels.
 #define CCLD_BLOCKS 8
 #define CCLD_MAX_BLOCKS 512
-#define CCLD_MAX_CHANNELS 32
 #define CCLD_GROUPS 2
 
 struct CcldChannel {

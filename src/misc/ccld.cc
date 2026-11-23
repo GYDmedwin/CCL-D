@@ -11,6 +11,7 @@
 #include "param.h"
 #include "utils.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -50,6 +51,11 @@ struct CcldState {
   uint64_t mode = 0;
   CcldSequence sequence;
   CcldPendingTable<256> pending;
+  struct ChannelSample {
+    int parent, ringPrev, ringNext;
+    uint64_t waitData, waitCredit;
+    uint64_t lastSend, lastRecv, dumpSend, dumpRecv, changesSend, changesRecv;
+  };
   struct Slot {
     std::atomic<int> phase{0};
     std::atomic<bool> done{false};
@@ -65,17 +71,10 @@ struct CcldState {
     const char* algorithm = nullptr;
     const char* protocol = nullptr;
     int channelLo = 0, channelHi = -1;
-    int parents[CCLD_MAX_CHANNELS] = {};
-    int ringPrev[CCLD_MAX_CHANNELS] = {}, ringNext[CCLD_MAX_CHANNELS] = {};
-    uint64_t waitData[CCLD_MAX_CHANNELS] = {}, waitCredit[CCLD_MAX_CHANNELS] = {};
-    uint64_t lastSend[CCLD_MAX_CHANNELS] = {};
-    uint64_t lastRecv[CCLD_MAX_CHANNELS] = {};
-    uint64_t dumpSend[CCLD_MAX_CHANNELS] = {};
-    uint64_t dumpRecv[CCLD_MAX_CHANNELS] = {};
-    uint64_t changesSend[CCLD_MAX_CHANNELS] = {};
-    uint64_t changesRecv[CCLD_MAX_CHANNELS] = {};
+    ChannelSample* channels = nullptr;
   };
   std::unique_ptr<Slot[]> slots;
+  std::unique_ptr<ChannelSample[]> samples;
   std::thread sampler;
   std::mutex mutex;
   std::condition_variable cv;
@@ -129,10 +128,14 @@ static CcldLogEvent ccldLogBase(CcldState* state, CcldLogType type,
   return event;
 }
 
+static void ccldWrite(CcldState* state, const CcldLogEvent* events, size_t count) {
+  if (state->logQueue != nullptr && state->logQueue->pushBatch(events, count)) return;
+  state->lastDroppedSeq.store(events[count - 1].seq, std::memory_order_relaxed);
+  state->logDrops.fetch_add(count, std::memory_order_release);
+}
+
 static void ccldWrite(CcldState* state, const CcldLogEvent& event) {
-  if (state->logQueue != nullptr && state->logQueue->push(event)) return;
-  state->lastDroppedSeq.store(event.seq, std::memory_order_relaxed);
-  state->logDrops.fetch_add(1, std::memory_order_release);
+  ccldWrite(state, &event, 1);
 }
 
 static void ccldWriter(CcldState* state) {
@@ -189,22 +192,24 @@ static void ccldSample(CcldState* state, unsigned index) {
   CcldBlock* block = ccldFrameBlock(state->frame, index, state->frameChannels, state->frameGroups);
   CcldChannel* channels = reinterpret_cast<CcldChannel*>(
       reinterpret_cast<unsigned char*>(block) + offsetof(CcldBlock, channel));
+  const CcldWaitChannel* waits = state->waitFrame == nullptr ? nullptr :
+      reinterpret_cast<const CcldWaitChannel*>(
+          reinterpret_cast<const unsigned char*>(state->waitFrame) + index * state->waitBlockBytes);
   for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) {
+    CcldState::ChannelSample& sample = slot.channels[channel];
     uint64_t send = 0, recv = 0;
     for (unsigned group = 0; group < state->frameGroups; ++group) {
       const CcldChannel& counts = channels[channel * state->frameGroups + group];
       send += ccldLoad(&counts.send);
       recv += ccldLoad(&counts.recv);
     }
-    if (send != slot.lastSend[channel]) ++slot.changesSend[channel];
-    if (recv != slot.lastRecv[channel]) ++slot.changesRecv[channel];
-    slot.lastSend[channel] = send;
-    slot.lastRecv[channel] = recv;
-    if (state->waitFrame != nullptr) {
-      const CcldWaitChannel* waits = reinterpret_cast<const CcldWaitChannel*>(
-          reinterpret_cast<const unsigned char*>(state->waitFrame) + index * state->waitBlockBytes);
+    if (send != sample.lastSend) ++sample.changesSend;
+    if (recv != sample.lastRecv) ++sample.changesRecv;
+    sample.lastSend = send;
+    sample.lastRecv = recv;
+    if (waits != nullptr) {
       ccldWaitTotals(waits + channel * state->frameGroups, state->frameGroups,
-                     &slot.waitData[channel], &slot.waitCredit[channel]);
+                     &sample.waitData, &sample.waitCredit);
     }
   }
 }
@@ -212,47 +217,53 @@ static void ccldSample(CcldState* state, unsigned index) {
 static void ccldEmit(CcldState* state, unsigned index, bool complete, uint64_t now) {
   CcldState::Slot& slot = state->slots[index];
   const uint64_t window = now > slot.lastDumpNs ? now - slot.lastDumpNs : 1;
-  CcldLogEvent event = ccldLogBase(state, complete ? CcldLogComplete : CcldLogSnapshot,
-                                   slot.seq, now);
-  event.startNs = slot.startNs;
-  event.windowNs = window;
-  event.count = slot.count;
-  event.bytes = slot.bytes;
-  event.nChannels = slot.channelHi - slot.channelLo + 1;
-  snprintf(event.op, sizeof(event.op), "%s", slot.op ? slot.op : "");
-  snprintf(event.algorithm, sizeof(event.algorithm), "%s", slot.algorithm ? slot.algorithm : "");
-  snprintf(event.protocol, sizeof(event.protocol), "%s", slot.protocol ? slot.protocol : "");
-  snprintf(event.datatype, sizeof(event.datatype), "%s", slot.datatype ? slot.datatype : "");
-  if (state->waitFrame != nullptr) {
-    CcldLogEvent wait = ccldLogBase(state, CcldLogRingWait, slot.seq, now);
-    wait.reserved = event.type;
-    wait.nChannels = event.nChannels;
-    snprintf(event.reason, sizeof(event.reason), "%s", "ring_wait_v1");
-    for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) {
-      CcldLogChannel& output = wait.channels[channel - slot.channelLo];
-      output.id = channel;
-      output.parent = slot.ringPrev[channel];
-      output.send = slot.waitData[channel];
-      output.recv = slot.waitCredit[channel];
-      output.sendChanges = static_cast<uint64_t>(slot.ringNext[channel]);
+  constexpr unsigned maxParts = (MAXCHANNELS + CCLD_RECORD_CHANNELS - 1) / CCLD_RECORD_CHANNELS;
+  CcldLogEvent records[2 * maxParts];
+  size_t recordCount = 0;
+  const auto type = complete ? CcldLogComplete : CcldLogSnapshot;
+  const unsigned channels = slot.channelHi - slot.channelLo + 1;
+  const unsigned parts = (channels + CCLD_RECORD_CHANNELS - 1) / CCLD_RECORD_CHANNELS;
+  for (unsigned part = 0; part < parts; ++part) {
+    CcldLogEvent* wait = state->waitFrame != nullptr ? &records[recordCount++] : nullptr;
+    CcldLogEvent& event = records[recordCount++];
+    event = ccldLogBase(state, type, slot.seq, now);
+    if (parts > 1) {
+      event.version = CCLD_FRAGMENT_VERSION;
+      event.reserved = (parts << 16) | (part << 8) | type;
     }
-    ccldWrite(state, wait);
+    event.startNs = slot.startNs;
+    event.windowNs = window;
+    event.count = slot.count;
+    event.bytes = slot.bytes;
+    const unsigned offset = part * CCLD_RECORD_CHANNELS;
+    event.nChannels = std::min(CCLD_RECORD_CHANNELS, channels - offset);
+    snprintf(event.op, sizeof(event.op), "%s", slot.op ? slot.op : "");
+    snprintf(event.algorithm, sizeof(event.algorithm), "%s", slot.algorithm ? slot.algorithm : "");
+    snprintf(event.protocol, sizeof(event.protocol), "%s", slot.protocol ? slot.protocol : "");
+    snprintf(event.datatype, sizeof(event.datatype), "%s", slot.datatype ? slot.datatype : "");
+    if (wait != nullptr) {
+      *wait = ccldLogBase(state, CcldLogRingWait, slot.seq, now);
+      wait->version = event.version;
+      wait->reserved = parts > 1 ? event.reserved : type;
+      wait->nChannels = event.nChannels;
+      snprintf(event.reason, sizeof(event.reason), "%s", "ring_wait_v1");
+    }
+    for (unsigned i = 0; i < event.nChannels; ++i) {
+      const unsigned channel = slot.channelLo + offset + i;
+      auto& sample = slot.channels[channel];
+      event.channels[i] = {static_cast<int32_t>(channel), sample.parent, sample.lastSend,
+          sample.lastRecv, sample.changesSend, sample.changesRecv,
+          sample.lastSend - sample.dumpSend, sample.lastRecv - sample.dumpRecv};
+      sample.dumpSend = sample.lastSend;
+      sample.dumpRecv = sample.lastRecv;
+      sample.changesSend = sample.changesRecv = 0;
+      if (wait != nullptr) {
+        wait->channels[i] = {static_cast<int32_t>(channel), sample.ringPrev,
+            sample.waitData, sample.waitCredit, static_cast<uint64_t>(sample.ringNext), 0, 0, 0};
+      }
+    }
   }
-  for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) {
-    CcldLogChannel& output = event.channels[channel - slot.channelLo];
-    output.id = channel;
-    output.parent = slot.parents[channel];
-    output.send = slot.lastSend[channel];
-    output.recv = slot.lastRecv[channel];
-    output.sendChanges = slot.changesSend[channel];
-    output.recvChanges = slot.changesRecv[channel];
-    output.sendDelta = slot.lastSend[channel] - slot.dumpSend[channel];
-    output.recvDelta = slot.lastRecv[channel] - slot.dumpRecv[channel];
-    slot.dumpSend[channel] = slot.lastSend[channel];
-    slot.dumpRecv[channel] = slot.lastRecv[channel];
-    slot.changesSend[channel] = slot.changesRecv[channel] = 0;
-  }
-  ccldWrite(state, event);
+  ccldWrite(state, records, recordCount);
   slot.lastDumpNs = now;
 }
 
@@ -334,7 +345,7 @@ void ccldInit(struct ncclComm* comm) {
     WARN("CCL-D RCCL prototype supports mode 1 only; telemetry disabled");
     return;
   }
-  if (comm->nChannels < 1 || comm->nChannels > CCLD_MAX_CHANNELS) {
+  if (comm->nChannels < 1 || comm->nChannels > MAXCHANNELS) {
     WARN("CCL-D channel count %d is outside the supported frame range", comm->nChannels);
     return;
   }
@@ -380,11 +391,15 @@ void ccldInit(struct ncclComm* comm) {
   state->frameBlocks = static_cast<unsigned>(ccldEnvNumber(
       "NCCL_CCLD_FRAME_BLOCKS", CCLD_BLOCKS, CCLD_BLOCKS, CCLD_MAX_BLOCKS));
   state->slots.reset(new (std::nothrow) CcldState::Slot[state->frameBlocks]);
-  if (!state->slots) {
+  state->samples.reset(new (std::nothrow)
+      CcldState::ChannelSample[state->frameBlocks * state->frameChannels]);
+  if (!state->slots || !state->samples) {
     WARN("CCL-D slot metadata allocation failed");
     delete state;
     return;
   }
+  for (unsigned i = 0; i < state->frameBlocks; ++i)
+    state->slots[i].channels = state->samples.get() + i * state->frameChannels;
   state->frameBytes = ccldFrameBytes(state->frameChannels, state->frameGroups, state->frameBlocks);
 
   hipError_t error = ccldMappedHostAlloc(&state->frameAllocation, state->frameBytes);
@@ -674,18 +689,12 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   slot.channelLo = static_cast<int>(descriptor.channelLo);
   slot.channelHi = static_cast<int>(descriptor.channelHi);
   for (int channel = slot.channelLo; channel <= slot.channelHi; ++channel) {
-    slot.parents[channel] = plan->ccldAlgorithm == NCCL_ALGO_TREE
+    auto& sample = slot.channels[channel];
+    sample = {};
+    sample.parent = plan->ccldAlgorithm == NCCL_ALGO_TREE
         ? comm->channels[channel].tree.up : -1;
-    slot.ringPrev[channel] = comm->channels[channel].ring.prev;
-    slot.ringNext[channel] = comm->channels[channel].ring.next;
-    slot.waitData[channel] = 0;
-    slot.waitCredit[channel] = 0;
-    slot.lastSend[channel] = 0;
-    slot.lastRecv[channel] = 0;
-    slot.dumpSend[channel] = 0;
-    slot.dumpRecv[channel] = 0;
-    slot.changesSend[channel] = 0;
-    slot.changesRecv[channel] = 0;
+    sample.ringPrev = comm->channels[channel].ring.prev;
+    sample.ringNext = comm->channels[channel].ring.next;
   }
   slot.lastDumpNs = slot.startNs;
   slot.done.store(false, std::memory_order_relaxed);

@@ -8,6 +8,11 @@ import signal
 import struct
 import time
 
+RECORD_CHANNELS = 32
+MAX_CHANNELS = 128
+FRAGMENT_VERSION = 2
+FRAGMENT_KINDS = (3, 4, 7)
+
 
 class Channel(ctypes.LittleEndianStructure):
     _fields_ = [('id', ctypes.c_int32), ('parent', ctypes.c_int32),
@@ -29,7 +34,7 @@ class Event(ctypes.LittleEndianStructure):
                 ('host', ctypes.c_char * 64), ('op', ctypes.c_char * 16),
                 ('algorithm', ctypes.c_char * 16), ('protocol', ctypes.c_char * 16),
                 ('datatype', ctypes.c_char * 16), ('reason', ctypes.c_char * 64),
-                ('channels', Channel * 32)]
+                ('channels', Channel * RECORD_CHANNELS)]
 
 
 RECORD_BYTES = 2088
@@ -105,9 +110,10 @@ def parse_event(raw):
     return Event.from_buffer_copy(raw)
 
 
-def decode_event(e, raw):
-    if (e.magic != 0x444c4343 or e.version != 1 or e.type not in KINDS or
-            e.nranks < 1 or e.rank >= e.nranks or e.nChannels > 32):
+def decode_event(e, raw, allow_fragment=False):
+    if (e.magic != 0x444c4343 or e.type not in KINDS or
+            (e.version != 1 and not (allow_fragment and e.version == FRAGMENT_VERSION and e.type in (3, 4))) or
+            e.nranks < 1 or e.rank >= e.nranks or e.nChannels > RECORD_CHANNELS):
         raise ValueError('invalid CCL-D binary header')
     result = {'event': KINDS[e.type], 'comm_hash': f'{e.hash:016x}', 'rank': e.rank,
               'world_size': e.nranks, 'mono_ns': e.nowNs, 'op_count': e.seq}
