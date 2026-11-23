@@ -37,7 +37,7 @@ class LlCounterHooksTest(unittest.TestCase):
     def test_async_writer_is_only_sink_for_telemetry(self):
         source = (ROOT / "src/misc/ccld.cc").read_text()
         log = source[source.index("static void ccldWrite"):source.index("static void ccldWriter")]
-        self.assertIn("logQueue->push(event)", log)
+        self.assertIn("logQueue->pushBatch(events, count)", log)
         self.assertNotIn("fwrite", log)
         self.assertIn("CcldQueue<CcldLogEvent>", source)
         self.assertIn("state->writer = std::thread(ccldWriter, state)", source)
