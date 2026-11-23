@@ -19,8 +19,9 @@ def _start_decoder():
 
 
 def _decode_events(records, indices):
+    view = memoryview(records)
     for offset, index in zip(range(0, len(records), RECORD_BYTES), indices):
-        event = _decoder.consume(records[offset:offset + RECORD_BYTES])
+        event = _decoder.consume(view[offset:offset + RECORD_BYTES])
         if event is not None:
             yield index, event
 
