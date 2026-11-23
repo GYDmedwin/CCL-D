@@ -12,6 +12,7 @@ RECORD_CHANNELS = 32
 MAX_CHANNELS = 128
 FRAGMENT_VERSION = 2
 FRAGMENT_KINDS = (3, 4, 7)
+OBSERVED_PROGRESS = 1 << 31
 
 
 class Channel(ctypes.LittleEndianStructure):
@@ -133,6 +134,11 @@ def decode_event(e, raw, allow_fragment=False):
         result.update(start_mono_ns=e.startNs, duration_ns=duration, op=text(e.op),
                       algorithm=text(e.algorithm), protocol=text(e.protocol), datatype=text(e.datatype),
                       count=e.count, bytes=e.bytes, n_channels=e.nChannels, channels=channels)
+        if e.mode & OBSERVED_PROGRESS:
+            first_progress = (e.frameChannels << 32) | e.frameBytes
+            if not e.startNs <= first_progress < e.nowNs:
+                raise ValueError('first progress is outside the observed operation')
+            result['first_progress_observed_mono_ns'] = first_progress
         if result['op'] == 'P2PAllPeers':
             result.update(pattern='p2p_all_peers', duration_scope=text(e.reason))
         if e.type == 4:

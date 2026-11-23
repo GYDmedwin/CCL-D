@@ -48,6 +48,20 @@ def fragments(channel_count, wait=False):
 
 
 class WaitDecoderTests(unittest.TestCase):
+    def test_progress_timestamp_requires_the_feature_flag_and_a_valid_interval(self):
+        progress = event(4)
+        progress.startNs = (1 << 32) + 20
+        progress.nowNs = progress.startNs + 500
+        progress.windowNs = 500
+        progress.frameBytes, progress.frameChannels = 300, 1
+        key = 'first_progress_observed_mono_ns'
+        self.assertNotIn(key, WaitDecoder().consume(bytes(progress)))
+        progress.mode = 1 << 31
+        self.assertEqual(WaitDecoder().consume(bytes(progress))[key], (1 << 32) + 300)
+        progress.frameBytes = 10
+        with self.assertRaisesRegex(ValueError, 'outside the observed operation'):
+            WaitDecoder().consume(bytes(progress))
+
     def test_wide_progress_requires_all_parts_and_preserves_wait_pairs(self):
         for count, waits in ((33, False), (65, True), (128, True)):
             with self.subTest(count=count, waits=waits):
