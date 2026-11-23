@@ -45,6 +45,10 @@ class DecisionTests(unittest.TestCase):
         out = analyze(entries[1:] + drops + following, self.cfg)
         self.assertEqual([(row['kind'], row['roots']) for row in out],
                          [('undetermined', []), ('undetermined', [])])
+        known = [entries[0], drops[0]] + [ev(rank, 'complete') for rank in (1, 2, 3)]
+        out = analyze(known + following, self.cfg)
+        self.assertEqual([(row['kind'], row['roots']) for row in out],
+                         [('skipped', []), ('H1', [3])])
 
     def test_h2_reports_completed_rank(self):
         rows = [ev(i, 'snapshot', duration=2000) for i in (0, 1, 2)]

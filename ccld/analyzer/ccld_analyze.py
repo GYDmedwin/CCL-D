@@ -113,32 +113,67 @@ def channel_parents(event: dict) -> dict[int, int]:
 
 
 SIGNATURE_FIELDS = ('op', 'count', 'datatype', 'algorithm', 'protocol')
+ENTRY_FIELDS = SIGNATURE_FIELDS[:3]
 GROUPED_PLAN_SKIP = 'multiple_collectives'
+RECOVERABLE_DROP_REASONS = {GROUPED_PLAN_SKIP, 'frame_slot_busy'}
 
 
-def grouped_skip(entry, dropped):
-    """Recognize the explicit group exclusion on this rank's recorded entry."""
-    if (dropped.get('reason') != GROUPED_PLAN_SKIP or entry is None or
+def acknowledged_exclusion(entry, dropped):
+    """Recognize a producer's explicit omission of one recorded operation."""
+    reason = dropped.get('reason')
+    if (reason not in RECOVERABLE_DROP_REASONS or entry is None or
             entry['event'] != 'entered' or dropped['mono_ns'] < entry['mono_ns']):
         return None
-    op, count, dtype = (entry.get(field) for field in SIGNATURE_FIELDS[:3])
+    op, count, dtype = (entry.get(field) for field in ENTRY_FIELDS)
     if (type(count) is not int or count < 0 or
             any(not isinstance(value, str) or not value for value in (op, dtype))):
         return None
-    return dict(entry, event='skipped', reason=GROUPED_PLAN_SKIP)
+    return dict(entry, event='skipped', reason=reason)
 
 
-def aligned_grouped_skip(states, world):
-    if set(states) != set(range(world)) or any(e is None or e['event'] != 'skipped' for e in states.values()):
-        return False
+def aligned_exclusion(states, world):
+    """Retire an incomplete operation only with consistent evidence from all ranks."""
+    if set(states) != set(range(world)) or any(e['event'] not in ('complete', 'skipped') for e in states.values()):
+        return None
+    reasons = {e['reason'] for e in states.values() if e['event'] == 'skipped'}
+    if len(reasons) != 1:
+        return None
+    reason = next(iter(reasons))
+    if reason == GROUPED_PLAN_SKIP and any(e['event'] != 'skipped' for e in states.values()):
+        return None
     first = states[0]
-    return all(all(e[k] == first[k] for k in SIGNATURE_FIELDS[:3]) for e in states.values())
+    if all(all(e.get(k) == first.get(k) for k in ENTRY_FIELDS) for e in states.values()):
+        return reason
+    return None
 
 
-def grouped_skip_report(comm, op):
-    item = result_common(comm, op, 'unsupported')
-    item.update(kind='skipped', roots=[], reason=GROUPED_PLAN_SKIP)
+def exclusion_report(comm, op, reason):
+    item = result_common(comm, op, 'unsupported' if reason == GROUPED_PLAN_SKIP else 'coverage')
+    item.update(kind='skipped', roots=[], reason=reason)
     return item
+
+
+def recorded_exclusion(records, dropped, world):
+    drops = {e['rank']: e for e in dropped}
+    if len(drops) != len(dropped) or not drops.keys() <= set(range(world)):
+        return None
+    by_rank = defaultdict(list)
+    for event in records:
+        by_rank[event['rank']].append(event)
+    states = {}
+    for rank in range(world):
+        evidence = by_rank.get(rank, [])
+        if rank in drops:
+            skipped = acknowledged_exclusion(evidence[0], drops[rank]) if len(evidence) == 1 else None
+            if skipped is None:
+                return None
+            states[rank] = skipped
+        else:
+            finished = [event for event in evidence if event['event'] == 'complete']
+            if len(finished) != 1:
+                return None
+            states[rank] = finished[0]
+    return aligned_exclusion(states, world)
 
 
 def operation_signature_partition(states: dict[int, dict], world_size: int,
@@ -400,12 +435,10 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
                 earliest_incomplete = op
             continue
         if op in dropped:
-            if len(records) == len(dropped[op]) == world:
-                entries = {e['rank']: e for e in records}
-                skipped = {e['rank']: grouped_skip(entries.get(e['rank']), e) for e in dropped[op]}
-                if aligned_grouped_skip(skipped, world):
-                    output.append(grouped_skip_report(comm, op))
-                    continue
+            reason = recorded_exclusion(records, dropped[op], world)
+            if reason:
+                output.append(exclusion_report(comm, op, reason))
+                continue
             item = result_common(comm, op, 'invalid')
             item.update(kind='undetermined', roots=[], reason='telemetry explicitly dropped',
                         dropped=[{'rank': e['rank'], 'reason': e.get('reason')} for e in dropped[op]])

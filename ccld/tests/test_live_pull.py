@@ -77,6 +77,21 @@ class LiveDecisionTests(unittest.TestCase):
         self.assertEqual([(r['category'], r['kind'], r['roots']) for r in reports],
                          [('collective_mismatch', 'H2', [2])])
 
+    def test_frame_busy_keeps_known_alignment_with_completed_peers(self):
+        results, decoder = [], WaitDecoder()
+        analysis = LiveAnalysis(Config(hang_s=.1), results.append)
+        for rank in range(2):
+            analysis.add(decoder.consume(event(1, rank, 0, 0)))
+            analysis.add(decoder.consume(event(2, rank, 1, 1_000)))
+        raw = Event.from_buffer_copy(event(6, 1, 1, 3_000))
+        raw.reason = b'frame_slot_busy'
+        analysis.add(decoder.consume(bytes(raw)))
+        analysis.add(decoder.consume(event(4, 0, 1, 5_000, 4_000)))
+        analysis.add(decoder.consume(event(3, 0, 2, 200_010_000, 200_000_000)))
+        analysis.evaluate()
+        self.assertEqual([(r['category'], r['kind'], r['roots']) for r in results],
+                         [('coverage', 'skipped', []), ('hang', 'H1', [1])])
+
     def test_same_host_linear_tree_reads_identity_from_initialization(self):
         for different_hosts in (False, True):
             with self.subTest(different_hosts=different_hosts):
