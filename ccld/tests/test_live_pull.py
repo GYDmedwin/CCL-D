@@ -30,7 +30,7 @@ def event(kind, rank, op, when, duration=0):
 
 class LiveDecisionTests(unittest.TestCase):
     def test_mixed_ring_requires_bracketed_waits_on_the_same_clock(self):
-        for reason in ('valid', 'other_host', 'missing_sample', 'counter_regressed'):
+        for reason in ('valid', 'fast_late_rank', 'pure_s1', 'other_host', 'missing_sample', 'counter_regressed'):
             with self.subTest(reason=reason):
                 cfg = Config(baseline_ms=1, repeats=1, window_s=.1, ring_wait_phases=True)
                 reports, traces = [], []
@@ -56,18 +56,22 @@ class LiveDecisionTests(unittest.TestCase):
                                                 and rank == 0 else 4)
                                 traces.append(dict(row, event='snapshot', mono_ns=stamp, duration_ns=stamp-t,
                                                    channels=[progress]))
-                        final = dict(channel, wait_credit_spins=200 if rank == 0 else 4)
-                        traces.append(dict(row, event='complete', mono_ns=t+12_000_000,
-                                           duration_ns=t+12_000_000-row['start_mono_ns'], channels=[final]))
+                        final = dict(channel, wait_credit_spins=200 if rank == 0 and reason != 'pure_s1' else 4)
+                        finish = t + (6_300_000 if rank == 2 and reason in ('fast_late_rank', 'pure_s1')
+                                      else 12_000_000)
+                        traces.append(dict(row, event='complete', mono_ns=finish,
+                                           duration_ns=finish-row['start_mono_ns'], channels=[final]))
                 for trace in traces:
                     analysis.add(trace)
                 analysis.evaluate()
                 for decisions in (reports, analyze(traces, cfg)):
                     decision = [e for e in decisions if e.get('category') == 'slow'][-1]
-                    if reason == 'valid':
+                    if reason in ('valid', 'fast_late_rank'):
                         self.assertEqual((decision['kind'], decision['compute_roots'], decision['communication_roots']),
                                          ('S3', [2], [1]))
                         self.assertEqual(decision['method'], 'post_entry_ring_wait')
+                    elif reason == 'pure_s1':
+                        self.assertEqual((decision['kind'], decision['roots']), ('S1', [2]))
                     else:
                         self.assertEqual((decision['kind'], decision['roots'], decision['communication_roots']),
                                          ('undetermined', [], []))

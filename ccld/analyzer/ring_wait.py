@@ -215,44 +215,53 @@ class RingWaitAttribution:
                 item['t_min_ms'] > item['t_base_ms'] * (1 + self.slow_threshold))
         if self.use_phases and kind == 'undetermined' and item['p'] >= self.alpha:
             mixed = True
-        if not (mixed or kind in ('S2', 'undetermined')):
+        verify_s1 = self.use_phases and kind == 'S1' and not mixed
+        if not (mixed or verify_s1 or kind in ('S2', 'undetermined')):
             self.rounds.clear()
             return item
-        phased = mixed and self.use_phases
+        phased = self.use_phases and (mixed or verify_s1)
         if phased != self.last_phase or (self.last_window is not None and window - self.last_window > 2) or (
                 self.rounds and self.rounds[-1][0] >= operation):
             self.rounds.clear()
         self.last_window = window
         self.last_phase = phased
         started = time.perf_counter_ns()
-        comp = item['compute_roots'] if mixed else []
+        comp = item['compute_roots'] if mixed or verify_s1 else []
         if phased:
             vote = None
             if boundaries is not None and comp == [boundaries[0]]:
-                try:
-                    vote = phase_vote(states, boundaries, self.gap)
-                except ValueError:
-                    pass
+                cutoff = states[comp[0]]['start_mono_ns']
+                tail_ns = statistics.median(e['mono_ns'] - cutoff for e in states.values())
+                # The early finish of the late rank can hide a slow tail on its peers.
+                if tail_ns > max(PHASE_ENTRY_GAP_NS, item['t_base_ms'] * 1e6):
+                    try:
+                        vote = phase_vote(states, boundaries, self.gap)
+                    except ValueError:
+                        pass
             self.rounds.append((operation, (tuple(comp), vote)))
         else:
             self.rounds.append((operation, states))
         if len(self.rounds) < 3:
+            if verify_s1:
+                return item
             return dict(item, kind='detected', roots=[], reason='waiting for three directional samples')
 
         if phased:
             votes = Counter(rank for _, (compute, rank) in self.rounds if rank is not None and compute == tuple(comp))
-            suspects = [rank for rank, support in votes.items() if support >= 2]
+            suspects = [rank for rank, support in votes.items() if support >= 2 and (not verify_s1 or rank == vote)]
         else:
             try:
                 suspects = decide(dict(self.rounds), self.gap, slow_confirmed=True)['candidate_ranks']
             except ValueError:
                 suspects = []
-        if len(suspects) != 1 or (mixed and suspects[0] in comp):
+        if len(suspects) != 1 or suspects[0] in comp:
+            if verify_s1:
+                return item
             return dict(item, kind='undetermined', roots=[], compute_roots=comp,
                         communication_roots=[], reason=('no consistent post-entry wait attribution' if phased
                                                         else 'no consistent directional wait attribution'))
         elapsed_ms = (time.perf_counter_ns() - started) / 1e6
-        return dict(item, kind='S3' if mixed else 'S2',
+        return dict(item, kind='S3' if mixed or phased else 'S2',
                     roots=sorted(set(comp + suspects)), communication_roots=suspects,
                     compute_roots=comp, method='post_entry_ring_wait' if phased else 'directional_ring_wait',
                     location_latency_ms=(item.get('location_latency_ms') or 0) + elapsed_ms)
