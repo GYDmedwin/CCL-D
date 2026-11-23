@@ -96,9 +96,15 @@ def main() -> int:
     parser.add_argument("paths", nargs="+", type=Path, help="decoded JSONL files or directories")
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument("--output", type=Path, help="write findings to this JSONL file")
+    parser.add_argument("--expect-rank", type=int, help="require a finding for this rank")
+    parser.add_argument("--expect-op-count", type=int, help="check the expected rank at this operation")
     args = parser.parse_args()
     if args.world_size < 2:
         parser.error("world-size must be at least 2")
+    if args.expect_rank is not None and not 0 <= args.expect_rank < args.world_size:
+        parser.error("expected rank must be within the communicator")
+    if args.expect_op_count is not None and (args.expect_rank is None or args.expect_op_count < 1):
+        parser.error("expected operation requires an expected rank and a positive count")
     try:
         rows = findings(args.paths, args.world_size)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -113,6 +119,13 @@ def main() -> int:
     print(json.dumps({"complete_operations_checked": "all full rank sets",
                       "mismatches_detected": len(rows),
                       "output": str(args.output) if args.output else "stdout"}), file=sys.stderr)
+    if args.expect_rank is not None and not any(
+        row["roots"] == [args.expect_rank]
+        and (args.expect_op_count is None or row["op_count"] == args.expect_op_count)
+        for row in rows
+    ):
+        print("missing expected completed-operation mismatch", file=sys.stderr)
+        return 1
     return 0
 
 

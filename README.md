@@ -2,6 +2,8 @@
 
 CCL-D-DCU 是 RCCL 上的集合通信诊断实现。它在通信过程中记录诊断事件，并复用 NCCL 版 CCL-D 的 decoder 和 analyzer 分析结果。
 
+此分支延续 niheartent 的 RCCL 移植和提交历史。 [RCCL 移植来源](https://github.com/niheartent/CCL-D-DCU/tree/486a4ced7fce37b41b6b60689d6c2143b34f0a28)
+
 ## 当前目标平台
 
 - GPU：BW1000，`gfx936`
@@ -28,10 +30,11 @@ cmake --build build-ccld-gfx936-fault -j
 
 ## 运行 Evaluation 5.1
 
-运行全部单节点场景：
+运行全部单节点场景前，先按拓扑、协议和消息大小标定等待阈值，再通过 `CCLD_WAIT_THRESHOLD` 传入。
 
 ```bash
-tools/tests/run_antccl_eval51_gfx936.sh --case all
+CCLD_WAIT_THRESHOLD="$CALIBRATED_WAIT_THRESHOLD" \
+  tools/tests/run_antccl_eval51_gfx936.sh --case all
 ```
 
 先运行一个例程，例如 H1（rank 2 暂停进入 collective）：
@@ -50,20 +53,21 @@ CCLD_RUN=/workspace/dcu/results/my-eval51 \
 双节点 8 rank/IB 验收命令：
 
 ```bash
-CCLD_TOPOLOGY=dual \
-  tools/tests/run_antccl_eval51_gfx936.sh --case all
+CCLD_WAIT_THRESHOLD="$CALIBRATED_WAIT_THRESHOLD" \
+  tools/tests/run_antccl_eval51_gfx936.sh --topology dual --case all
 ```
 
 双节点 runner 通过 SSH 启动 HPDPS-7，并检查两端 RCCL 日志中的 IB 记录。节点名解析或 SSH 未就绪时，该实验无法启动。
 
+`H2` 检查已经完成的 collective 是否在预期轮次出现 count 或 operation 不一致。`H2_SIM` 验证模拟 hang 的分类。`S2` 的统一入口验证 slow 检测，并输出候选 rank。需要核对根因时，可使用 `tools/tests/validate_ccld_s2_strict.py` 检查多轮等待得分。
+
 ## 依赖与结果
 
-验收入口使用 `/workspace/nv/CCL-D` 中的 decoder 和 analyzer。若参考源码在其他位置，可设置：
+验收入口、分析适配器和源码对照单测通过 `CCLD_NV_ROOT` 指定 NCCL 版 CCL-D 源码。默认目录为 `/workspace/nv/CCL-D`。本分支的参考版本为 NCCL 版 CCL-D 提交 `38e21d1`。
 
 ```bash
-CCLD_DECODER=/path/to/CCL-D/ccld/tools/decode_async_wait.py \
-CCLD_ANALYZER=/path/to/CCL-D/ccld/analyzer/ccld_analyze.py \
-  tools/tests/run_antccl_eval51_gfx936.sh --case H1
+export CCLD_NV_ROOT=/path/to/nccl-CCL-D
+tools/tests/run_antccl_eval51_gfx936.sh --case H1
 ```
 
 运行脚本会将结果写入仓库同级的 `results/` 目录。项目设计、移植索引和逐项验收记录保存在工作区 `/workspace/dcu/doc/`，其中 `当前进度与有效文档.md` 是文档索引。

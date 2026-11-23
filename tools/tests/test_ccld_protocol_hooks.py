@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
+import os
 import pathlib
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-NV = pathlib.Path("/workspace/nv/CCL-D")
+NV = pathlib.Path(os.environ.get("CCLD_NV_ROOT", "/workspace/nv/CCL-D"))
 
 
 class LlCounterHooksTest(unittest.TestCase):

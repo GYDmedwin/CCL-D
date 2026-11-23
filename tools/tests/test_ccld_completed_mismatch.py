@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -44,6 +45,39 @@ class CompletedMismatchTests(unittest.TestCase):
     def test_consistent_completed_operation_has_no_mismatch(self):
         rows = self.run_detector([event(rank, 262144) for rank in range(4)])
         self.assertEqual(rows, [])
+
+    def test_explicit_h2_expectation_fails_when_the_round_does_not_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / 'rank.jsonl'
+            rows = [event(rank, 261888 if rank == 2 else 262144) for rank in range(4)]
+            trace.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            command = ['python3', str(DETECTOR), str(trace), '--world-size', '4',
+                       '--expect-rank', '2', '--expect-op-count']
+            self.assertEqual(subprocess.run(command + ['4'], capture_output=True).returncode, 0)
+            rejected = subprocess.run(command + ['5'], capture_output=True, text=True)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn('missing expected', rejected.stderr)
+
+    def test_dual_command_line_selects_dual_matrix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tests = root / 'tools/tests'
+            tests.mkdir(parents=True)
+            entry = tests / EVAL51.name
+            entry.write_text(EVAL51.read_text())
+            for source, status in ((SINGLE, 17), (DUAL, 23)):
+                stub = tests / source.name
+                stub.write_text(f'#!/bin/sh\nexit {status}\n')
+                stub.chmod(0o755)
+            library = root / 'librccl.so'
+            library.touch()
+            env = dict(os.environ, CCLD_TOPOLOGY='single', RCCL_LIB=str(library),
+                       CCLD_RUN=str(root / 'result'))
+            result = subprocess.run(
+                ['bash', str(entry), '--topology', 'dual', '--case', 'H2'],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 23, result.stderr)
 
     def test_mismatch_detector_is_wired_into_decoded_matrix_runners(self):
         source = EVAL51.read_text()

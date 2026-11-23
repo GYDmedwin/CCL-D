@@ -2,11 +2,12 @@
 """Run NV CCL-D ring_wait scoring on platform traces without changing its rules."""
 import argparse
 import json
+import os
 import statistics
 import sys
 from pathlib import Path
 
-NV_ANALYZER = Path('/workspace/nv/CCL-D/ccld/analyzer')
+NV_ANALYZER = Path(os.environ.get('CCLD_NV_ROOT', '/workspace/nv/CCL-D')) / 'ccld/analyzer'
 sys.path.insert(0, str(NV_ANALYZER))
 from ring_wait import decide, graph_wait_scores  # noqa: E402
 

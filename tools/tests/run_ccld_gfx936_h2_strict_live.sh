@@ -2,8 +2,8 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 NODE_SCRIPT="$ROOT/tools/tests/run_ccld_gfx936_docker_node.sh"
-DECODER=${CCLD_DECODER:-/workspace/nv/CCL-D/ccld/tools/decode_async_wait.py}
-ANALYZER=${CCLD_ANALYZER:-/workspace/nv/CCL-D/ccld/analyzer/ccld_analyze.py}
+DECODER=${CCLD_DECODER:-${CCLD_NV_ROOT:-/workspace/nv/CCL-D}/ccld/tools/decode_async_wait.py}
+ANALYZER=${CCLD_ANALYZER:-${CCLD_NV_ROOT:-/workspace/nv/CCL-D}/ccld/analyzer/ccld_analyze.py}
 RCCL_BUILD_DIR=${RCCL_BUILD_DIR:-$ROOT/build-ccld-gfx936-fault}
 RCCL_LIB=${RCCL_LIB:-$RCCL_BUILD_DIR/librccl.so.1.0}
 RUN=${CCLD_RUN:-$ROOT/../results/ccld-h2-strict-live-$(date +%Y%m%d-%H%M%S)}

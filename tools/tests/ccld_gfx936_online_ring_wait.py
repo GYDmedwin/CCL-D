@@ -2,6 +2,7 @@
 """RCCL topology adapter for the NV CCL-D online Ring-wait decision."""
 import argparse
 import json
+import os
 import math
 from pathlib import Path
 import selectors
@@ -9,7 +10,7 @@ import signal
 import subprocess
 import sys
 
-NV_ANALYZER = Path('/workspace/nv/CCL-D/ccld/analyzer')
+NV_ANALYZER = Path(os.environ.get('CCLD_NV_ROOT', '/workspace/nv/CCL-D')) / 'ccld/analyzer'
 sys.path.insert(0, str(NV_ANALYZER))
 from ring_wait import decide  # noqa: E402
 

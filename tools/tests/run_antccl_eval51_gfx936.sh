@@ -4,7 +4,7 @@ set -euo pipefail
 # Single public entry point for the AntCCL Evaluation 5.1 fault experiments.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TESTS="$ROOT/tools/tests"
-DECODER=${CCLD_DECODER:-/workspace/nv/CCL-D/ccld/tools/decode_async_wait.py}
+DECODER=${CCLD_DECODER:-${CCLD_NV_ROOT:-/workspace/nv/CCL-D}/ccld/tools/decode_async_wait.py}
 TOPOLOGY=${CCLD_TOPOLOGY:-single}
 CASE=${CCLD_EVAL51_CASE:-all}
 RUN=${CCLD_RUN:-$ROOT/../results/antccl-eval51-${TOPOLOGY}-$(date +%Y%m%d-%H%M%S)}
@@ -14,16 +14,14 @@ RANK=${CCLD_FAULT_RANK:-2}
 PROTO=${CCLD_PROTO:-Simple}
 SINGLE_MATRIX="$ROOT/tools/tests/run_ccld_gfx936_docker_single_node_matrix.sh"
 DUAL_MATRIX="$ROOT/tools/tests/run_ccld_gfx936_docker_2node.sh"
-MATRIX_RUNNER=$SINGLE_MATRIX
-WORLD_SIZE=4
-if [[ "$TOPOLOGY" == dual ]]; then MATRIX_RUNNER=$DUAL_MATRIX; WORLD_SIZE=8; fi
 
 usage() {
   cat <<'EOF'
 Usage: run_antccl_eval51_gfx936.sh [--topology single|dual] [--case all|H1|H2|H2_SIM|H3|POST|S1|S2]
 
-Environment overrides: CCLD_RUN RCCL_BUILD_DIR RCCL_LIB CCLD_FAULT_RANK
-CCLD_S2_CYCLES CCLD_WAIT_THRESHOLD CCLD_BASELINE_MS CCLD_PROTO
+Environment overrides: CCLD_RUN RCCL_BUILD_DIR RCCL_LIB CCLD_NV_ROOT CCLD_FAULT_RANK
+CCLD_S2_CYCLES CCLD_BASELINE_MS CCLD_PROTO
+The S2 and all cases require CCLD_WAIT_THRESHOLD for the selected setup.
 EOF
 }
 
@@ -38,6 +36,15 @@ done
 [[ "$TOPOLOGY" == single || "$TOPOLOGY" == dual ]] || { echo "invalid topology: $TOPOLOGY" >&2; exit 2; }
 [[ "$CASE" == all || "$CASE" =~ ^(H1|H2|H2_SIM|H3|POST|S1|S2)$ ]] || { echo "invalid case: $CASE" >&2; exit 2; }
 [[ -f "$RCCL_LIB" ]] || { echo "RCCL library not found: $RCCL_LIB" >&2; exit 2; }
+if [[ "$CASE" == all || "$CASE" == S2 ]]; then
+  : "${CCLD_WAIT_THRESHOLD:?set CCLD_WAIT_THRESHOLD calibrated for topology/protocol}"
+fi
+MATRIX_RUNNER=$SINGLE_MATRIX
+WORLD_SIZE=4
+if [[ "$TOPOLOGY" == dual ]]; then
+  MATRIX_RUNNER=$DUAL_MATRIX
+  WORLD_SIZE=8
+fi
 mkdir -p "$RUN"
 export RCCL_BUILD_DIR RCCL_LIB CCLD_TOPOLOGY="$TOPOLOGY" CCLD_H1_RANK="$RANK"
 
@@ -61,6 +68,7 @@ run_one() {
       python3 "$DECODER" "$case_dir/bin" "$case_dir/jsonl"
       python3 "$TESTS/ccld_completed_mismatch.py" "$case_dir/jsonl" \
         --world-size "$WORLD_SIZE" \
+        --expect-rank "$RANK" --expect-op-count 4 \
         --output "$case_dir/completed-mismatches.jsonl"
       cat "$case_dir/completed-mismatches.jsonl"
       ;;
@@ -93,7 +101,6 @@ run_one() {
       CCLD_S1_RANK="$RANK" "$TESTS/run_ccld_gfx936_s1_strict_live.sh"
       ;;
     S2)
-      : "${CCLD_WAIT_THRESHOLD:?set CCLD_WAIT_THRESHOLD calibrated for topology/protocol}"
       local cycles=${CCLD_S2_CYCLES:-2300}
       [[ "$TOPOLOGY" == dual && -z "${CCLD_S2_CYCLES:-}" ]] && cycles=115000
       CCLD_PROTO="$PROTO" CCLD_S2_RANK="$RANK" \
