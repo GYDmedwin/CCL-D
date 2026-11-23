@@ -200,6 +200,17 @@ All three cases had complete event coverage. In the Ring case the H1
 report appeared 5.33 s after the injected-delay marker at a 5 s threshold.
 The injector and analyzer shared the same host clock for that observation.
 
+### Compact decoder training regression
+
+The compact decoder copies the record header and retains channel bytes
+for deferred decoding. A four-H100 run across two nodes executed eight
+FSDP training steps with one decoder process and repeated the run with
+four decoder processes. Both modes produced the same per-rank losses
+and 264 collective completion records (160 AllGather, 96 ReduceScatter,
+and eight AllReduce), with complete telemetry coverage. All 63 Linux
+unit tests passed. This is an online decoder regression on a short
+synthetic workload.
+
 ## Cross-domain H1 over memory pull
 
 Slurm job 16448 ran a PyTorch TP8×DP2 projection and gradient workload on

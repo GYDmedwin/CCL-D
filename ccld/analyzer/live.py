@@ -234,8 +234,9 @@ class LiveAnalysis:
         self.comms[comm].add(event)
 
     def receive(self, endpoint, records):
+        view = memoryview(records)
         for offset in range(0, len(records), RECORD_BYTES):
-            event = endpoint.decoder.consume(records[offset:offset + RECORD_BYTES])
+            event = endpoint.decoder.consume(view[offset:offset + RECORD_BYTES])
             if event is not None:
                 self.add(event)
 
