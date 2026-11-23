@@ -10,8 +10,8 @@ import signal
 import sys
 import time
 
-from .ccld_analyze import (add_decision_arguments, analyze_comm, barrier, decision_config,
-                           result_common, slow_decision, slow_groups)
+from .ccld_analyze import (add_decision_arguments, analyze_comm, barrier, completed_mismatch,
+                           decision_config, result_common, slow_decision, slow_groups)
 from .cross_domain import CrossDomainWaits
 from .ring_wait import RingWaitAttribution
 from .tree_s1_vote import CLASSIFIED, vote
@@ -34,7 +34,7 @@ class SlowWindow:
         self.baseline_sum = 0.
         self.baseline_ready = None
 
-    def add(self, op, states, world):
+    def add(self, op, states, world, rank_hosts=None):
         when = states[0]['mono_ns']
         if self.first is None:
             self.first = when
@@ -55,7 +55,7 @@ class SlowWindow:
                 self.baseline_sum += max(e['duration_ns'] for e in states.values()) / 1e6
             if self.baseline_count == self.cfg.baseline_rounds or when >= cutoff:
                 self.baseline_ready = min(when, cutoff)
-        groups, warnings = slow_groups(states, world)
+        groups, warnings = slow_groups(states, world, rank_hosts)
         if not groups:
             item = result_common(self.comm, op, 'coverage')
             item.update(kind='undetermined', roots=[], reason='slow comparison unavailable', warnings=warnings)
@@ -117,6 +117,7 @@ class Communicator:
     def __init__(self, comm, world, cfg, emit):
         self.comm, self.world, self.cfg, self.emit = comm, world, cfg, emit
         self.observed = {}
+        self.rank_hosts = {}
         self.ended = set()
         self.pending = defaultdict(dict)
         self.completed_by_time = []
@@ -145,6 +146,7 @@ class Communicator:
             if rank in self.observed:
                 self.mark_gap(op, 'duplicate rank stream for a communicator')
             self.observed[rank] = 0
+            self.rank_hosts[rank] = event.get('host')
         elif rank not in self.observed or rank in self.ended:
             self.mark_gap(op, 'event outside an initialized rank stream')
             return
@@ -197,7 +199,6 @@ class Communicator:
                 if allow_partial_hang:
                     self.diagnose_hang(states)
                 break
-            self.diagnose_hang(states)
             op = self.next_op
             self.next_op += 1
             del self.pending[op]
@@ -206,7 +207,13 @@ class Communicator:
                 self.mark_gap(op, 'rank-0 entry times were out of order')
                 return
             self.rank0_entry_ns = start
-            if not all(barrier(e) for e in states.values()):
+            if all(barrier(e) for e in states.values()):
+                continue
+            mismatch = completed_mismatch(self.comm, op, states, self.world)
+            if mismatch:
+                self.emit(mismatch)
+            else:
+                self.diagnose_hang(states)
                 heapq.heappush(self.completed_by_time, (states[0]['mono_ns'], op, states))
         # Sampling cyclic slots can observe a later op's completion first.
         # A future rank-0 completion cannot precede its own entry, and the
@@ -215,7 +222,7 @@ class Communicator:
         while self.completed_by_time and self.completed_by_time[0][0] <= watermark:
             _, op, states = heapq.heappop(self.completed_by_time)
             try:
-                self.window.add(op, states, self.world)
+                self.window.add(op, states, self.world, self.rank_hosts)
             except ValueError as exc:
                 self.mark_gap(op, str(exc))
                 break
@@ -352,7 +359,7 @@ def address(value):
 
 def emit(item):
     now = time.monotonic_ns()
-    if item.get('category') in ('hang', 'slow', 'cross_domain'):
+    if item.get('category') in ('hang', 'slow', 'cross_domain', 'collective_mismatch'):
         item = dict(item, observer_mono_ns=now, timing_note='analyzer local observation time')
     print(json.dumps(item, sort_keys=True), flush=True)
 

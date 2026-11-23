@@ -158,9 +158,8 @@ class RingWaitAttribution:
             suspects = []
         comp = item['compute_roots'] if mixed else []
         if len(suspects) != 1 or (mixed and suspects[0] in comp):
-            if kind == 'S1':
-                return item
-            return dict(item, kind='undetermined', roots=[], reason='no consistent directional wait attribution')
+            return dict(item, kind='undetermined', roots=[], compute_roots=comp,
+                        communication_roots=[], reason='no consistent directional wait attribution')
         elapsed_ms = (time.perf_counter_ns() - started) / 1e6
         return dict(item, kind='S3' if mixed else 'S2',
                     roots=sorted(set(comp + suspects)), communication_roots=suspects,

@@ -111,16 +111,19 @@ def channel_parents(event: dict) -> dict[int, int]:
     return {cid: channel.get('tree_parent') for cid, channel in channel_map(event).items()}
 
 
-def operation_signature_partition(states: dict[int, dict], world_size: int) -> dict:
-    """Separate inconsistent all-hung signatures only under a strict-majority assumption."""
+SIGNATURE_FIELDS = ('op', 'count', 'datatype', 'algorithm', 'protocol')
+
+
+def operation_signature_partition(states: dict[int, dict], world_size: int,
+                                  event_type: str = 'snapshot') -> dict:
+    """Attribute an inconsistent signature only when a strict majority agrees."""
     if set(states) != set(range(world_size)):
         return {'status': 'incomplete', 'groups': []}
     groups: dict[tuple, list[int]] = defaultdict(list)
     for rank in range(world_size):
         event = states[rank]
-        op, count, dtype, algorithm, protocol = (event.get(k) for k in
-                                                  ('op', 'count', 'datatype', 'algorithm', 'protocol'))
-        if (event.get('event') != 'snapshot' or type(count) is not int or count < 0 or
+        op, count, dtype, algorithm, protocol = (event.get(k) for k in SIGNATURE_FIELDS)
+        if (event.get('event') != event_type or type(count) is not int or count < 0 or
                 any(not isinstance(x, str) or not x.strip() for x in (op, dtype, algorithm, protocol))):
             return {'status': 'incomplete', 'groups': []}
         key = (op.strip().lower(), count, dtype.strip().lower(), algorithm.strip().lower(), protocol.strip().lower())
@@ -183,11 +186,12 @@ def comparable_groups(rank_events: dict[int, dict], world_size: int) -> tuple[li
     return groups, errors
 
 
-def slow_groups(states, world):
+def slow_groups(states, world, rank_hosts=None):
     groups, warnings = comparable_groups(states, world)
     if warnings != ['tree has no layer with at least two ranks'] or world < 3:
         return groups, warnings
-    hosts = {event.get('host') for event in states.values()}
+    rank_hosts = rank_hosts or {}
+    hosts = {rank_hosts.get(rank, event.get('host')) for rank, event in states.items()}
     if len(hosts) == 1 and all(hosts):
         return [('tree-chain', sorted(states), None)], []
     return groups, warnings
@@ -256,6 +260,28 @@ def result_common(comm: str, op_count: int | None, category: str) -> dict:
             'timing_note': 'offline input has no analyzer-side fault/arrival timestamps'}
 
 
+def completed_mismatch(comm, op, states, world):
+    """Check metadata disagreement even when every rank reports completion."""
+    first = states[0]
+    if all(event is first or all(event.get(k) == first.get(k) for k in SIGNATURE_FIELDS)
+           for event in states.values()):
+        return None
+    started = time.perf_counter_ns()
+    partition = operation_signature_partition(states, world, event_type='complete')
+    if partition['status'] not in ('minority', 'ambiguous'):
+        return None
+    item = result_common(comm, op, 'collective_mismatch')
+    item.update(kind='H2' if partition['status'] == 'minority' else 'undetermined',
+                roots=partition.get('minority_ranks', []),
+                operation_signature_groups=partition['groups'],
+                reason='all ranks reported completion with inconsistent operation signatures',
+                location_latency_ms=(time.perf_counter_ns() - started) / 1e6)
+    if partition['status'] == 'minority':
+        item['signature_majority_ranks'] = partition['majority_ranks']
+        item['signature_heuristic'] = 'strict_majority_assumed_correct'
+    return item
+
+
 def slow_decision(comm, op, states, label, window, members, cid, base, baseline, detections, cfg):
     durs = {r: states[r]['duration_ns'] / 1e6 for r in members}
     tmax, tmin = max(durs.values()), min(durs.values())
@@ -309,8 +335,11 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
     dropped: dict[int, list[dict]] = defaultdict(list)
     # Include init and heartbeat to distinguish an observed but lagging rank.
     history = defaultdict(list)
+    rank_hosts = {}
     for e in events:
         history[e['rank']].append(e)
+        if e['event'] == 'comm_init':
+            rank_hosts[e['rank']] = e.get('host')
         if e['event'] == 'dropped':
             dropped[e['op_count']].append(e)
         if e['event'] in ('entered', 'snapshot', 'complete'):
@@ -371,6 +400,10 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
         if not measured or is_barrier:
             continue
         if all_complete and blocked_by is None:
+            mismatch = completed_mismatch(comm, op, states, world)
+            if mismatch:
+                output.append(mismatch)
+                continue
             # Rank 0's local completion clock defines window boundaries.
             completed.append((op, states, states[0]['mono_ns']))
         long_events = [e for e in measured if e['duration_ns'] >= cfg.hang_s * 1e9]
@@ -402,7 +435,7 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
             # Preserve the per-rank operation metadata even when all ranks
             # hang and channel counts cannot be compared. This is evidence,
             # not an automatic classification or root-cause decision.
-            signatures = {r: [e.get(x) for x in ('op', 'count', 'datatype', 'algorithm', 'protocol')]
+            signatures = {r: [e.get(x) for x in SIGNATURE_FIELDS]
                           for r, e in states.items()}
             hang['operation_signatures'] = signatures
             # A completion after the hang threshold is not evidence that this
@@ -471,7 +504,7 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
     window_ns = max(1, int(cfg.window_s * 1e9))
     windows = defaultdict(list)
     for op, states, t in completed:
-        groups, errors = slow_groups(states, world)
+        groups, errors = slow_groups(states, world, rank_hosts)
         if not groups:
             item = result_common(comm, op, 'coverage')
             item.update(kind='undetermined', roots=[],

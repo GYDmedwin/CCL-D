@@ -42,6 +42,15 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual((out['kind'], out['roots']), ('H2', [3]))
         self.assertEqual(out['operation_signatures'][3][1], 255)
 
+    def test_completed_collective_reports_conflicting_counts(self):
+        majority = [ev(rank, 'complete', count=256) for rank in range(3)]
+        out = analyze(majority + [ev(3, 'complete', count=255)], self.cfg)
+        self.assertEqual([(e['category'], e['kind'], e['roots']) for e in out],
+                         [('collective_mismatch', 'H2', [3])])
+        majority[2]['count'] = 255
+        out = analyze(majority + [ev(3, 'complete', count=255)], self.cfg)
+        self.assertEqual([(e['kind'], e['roots']) for e in out], [('undetermined', [])])
+
     def test_later_h1_is_not_attributed_when_previous_round_is_hung(self):
         rows = [ev(i, 'snapshot', op=4, duration=2000) for i in (0, 1, 3)]
         rows.append(ev(2, 'complete', op=4, duration=500, count=64))
@@ -267,19 +276,20 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(out[-1]['t_base_ms'], 15)
 
     def test_linear_tree_uses_a_same_host_late_entry(self):
-        rows = []
+        inits = [ev(rank, 'comm_init', op=0, host='one-host') for rank in range(4)]
+        rows = list(inits)
         for op, entered in ((1, 1_000_000_000), (2, 3_000_000_000)):
             completed = entered + 62_000_000
             for rank in range(4):
                 start = entered + (60_000_000 if rank == 2 else 0)
                 rows.append(ev(rank, 'complete', op=op, t=completed,
                                duration=(completed - start) / 1e6, algorithm='Tree',
-                               host='one-host', start_mono_ns=start,
+                               start_mono_ns=start,
                                channels=[{'id': 0, 'tree_parent': rank-1}]))
         reports = analyze(rows, self.cfg)
         self.assertEqual([(r['kind'], r['roots']) for r in reports if r['kind'] == 'S1'], [('S1', [2])])
         self.assertTrue(any(r.get('method') == 'same_host_tree_entry_gap' for r in reports))
-        for row in rows:
+        for row in inits:
             row['host'] = f"node-{row['rank'] // 2}"
         self.assertFalse(any(r['kind'] == 'S1' for r in analyze(rows, self.cfg)))
 

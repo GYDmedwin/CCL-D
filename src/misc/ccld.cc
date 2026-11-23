@@ -680,6 +680,12 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
     slot.ringNext[channel] = comm->channels[channel].ring.next;
     slot.waitData[channel] = 0;
     slot.waitCredit[channel] = 0;
+    slot.lastSend[channel] = 0;
+    slot.lastRecv[channel] = 0;
+    slot.dumpSend[channel] = 0;
+    slot.dumpRecv[channel] = 0;
+    slot.changesSend[channel] = 0;
+    slot.changesRecv[channel] = 0;
   }
   slot.lastDumpNs = slot.startNs;
   slot.done.store(false, std::memory_order_relaxed);

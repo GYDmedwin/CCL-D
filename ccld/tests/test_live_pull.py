@@ -29,6 +29,45 @@ def event(kind, rank, op, when, duration=0):
 
 
 class LiveDecisionTests(unittest.TestCase):
+    def test_completed_collective_reports_a_minority_signature(self):
+        reports, decoder = [], WaitDecoder()
+        analysis = LiveAnalysis(Config(), reports.append)
+        for rank in range(4):
+            raw = Event.from_buffer_copy(event(1, rank, 0, 0))
+            raw.nranks = 4
+            analysis.add(decoder.consume(bytes(raw)))
+        for rank in range(4):
+            raw = Event.from_buffer_copy(event(4, rank, 1, 200, 100))
+            raw.nranks = 4
+            if rank == 2:
+                raw.count -= 4
+            analysis.add(decoder.consume(bytes(raw)))
+        analysis.evaluate()
+        self.assertEqual([(r['category'], r['kind'], r['roots']) for r in reports],
+                         [('collective_mismatch', 'H2', [2])])
+
+    def test_same_host_linear_tree_reads_identity_from_initialization(self):
+        for different_hosts in (False, True):
+            with self.subTest(different_hosts=different_hosts):
+                reports, decoder = [], WaitDecoder()
+                analysis = LiveAnalysis(Config(baseline_ms=1., repeats=1, window_s=.1),
+                                        reports.append)
+                for rank in range(4):
+                    raw = Event.from_buffer_copy(event(1, rank, 0, 0))
+                    raw.nranks = 4
+                    raw.host = f'host-{rank if different_hosts else 0}'.encode()
+                    analysis.add(decoder.consume(bytes(raw)))
+                for op in range(1, 4):
+                    for rank in range(4):
+                        duration = 2 if rank == 2 or op != 1 else 60
+                        raw = Event.from_buffer_copy(event(4, rank, op, op * 200_000_000,
+                                                          duration * 1_000_000))
+                        raw.nranks, raw.algorithm, raw.channels[0].parent = 4, b'TREE', rank - 1
+                        analysis.add(decoder.consume(bytes(raw)))
+                    analysis.evaluate()
+                diagnoses = [(r['kind'], r['roots']) for r in reports if r['category'] == 'slow']
+                self.assertEqual(diagnoses, [] if different_hosts else [('S1', [2])])
+
     def tree_states(self, op, durations):
         states = {}
         decoder = WaitDecoder(defer_channels=True)
