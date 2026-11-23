@@ -28,6 +28,8 @@ cmake --build build-ccld-gfx936 -j
 
 `CCLD_FAULT_INJECTION=ON` 启用 H3/S2 实验的故障注入。在独立的 `build-ccld-gfx936-fault` 目录构建该版本。验收脚本支持用 `RCCL_BUILD_DIR` 和 `RCCL_LIB` 指定库。
 
+开发时可用 [实测的定向构建配置](RESULTS.md#复跑通信基准) 通过 `ONLY_FUNCS` 只编译这轮要验证的设备函数。FSDP 的定向构建还要包含所用的 BF16 归约与其他实际操作。每种工具链、函数集和故障注入开关各用固定的节点本地构建目录。修改 C++ 后用 `cmake --build` 增量构建，并核对需要更新的库已重新链接。修改 Python 分析器或启动脚本时可继续使用已验证的库。Slurm 上可以单独提交 CPU 构建作业，把构建产物放到训练节点可访问的位置供 GPU 作业复用。
+
 ## 随训练在线运行
 
 在所有节点代理和分析器的环境中设置相同的 `CCLD_PULL_TOKEN`，可用 `openssl rand -hex 32` 生成。各训练节点先启动一个代理，`TRAIN_NODE_ADDR` 是分析主机可访问的作业网地址。

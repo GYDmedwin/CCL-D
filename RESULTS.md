@@ -2,6 +2,21 @@
 
 实测使用 RCCL 2.22.3-1、DTK 26.04（HIP 6.3.26045）、gfx936 BW1000、CMake 3.22.1 和 PyTorch 2.7.1。RCCL 移植来源为 `486a4ce`，原版开销对照使用同一 RCCL 版本的基线 `2939c54`。故障矩阵与通信基准使用定向编译的设备函数，训练使用覆盖 BF16 AllReduce、AllGather 和 ReduceScatter 等操作的定向构建。诊断实验用本分支自带的节点代理和分析器。 [原始移植](https://github.com/niheartent/CCL-D-DCU/tree/486a4ced7fce37b41b6b60689d6c2143b34f0a28)
 
+默认禁用故障注入的 gfx936 完整库在 20 CPU 的构建作业中成功生成，`ONLY_FUNCS` 留空，耗时 27 分钟。全库的四卡 Ring/Tree × Simple/LL AllReduce 和 Ring/Simple、Ring/LL 的 AllGather/ReduceScatter 数值及解码检查通过，合计 64 条完成记录，未观察到采集缺口。
+
+## 构建耗时
+
+构建发生在主机 CPU 上。完整编译中大部分时间耗在 gfx936 设备代码链接。用 12 CPU 在节点本地目录单独测量了定向构建。
+
+| 构建动作 | 实测墙钟时间 |
+|---|---:|
+| 完整 gfx936 库，20 CPU | 27 分 18 秒 |
+| 定向构建，配置加编译和链接 | 54.21 秒 |
+| 定向构建，修改一个主机端探针源文件后重编和链接 | 12.69 秒 |
+| 定向构建，未变更源码后再次执行构建 | 0.31 秒 |
+
+定向构建的时间适用于下文的函数集。改动设备公共头文件会影响更多编译单元。日常 C++ 验证用固定的定向构建目录，发布验证再构建完整库。纯分析器修改可直接复用已验证的库，并从二进制记录回放。
+
 ## 诊断准确度
 
 单节点四卡，每种配置五次，覆盖四个注入 rank。主矩阵使用 FP32 AllReduce 和 512 KiB 数据。H1 让一个 rank 延迟 1.2 s 入场，H2 让一个 rank 少调用 256 个 FP32 元素，H3 用 `clock64` 限时停顿模拟设备卡死。S1 单独延迟入场 18 ms，S2 在 send 路径注入 120 万周期的限时延迟。S3 同时让一个 rank 延迟入场 6 ms，并在另一个 rank 注入 S2。
@@ -31,7 +46,7 @@ S2 原规则在 256 KiB 检出 5/5，定位正确 0/5。对 Ring 的实际前驱
 
 - 四卡数值和记录验证覆盖 Ring/Simple、Ring/LL、Tree/Simple、Tree/LL 的 AllReduce，以及 Ring/Simple 和 Ring/LL 的 AllGather、ReduceScatter。
 - 2+2 BW1000 的实际跨节点日志确认使用 InfiniBand。在 4 rank 的 Ring 和 Tree 健康实验中，聚合各收齐 48 个完成记录。Ring H1 在第 4 轮定位到 rank 2，故障恢复后收齐 48 条完成记录。分析器运行于其中一个训练节点。
-- 8+8 BW1000 复测同样走 InfiniBand。Ring/Tree × Simple/LL 的四组健康 AllReduce 各收齐 208 条完成记录，数值都正确。Ring/Simple 的 H1 将延迟 1.2 s 的 rank 12 定位为根因，并在恢复后收齐 128 条记录。Ring/Simple 和 Tree/Simple 各一次 S1 注入，均定位到 rank 12，两个配置各报告八个有效窗口。短窗口的 Ring/Simple 健康对照在第二轮报了一次 S1，该轮仍使用初始基线。
+- 8+8 BW1000 复测同样走 InfiniBand。Ring/Tree × Simple/LL 的四组健康 AllReduce 各收齐 208 条完成记录，所有 rank 通过末轮数值校验。Ring/Simple 的 H1 将延迟 1.2 s 的 rank 12 定位为根因，并在恢复后收齐 128 条记录。Ring/Simple 和 Tree/Simple 各一次 S1 注入，均定位到 rank 12，两个配置各报告八个有效窗口。短窗口的 Ring/Simple 健康对照在第二轮报了一次 S1，该轮仍使用初始基线。
 - 同一 communicator 每次提交两个 collective 的压力场景曾导致后续单 collective 缺失。回收所有未跟踪任务的挂起元数据后，132 组成组调用之后的三个单 collective 都得到四个 rank 的完成记录。组内 collective 仍显式标为未覆盖。
 - 32 帧、80 轮的 AllReduce 对照，旧库在循环复用后的 3,072 个 channel 增量全部与本轮计数不符。槽位准备时清零主机采样历史后，6 种有探针的配置中 86,016 个复用增量全部正确。
 - `ncclAllToAll` 走 P2P 的数值校验通过。当前仅出现 communicator 生命周期记录。该路径的诊断覆盖仍有缺口。
@@ -91,6 +106,8 @@ NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_CCLD_ENABLE=1 \
 新版用四组开关对照和三次训练中 S1 注入复测。分析器使用四个解码进程、合并同批中被完成记录覆盖的进度事件，拉取周期 25 ms。跳过前 416 个符合比较条件的完成操作，动态基线为其后 60 轮，slow 窗 0.5 s。四次健康开启组的确定告警为 0，三次出现待确认 slow。三个注入分别在 rank 2、0、3 的第 48–73 步入场前延迟 60 ms，三次全部正确定位，注入至首条正确结果中位数 799 ms。七次开启组都收齐每次 9,992 条记录，所有 11 次的各 rank loss 曲线保持一致。
 
 新版对照的开启 P50 配对中位数 +4.83%，四对范围 −0.45% 至 +6.67%。全训练循环 +2.92%，四 rank CPU 累计 +3.53%。分析器协调进程与四个解码进程共用约 4.04 CPU 秒/次的中位数，节点代理的 CPU 未计入该数字。两轮对照在不同节点，采样和分析参数均应与工作负载一并记录。
+
+gfx936 完整库另完成一次四卡、30 步开关对照。每 rank 的 loss 逐步一致，开启组收齐 3,128 条完成记录、无覆盖缺口，出现一条待确认 slow。
 
 ## 与 NCCL / H100 的差异和可采取的措施
 
