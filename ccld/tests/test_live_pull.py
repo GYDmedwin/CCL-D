@@ -29,6 +29,37 @@ def event(kind, rank, op, when, duration=0):
 
 
 class LiveDecisionTests(unittest.TestCase):
+    def test_grouped_exclusion_retires_only_after_all_ranks_agree(self):
+        for peer in ('matching', 'different_count', 'complete', 'missing'):
+            with self.subTest(peer=peer):
+                reports, decoder = [], WaitDecoder()
+                analysis = LiveAnalysis(Config(hang_s=.1), reports.append)
+                for rank in range(2):
+                    analysis.add(decoder.consume(event(1, rank, 0, 0)))
+                    entered = Event.from_buffer_copy(event(2, rank, 1, 1_000))
+                    if rank == 1 and peer == 'different_count':
+                        entered.count += 64
+                    analysis.add(decoder.consume(bytes(entered)))
+                for rank in range(2):
+                    if rank == 1 and peer in ('complete', 'missing'):
+                        if peer == 'complete':
+                            analysis.add(decoder.consume(event(4, 1, 1, 5_000, 4_000)))
+                        continue
+                    dropped = Event.from_buffer_copy(event(6, rank, 1, 3_000))
+                    dropped.reason = b'multiple_collectives'
+                    analysis.add(decoder.consume(bytes(dropped)))
+                    if rank == 0:
+                        analysis.evaluate()
+                        self.assertFalse(reports)
+                analysis.add(decoder.consume(event(3, 0, 2, 200_010_000, 200_000_000)))
+                analysis.evaluate()
+                self.assertEqual([(r['category'], r['kind'], r['roots']) for r in reports], {
+                    'matching': [('unsupported', 'skipped', []), ('hang', 'H1', [1])],
+                    'different_count': [('coverage_gap', 'undetermined', [])],
+                    'complete': [('coverage_gap', 'undetermined', [])],
+                    'missing': [],
+                }[peer])
+
     def test_completed_collective_reports_a_minority_signature(self):
         reports, decoder = [], WaitDecoder()
         analysis = LiveAnalysis(Config(slow_warmup_ops=100), reports.append)

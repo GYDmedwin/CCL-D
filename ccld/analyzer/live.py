@@ -10,8 +10,9 @@ import signal
 import sys
 import time
 
-from .ccld_analyze import (add_decision_arguments, analyze_comm, barrier, completed_mismatch,
-                           decision_config, result_common, slow_decision, slow_groups)
+from .ccld_analyze import (add_decision_arguments, aligned_grouped_skip, analyze_comm, barrier,
+                           completed_mismatch, decision_config, grouped_skip, grouped_skip_report,
+                           result_common, slow_decision, slow_groups)
 from .cross_domain import CrossDomainWaits
 from .ring_wait import RingWaitAttribution
 from .tree_s1_vote import CLASSIFIED, vote
@@ -159,7 +160,14 @@ class Communicator:
         self.observed[rank] = max(self.observed[rank], op)
         if self.gap:
             return
-        if kind in ('dropped', 'coverage_gap'):
+        if kind == 'dropped':
+            states = self.pending.get(op)
+            skipped = grouped_skip(states.get(rank) if states is not None else None, event)
+            if skipped is not None:
+                states[rank] = skipped
+                return
+            self.mark_gap(op, event.get('reason', 'missing telemetry'))
+        elif kind == 'coverage_gap':
             self.mark_gap(op, event.get('reason', 'missing telemetry'))
         elif kind in ('entered', 'snapshot', 'complete'):
             if op < self.next_op:
@@ -167,6 +175,9 @@ class Communicator:
                 return
             states = self.pending[op]
             previous = states.get(rank)
+            if previous is not None and previous['event'] == 'skipped':
+                self.mark_gap(op, 'progress after an explicit grouped skip')
+                return
             if (previous is None or kind == 'complete' or
                     (previous['event'] != 'complete' and event['mono_ns'] >= previous['mono_ns'])):
                 states[rank] = event
@@ -199,18 +210,26 @@ class Communicator:
         if self.gap:
             return
         while (states := self.pending.get(self.next_op)) is not None:
-            if len(states) != self.world or any(e['event'] != 'complete' for e in states.values()):
-                if allow_partial_hang:
+            kinds = {e['event'] for e in states.values()}
+            if len(states) != self.world or not kinds <= {'complete', 'skipped'}:
+                if allow_partial_hang and 'skipped' not in kinds:
                     self.diagnose_hang(states)
                 break
             op = self.next_op
+            skipped = 'skipped' in kinds
+            if skipped and not aligned_grouped_skip(states, self.world):
+                self.mark_gap(op, 'grouped exclusions did not align across ranks')
+                return
             self.next_op += 1
             del self.pending[op]
-            start = states[0]['start_mono_ns']
+            start = states[0]['mono_ns' if skipped else 'start_mono_ns']
             if start < self.rank0_entry_ns:
                 self.mark_gap(op, 'rank-0 entry times were out of order')
                 return
             self.rank0_entry_ns = start
+            if skipped:
+                self.emit(grouped_skip_report(self.comm, op))
+                continue
             if all(barrier(e) for e in states.values()):
                 continue
             mismatch = completed_mismatch(self.comm, op, states, self.world)

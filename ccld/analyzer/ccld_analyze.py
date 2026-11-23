@@ -113,6 +113,32 @@ def channel_parents(event: dict) -> dict[int, int]:
 
 
 SIGNATURE_FIELDS = ('op', 'count', 'datatype', 'algorithm', 'protocol')
+GROUPED_PLAN_SKIP = 'multiple_collectives'
+
+
+def grouped_skip(entry, dropped):
+    """Recognize the explicit group exclusion on this rank's recorded entry."""
+    if (dropped.get('reason') != GROUPED_PLAN_SKIP or entry is None or
+            entry['event'] != 'entered' or dropped['mono_ns'] < entry['mono_ns']):
+        return None
+    op, count, dtype = (entry.get(field) for field in SIGNATURE_FIELDS[:3])
+    if (type(count) is not int or count < 0 or
+            any(not isinstance(value, str) or not value for value in (op, dtype))):
+        return None
+    return dict(entry, event='skipped', reason=GROUPED_PLAN_SKIP)
+
+
+def aligned_grouped_skip(states, world):
+    if set(states) != set(range(world)) or any(e is None or e['event'] != 'skipped' for e in states.values()):
+        return False
+    first = states[0]
+    return all(all(e[k] == first[k] for k in SIGNATURE_FIELDS[:3]) for e in states.values())
+
+
+def grouped_skip_report(comm, op):
+    item = result_common(comm, op, 'unsupported')
+    item.update(kind='skipped', roots=[], reason=GROUPED_PLAN_SKIP)
+    return item
 
 
 def operation_signature_partition(states: dict[int, dict], world_size: int,
@@ -362,7 +388,8 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
                            'reason': event.get('reason', 'untraced activity')})
     completed: list[tuple[int, dict[int, dict], int]] = []
     earliest_incomplete = None
-    for op, records in sorted(by_op.items()):
+    for op in sorted(by_op.keys() | dropped.keys()):
+        records = by_op.get(op, [])
         if gap_boundaries and op > min(gap_boundaries):
             item = result_common(comm, op, 'invalid')
             item.update(kind='undetermined', roots=[],
@@ -373,6 +400,12 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
                 earliest_incomplete = op
             continue
         if op in dropped:
+            if len(records) == len(dropped[op]) == world:
+                entries = {e['rank']: e for e in records}
+                skipped = {e['rank']: grouped_skip(entries.get(e['rank']), e) for e in dropped[op]}
+                if aligned_grouped_skip(skipped, world):
+                    output.append(grouped_skip_report(comm, op))
+                    continue
             item = result_common(comm, op, 'invalid')
             item.update(kind='undetermined', roots=[], reason='telemetry explicitly dropped',
                         dropped=[{'rank': e['rank'], 'reason': e.get('reason')} for e in dropped[op]])

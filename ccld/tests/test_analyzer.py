@@ -35,6 +35,17 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual((out[0]['kind'], out[0]['roots']), ('H1', [3]))
         self.assertEqual(analyze(rows[:-1], self.cfg)[0]['kind'], 'undetermined')
 
+    def test_offline_group_exclusions_preserve_later_coverage(self):
+        entries = [ev(rank, 'entered') for rank in range(4)]
+        drops = [ev(rank, 'dropped', reason='multiple_collectives') for rank in range(4)]
+        following = [ev(rank, 'snapshot', op=2, duration=2000) for rank in (0, 1, 2)]
+        out = analyze(entries + drops + following, self.cfg)
+        self.assertEqual([(row['kind'], row['roots']) for row in out], [('skipped', []), ('H1', [3])])
+        drops[0]['reason'] = 'frame_slot_busy'
+        out = analyze(entries[1:] + drops + following, self.cfg)
+        self.assertEqual([(row['kind'], row['roots']) for row in out],
+                         [('undetermined', []), ('undetermined', [])])
+
     def test_h2_reports_completed_rank(self):
         rows = [ev(i, 'snapshot', duration=2000) for i in (0, 1, 2)]
         rows.append(ev(3, 'complete', duration=500, count=255))
