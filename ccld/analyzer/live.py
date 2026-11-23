@@ -28,6 +28,7 @@ class SlowWindow:
         self.winners = {}
         self.detections = Counter()
         self.ring_wait = RingWaitAttribution(cfg.ring_wait_gap, cfg.slow_threshold)
+        self.warmup_ops = cfg.slow_warmup_ops
         self.skip = cfg.baseline_skip
         self.baseline_first = None
         self.baseline_count = 0
@@ -35,6 +36,9 @@ class SlowWindow:
         self.baseline_ready = None
 
     def add(self, op, states, world, rank_hosts=None):
+        if self.warmup_ops:
+            self.warmup_ops -= 1
+            return
         when = states[0]['mono_ns']
         if self.first is None:
             self.first = when

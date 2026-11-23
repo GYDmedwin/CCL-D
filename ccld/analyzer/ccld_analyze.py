@@ -38,6 +38,7 @@ class Config:
     flush_last_window: bool = False
     baseline_skip: int = 0
     ring_wait_gap: float = 0.2
+    slow_warmup_ops: int = 0
 
 
 def load_records(paths: list[Path], allow_partial: bool = False) -> tuple[list[dict], list[str]]:
@@ -485,6 +486,8 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
 
     # Windows use rank 0's monotonically increasing local timestamps only.
     completed.sort(key=lambda x: x[2])
+    if cfg.slow_warmup_ops:
+        completed = completed[cfg.slow_warmup_ops:]
     if not completed:
         return output
     first_ns = completed[0][2]
@@ -602,6 +605,8 @@ def add_decision_arguments(p):
     p.add_argument('--beta', type=float, default=.6)
     p.add_argument('--baseline-rounds', type=int, default=100)
     p.add_argument('--baseline-skip', type=int, default=0, help='exclude initial warmup rounds from dynamic baseline')
+    p.add_argument('--slow-warmup-ops', type=int, default=0,
+                   help='skip these initial completed operations per communicator for slow analysis')
     p.add_argument('--baseline-s', type=float, default=120)
     p.add_argument('--rate-metric', choices=('paper', 'delta'), default='paper')
     p.add_argument('--ring-wait-gap', type=float, default=0.2,
@@ -612,12 +617,12 @@ def decision_config(p, args, flush_last_window=False):
     if (any(not math.isfinite(x) or x <= 0 for x in
             (args.hang_s, args.window_s, args.baseline_ms, args.baseline_s, args.ring_wait_gap)) or
             not math.isfinite(args.slow_threshold) or args.slow_threshold < 0 or
-            args.repeats < 1 or args.baseline_rounds < 1 or args.baseline_skip < 0 or
+            args.repeats < 1 or args.baseline_rounds < 1 or args.baseline_skip < 0 or args.slow_warmup_ops < 0 or
             not (0 <= args.alpha < args.beta <= 1)):
         p.error('durations, baseline and counts must be positive; require 0 <= alpha < beta <= 1')
     return Config(args.hang_s, args.window_s, args.baseline_ms, args.slow_threshold,
                   args.repeats, args.alpha, args.beta, args.baseline_rounds, args.baseline_s,
-                  args.rate_metric, flush_last_window, args.baseline_skip, args.ring_wait_gap)
+                  args.rate_metric, flush_last_window, args.baseline_skip, args.ring_wait_gap, args.slow_warmup_ops)
 
 
 def main() -> int:

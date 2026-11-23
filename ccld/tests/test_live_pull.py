@@ -31,7 +31,7 @@ def event(kind, rank, op, when, duration=0):
 class LiveDecisionTests(unittest.TestCase):
     def test_completed_collective_reports_a_minority_signature(self):
         reports, decoder = [], WaitDecoder()
-        analysis = LiveAnalysis(Config(), reports.append)
+        analysis = LiveAnalysis(Config(slow_warmup_ops=100), reports.append)
         for rank in range(4):
             raw = Event.from_buffer_copy(event(1, rank, 0, 0))
             raw.nranks = 4
@@ -169,6 +169,28 @@ class LiveDecisionTests(unittest.TestCase):
                                    for r in items if r['category'] == 'slow']
         self.assertEqual(signature(results), [(3, 'detected', [], 'dynamic'), (4, 'S1', [1], 'dynamic')])
         self.assertEqual(signature(results), signature(analyze(history, cfg)))
+
+    def test_slow_warmup_excludes_startup_and_preserves_later_diagnoses(self):
+        cfg = Config(window_s=.1, baseline_rounds=1, baseline_ms=1.,
+                     repeats=1, slow_warmup_ops=2)
+        reports, history = [], []
+        analysis, decoder = LiveAnalysis(cfg, reports.append), WaitDecoder()
+        for rank in range(2):
+            analysis.add(decoder.consume(event(1, rank, 0, 0)))
+        for op, durations in enumerate(((16, 1), (1, 22), (1, 1), (15, 2), (1, 1)), 1):
+            for rank, duration in enumerate(durations):
+                record = decoder.consume(event(4, rank, op, op * 200_000_000,
+                                               duration * 1_000_000))
+                history.append(record)
+                analysis.add(record)
+            analysis.evaluate()
+        for rank in range(2):
+            analysis.add(decoder.consume(event(8, rank, 5, 1_002_000_000)))
+        analysis.evaluate()
+        result = lambda rows: [(r['op_count'], r['kind'], r['roots'], r['baseline'])
+                               for r in rows if r['category'] == 'slow']
+        self.assertEqual(result(reports), [(4, 'S1', [1], 'dynamic')])
+        self.assertEqual(result(analyze(history, cfg)), result(reports))
 
     def test_completed_prefix_retires_while_backlogged_and_tolerates_slot_order(self):
         cfg = Config(window_s=.05, baseline_ms=1., baseline_rounds=100, repeats=1)
