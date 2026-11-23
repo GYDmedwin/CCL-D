@@ -3,6 +3,7 @@ import asyncio
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from functools import partial
 import multiprocessing
 import struct
 
@@ -29,7 +30,7 @@ def _decode(records, indices):
     return list(_decode_events(records, indices)), {}
 
 
-def _decode_coalesced(records, indices):
+def _decode_coalesced(records, indices, keep_wait_snapshots=False):
     """Retain progress updates until the same rank and operation completes."""
     pending = {}
     updates = []
@@ -43,7 +44,10 @@ def _decode_coalesced(records, indices):
             continue
         if kind == 'complete':
             earlier = pending.get(stream, {}).pop(key, ())
-            if earlier:
+            if earlier and keep_wait_snapshots and any(
+                    prev['event'] == 'snapshot' and prev.get('wait_probe') is True for _, prev in earlier):
+                updates.extend(earlier)
+            elif earlier:
                 # The coordinator evaluates only after the whole batch. Keep
                 # the first position so the pending-operation limit sees the
                 # same operation creation order.
@@ -72,6 +76,8 @@ class ParallelAnalysis(LiveAnalysis):
         self.context = multiprocessing.get_context('spawn')
         self.workers = workers
         self.decode = _decode_coalesced if coalesce_completed else _decode
+        if coalesce_completed and cfg.ring_wait_phases:
+            self.decode = partial(_decode_coalesced, keep_wait_snapshots=True)
         self.coalesced = Counter()
         # Each shard always uses the same process. A Ring-wait pair may span
         # batches, so the worker must retain its decoder between calls.

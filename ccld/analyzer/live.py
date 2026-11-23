@@ -1,7 +1,7 @@
 """Pull CCL-D events from training nodes and diagnose collectives in memory."""
 import argparse
 import asyncio
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 import heapq
 import json
@@ -59,6 +59,8 @@ class SlowWindow(SlowWindows):
 
 class Communicator:
     MAX_PENDING = 2048
+    MAX_PHASE_OPERATIONS = 16
+    MAX_PHASE_SNAPSHOTS = 32
 
     def __init__(self, comm, world, cfg, emit):
         self.comm, self.world, self.cfg, self.emit = comm, world, cfg, emit
@@ -66,6 +68,7 @@ class Communicator:
         self.rank_hosts = {}
         self.ended = set()
         self.pending = defaultdict(dict)
+        self.phase_samples = OrderedDict() if cfg.ring_wait_phases else None
         self.completed_by_time = []
         self.rank0_entry_ns = 0
         self.next_op = 1
@@ -78,6 +81,8 @@ class Communicator:
             return
         self.gap = True
         self.pending.clear()
+        if self.phase_samples is not None:
+            self.phase_samples.clear()
         self.completed_by_time.clear()
         self.window.profiles.clear()
         self.emit({'category': 'coverage_gap', 'kind': 'undetermined', 'roots': [],
@@ -122,6 +127,12 @@ class Communicator:
             if (previous is None or kind == 'complete' or
                     (previous['event'] != 'complete' and event['mono_ns'] >= previous['mono_ns'])):
                 states[rank] = event
+            if self.phase_samples is not None and kind == 'snapshot' and event.get('wait_probe') is True:
+                if op not in self.phase_samples and len(self.phase_samples) == self.MAX_PHASE_OPERATIONS:
+                    self.phase_samples.popitem(last=False)
+                samples = self.phase_samples.setdefault(op, {})
+                self.phase_samples.move_to_end(op)
+                samples.setdefault(rank, deque(maxlen=self.MAX_PHASE_SNAPSHOTS)).append(event)
             if len(self.pending) + len(self.completed_by_time) > self.MAX_PENDING:
                 self.mark_gap(op, 'too many operations waiting for complete rank coverage')
 
@@ -185,8 +196,9 @@ class Communicator:
         watermark = math.inf if len(self.ended) == self.world else self.rank0_entry_ns
         while self.completed_by_time and self.completed_by_time[0][0] <= watermark:
             _, op, states = heapq.heappop(self.completed_by_time)
+            snapshots = self.phase_samples.pop(op, None) if self.phase_samples is not None else None
             try:
-                self.window.add(op, states, self.world, self.rank_hosts)
+                self.window.add(op, states, self.world, self.rank_hosts, snapshots)
             except ValueError as exc:
                 self.mark_gap(op, str(exc))
                 break

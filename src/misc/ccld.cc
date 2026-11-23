@@ -375,7 +375,7 @@ void ccldInit(struct ncclComm* comm) {
   state->device = comm->cudaDev;
   gethostname(state->host, sizeof(state->host) - 1);
   state->pollUs = ccldEnvNumber("NCCL_CCLD_POLL_US", 200, 20, 1000000);
-  state->dumpNs = ccldEnvNumber("NCCL_CCLD_DUMP_MS", 1000, 10, 60000) * 1000000ull;
+  state->dumpNs = ccldEnvNumber("NCCL_CCLD_DUMP_MS", 1000, 1, 60000) * 1000000ull;
   const char* completion = ncclGetEnv("NCCL_CCLD_COMPLETION");
   state->useEvent = completion == nullptr || strcmp(completion, "hostfunc") != 0;
 #ifdef CCLD_FAULT_INJECTION

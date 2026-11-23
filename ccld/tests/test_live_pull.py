@@ -29,6 +29,49 @@ def event(kind, rank, op, when, duration=0):
 
 
 class LiveDecisionTests(unittest.TestCase):
+    def test_mixed_ring_requires_bracketed_waits_on_the_same_clock(self):
+        for reason in ('valid', 'other_host', 'missing_sample', 'counter_regressed'):
+            with self.subTest(reason=reason):
+                cfg = Config(baseline_ms=1, repeats=1, window_s=.1, ring_wait_phases=True)
+                reports, traces = [], []
+                analysis = LiveAnalysis(cfg, reports.append)
+                for rank in range(4):
+                    traces.append(dict(event='comm_init', comm_hash='fixture', world_size=4, rank=rank,
+                                       op_count=0, mono_ns=1, host='different' if reason == 'other_host'
+                                       and rank == 3 else 'host'))
+                for op in range(1, 6):
+                    t = op * 100_000_000
+                    for rank in range(4):
+                        row = dict(comm_hash='fixture', op_count=op, world_size=4, rank=rank,
+                                   op='AllReduce', count=4096, bytes=16384, datatype='float32',
+                                   algorithm='Ring', protocol='Simple', wait_probe=True,
+                                   start_mono_ns=t + (5_000_000 if rank == 2 else 0))
+                        channel = dict(id=0, ring_prev=(rank-1) % 4, ring_next=(rank+1) % 4,
+                                       wait_data_spins=4, wait_credit_spins=4)
+                        if rank != 2:
+                            for stamp in (t+4_500_000, t+5_500_000):
+                                if reason == 'missing_sample' and rank == 3 and stamp < t+5_000_000:
+                                    continue
+                                progress = dict(channel, wait_credit_spins=500 if reason == 'counter_regressed'
+                                                and rank == 0 else 4)
+                                traces.append(dict(row, event='snapshot', mono_ns=stamp, duration_ns=stamp-t,
+                                                   channels=[progress]))
+                        final = dict(channel, wait_credit_spins=200 if rank == 0 else 4)
+                        traces.append(dict(row, event='complete', mono_ns=t+12_000_000,
+                                           duration_ns=t+12_000_000-row['start_mono_ns'], channels=[final]))
+                for trace in traces:
+                    analysis.add(trace)
+                analysis.evaluate()
+                for decisions in (reports, analyze(traces, cfg)):
+                    decision = [e for e in decisions if e.get('category') == 'slow'][-1]
+                    if reason == 'valid':
+                        self.assertEqual((decision['kind'], decision['compute_roots'], decision['communication_roots']),
+                                         ('S3', [2], [1]))
+                        self.assertEqual(decision['method'], 'post_entry_ring_wait')
+                    else:
+                        self.assertEqual((decision['kind'], decision['roots'], decision['communication_roots']),
+                                         ('undetermined', [], []))
+
     def test_grouped_exclusion_retires_only_after_all_ranks_agree(self):
         for peer in ('matching', 'different_count', 'complete', 'missing'):
             with self.subTest(peer=peer):

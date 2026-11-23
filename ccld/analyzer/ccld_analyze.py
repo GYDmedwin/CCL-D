@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
-    from .ring_wait import RingWaitAttribution
+    from .ring_wait import RingWaitAttribution, phase_boundaries
 else:
-    from ring_wait import RingWaitAttribution
+    from ring_wait import RingWaitAttribution, phase_boundaries
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,7 @@ class Config:
     ring_wait_gap: float = 0.2
     slow_warmup_ops: int = 0
     baseline_scope: str = 'communicator'
+    ring_wait_phases: bool = False
 
 
 def load_records(paths: list[Path], allow_partial: bool = False) -> tuple[list[dict], list[str]]:
@@ -444,7 +445,7 @@ class SlowProfile:
         self.total_ms = 0.
         self.winners = {}
         self.detections = defaultdict(int)
-        self.ring_wait = RingWaitAttribution(cfg.ring_wait_gap, cfg.slow_threshold)
+        self.ring_wait = RingWaitAttribution(cfg.ring_wait_gap, cfg.slow_threshold, cfg.ring_wait_phases, cfg.alpha)
 
     def observe(self, when, states, cfg):
         if self.skip:
@@ -476,7 +477,7 @@ class SlowWindows:
         self.warmup_ops = cfg.slow_warmup_ops
         self.profiles = OrderedDict()
 
-    def add(self, op, states, world, rank_hosts=None):
+    def add(self, op, states, world, rank_hosts=None, snapshots=None):
         if self.warmup_ops:
             self.warmup_ops -= 1
             return
@@ -513,15 +514,16 @@ class SlowWindows:
             durations = [states[r]['duration_ns'] for r in members]
             score = max(durations) - min(durations), -op
             if label not in profile.winners or score > profile.winners[label][0]:
-                profile.winners[label] = score, op, states, members, channel, base, source
+                bounds = phase_boundaries(states, snapshots, rank_hosts or {}) if label == 'ring' and snapshots else None
+                profile.winners[label] = score, op, states, members, channel, base, source, bounds
 
     def decisions(self):
         for key, profile in sorted(self.profiles.items()):
-            for label, (_, op, states, members, channel, base, source) in sorted(profile.winners.items()):
+            for label, (_, op, states, members, channel, base, source, bounds) in sorted(profile.winners.items()):
                 item = slow_decision(self.comm, op, states, label, self.window, members, channel,
                                      base, source, profile.detections, self.cfg)
                 if label == 'ring':
-                    item = profile.ring_wait.refine(item, states, op, self.window)
+                    item = profile.ring_wait.refine(item, states, op, self.window, bounds)
                 if item:
                     if key:
                         item['operation_profile'] = dict(zip(PROFILE_FIELDS, key))
@@ -697,7 +699,13 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
 
     slow = SlowWindows(comm, cfg, output.append)
     for op, states, _ in sorted(completed, key=lambda x: x[2]):
-        slow.add(op, states, world, rank_hosts)
+        snapshots = None
+        if cfg.ring_wait_phases and states[0].get('wait_probe') is True:
+            snapshots = defaultdict(list)
+            for event in by_op[op]:
+                if event['event'] == 'snapshot' and event.get('wait_probe') is True:
+                    snapshots[event['rank']].append(event)
+        slow.add(op, states, world, rank_hosts, snapshots)
     if cfg.flush_last_window:
         slow.flush()
     return output
@@ -779,6 +787,8 @@ def add_decision_arguments(p):
     p.add_argument('--rate-metric', choices=('paper', 'delta'), default='paper')
     p.add_argument('--ring-wait-gap', type=float, default=0.2,
                    help='minimum normalized directional wait score gap')
+    p.add_argument('--ring-wait-phases', action='store_true',
+                   help='require same-host post-entry wait snapshots for mixed Ring slowdown')
 
 
 def decision_config(p, args, flush_last_window=False):
@@ -791,7 +801,7 @@ def decision_config(p, args, flush_last_window=False):
     return Config(args.hang_s, args.window_s, args.baseline_ms, args.slow_threshold,
                   args.repeats, args.alpha, args.beta, args.baseline_rounds, args.baseline_s,
                   args.rate_metric, flush_last_window, args.baseline_skip, args.ring_wait_gap,
-                  args.slow_warmup_ops, args.baseline_scope)
+                  args.slow_warmup_ops, args.baseline_scope, args.ring_wait_phases)
 
 
 def main() -> int:
