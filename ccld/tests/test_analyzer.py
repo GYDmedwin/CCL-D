@@ -290,6 +290,23 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(out[-1]['baseline'], 'dynamic')
         self.assertEqual(out[-1]['t_base_ms'], 15)
 
+    def test_signature_baselines_ignore_healthy_large_ops_and_keep_small_fault(self):
+        from dataclasses import replace
+        events = []
+        rounds = [(1024, (1, 1, 1, 1)), (1 << 20, (20, 20, 20, 20)),
+                  (1024, (20, 20, 1, 20)), (1 << 20, (20, 20, 20, 20))]
+        for op, (count, durations) in enumerate(rounds, 1):
+            events.extend(ev(rank, 'complete', op=op, t=op * 100_000_000,
+                             count=count, duration=duration)
+                          for rank, duration in enumerate(durations))
+        old = Config(baseline_rounds=1, baseline_ms=1, window_s=.08,
+                     repeats=1, flush_last_window=True)
+        self.assertTrue(any(r['op_count'] == 4 and r['category'] == 'slow'
+                            for r in analyze(events, old)))
+        qualified = analyze(events, replace(old, baseline_scope='signature'))
+        self.assertEqual([(x['op_count'], x['kind'], x['roots']) for x in qualified if x['category'] == 'slow'],
+                         [(3, 'S1', [2])])
+
     def test_linear_tree_uses_a_same_host_late_entry(self):
         inits = [ev(rank, 'comm_init', op=0, host='one-host') for rank in range(4)]
         rows = list(inits)

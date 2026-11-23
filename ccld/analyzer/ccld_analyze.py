@@ -12,7 +12,7 @@ import math
 import socket
 import sys
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +39,7 @@ class Config:
     baseline_skip: int = 0
     ring_wait_gap: float = 0.2
     slow_warmup_ops: int = 0
+    baseline_scope: str = 'communicator'
 
 
 def load_records(paths: list[Path], allow_partial: bool = False) -> tuple[list[dict], list[str]]:
@@ -388,6 +389,119 @@ def slow_decision(comm, op, states, label, window, members, cid, base, baseline,
     return item
 
 
+PROFILE_FIELDS = ('op', 'count', 'datatype', 'algorithm', 'protocol', 'n_channels')
+
+
+def operation_profile(event):
+    count = event.get('count')
+    channels = event.get('n_channels')
+    if channels is None:
+        channels = len(event.get('channels') or ())
+    names = tuple(event.get(field) for field in ('op', 'datatype', 'algorithm', 'protocol'))
+    if (type(count) is not int or count < 0 or type(channels) is not int or channels < 1 or
+            any(not isinstance(name, str) or not name.strip() for name in names)):
+        return None
+    op, datatype, algorithm, protocol = (name.strip().lower() for name in names)
+    return op, count, datatype, algorithm, protocol, channels
+
+
+class SlowProfile:
+    def __init__(self, cfg):
+        self.skip = cfg.baseline_skip
+        self.first = self.ready = None
+        self.count = 0
+        self.total_ms = 0.
+        self.winners = {}
+        self.detections = defaultdict(int)
+        self.ring_wait = RingWaitAttribution(cfg.ring_wait_gap, cfg.slow_threshold)
+
+    def observe(self, when, states, cfg):
+        if self.skip:
+            self.skip -= 1
+        elif self.ready is None:
+            if self.first is None:
+                self.first = when
+            cutoff = self.first + int(cfg.baseline_s * 1e9)
+            if when <= cutoff:
+                self.count += 1
+                self.total_ms += max(e['duration_ns'] for e in states.values()) / 1e6
+            if self.count == cfg.baseline_rounds or when >= cutoff:
+                self.ready = min(when, cutoff)
+        if self.total_ms and self.ready is not None and when > self.ready:
+            return self.total_ms / self.count, 'dynamic'
+        return cfg.baseline_ms, 'initial'
+
+
+class SlowWindows:
+    """Use rank 0's clock to select a worst round for each comparable group."""
+
+    MAX_PROFILES = 128
+
+    def __init__(self, comm, cfg, emit):
+        self.comm, self.cfg, self.emit = comm, cfg, emit
+        self.first = None
+        self.window = 0
+        self.window_ns = max(1, int(cfg.window_s * 1e9))
+        self.warmup_ops = cfg.slow_warmup_ops
+        self.profiles = OrderedDict()
+
+    def add(self, op, states, world, rank_hosts=None):
+        if self.warmup_ops:
+            self.warmup_ops -= 1
+            return
+        when = states[0]['mono_ns']
+        if self.first is None:
+            self.first = when
+        window = (when - self.first) // self.window_ns
+        if window < self.window:
+            raise ValueError('a rank-0 completion arrived after its slow window closed')
+        if window > self.window:
+            self.flush()
+            self.window = window
+        key = operation_profile(states[0]) if self.cfg.baseline_scope == 'signature' else ()
+        if key is None:
+            return
+        profile = self.profiles.get(key)
+        if profile is None:
+            if len(self.profiles) == self.MAX_PROFILES:
+                self.profiles.popitem(last=False)
+            profile = self.profiles[key] = SlowProfile(self.cfg)
+        else:
+            self.profiles.move_to_end(key)
+        base, source = profile.observe(when, states, self.cfg)
+        if key and source == 'initial':
+            return
+        groups, warnings = slow_groups(states, world, rank_hosts)
+        if not groups:
+            item = result_common(self.comm, op, 'coverage')
+            item.update(kind='undetermined', roots=[], reason='slow comparison unavailable', warnings=warnings)
+            self.emit(item)
+        for label, members, channel in groups:
+            if len(members) < 2:
+                continue
+            durations = [states[r]['duration_ns'] for r in members]
+            score = max(durations) - min(durations), -op
+            if label not in profile.winners or score > profile.winners[label][0]:
+                profile.winners[label] = score, op, states, members, channel, base, source
+
+    def decisions(self):
+        for key, profile in sorted(self.profiles.items()):
+            for label, (_, op, states, members, channel, base, source) in sorted(profile.winners.items()):
+                item = slow_decision(self.comm, op, states, label, self.window, members, channel,
+                                     base, source, profile.detections, self.cfg)
+                if label == 'ring':
+                    item = profile.ring_wait.refine(item, states, op, self.window)
+                if item:
+                    if key:
+                        item['operation_profile'] = dict(zip(PROFILE_FIELDS, key))
+                    yield key, label, states, item
+            profile.winners.clear()
+
+    def flush(self):
+        for _, _, _, item in self.decisions():
+            self.emit(item)
+
+
 def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
     sizes = {e['world_size'] for e in events}
     if len(sizes) != 1:
@@ -550,56 +664,11 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
         hang['location_latency_ms'] = (time.perf_counter_ns() - locate_start) / 1e6
         output.append(hang)
 
-    # Windows use rank 0's monotonically increasing local timestamps only.
-    completed.sort(key=lambda x: x[2])
-    if cfg.slow_warmup_ops:
-        completed = completed[cfg.slow_warmup_ops:]
-    if not completed:
-        return output
-    first_ns = completed[0][2]
-    baseline_values = []
-    baseline_history = completed[cfg.baseline_skip:]
-    baseline_first_ns = baseline_history[0][2] if baseline_history else None
-    for _, states, t in baseline_history:
-        if len(baseline_values) >= cfg.baseline_rounds or t - baseline_first_ns > cfg.baseline_s * 1e9:
-            break
-        baseline_values.append(max(e['duration_ns'] for e in states.values()) / 1e6)
-    baseline_ready_ns = None
-    if len(baseline_values) == cfg.baseline_rounds:
-        baseline_ready_ns = baseline_history[cfg.baseline_rounds-1][2]
-    elif baseline_first_ns is not None and completed[-1][2] - baseline_first_ns >= cfg.baseline_s * 1e9 and baseline_values:
-        baseline_ready_ns = baseline_first_ns + int(cfg.baseline_s * 1e9)
-    dynamic_base = sum(baseline_values) / len(baseline_values) if baseline_values else None
-    window_ns = max(1, int(cfg.window_s * 1e9))
-    windows = defaultdict(list)
-    for op, states, t in completed:
-        groups, errors = slow_groups(states, world, rank_hosts)
-        if not groups:
-            item = result_common(comm, op, 'coverage')
-            item.update(kind='undetermined', roots=[],
-                        reason='slow comparison unavailable', warnings=errors)
-            output.append(item)
-            continue
-        for label, members, cid in groups:
-            if len(members) < 2:
-                continue
-            times = [states[r]['duration_ns'] / 1e6 for r in members]
-            windows[((t-first_ns)//window_ns, label)].append((max(times)-min(times), op, states, members, cid, t))
-    detections = defaultdict(int)
-    ring_wait = RingWaitAttribution(cfg.ring_wait_gap, cfg.slow_threshold)
-    last_ns = completed[-1][2]
-    for (window, label), entries in sorted(windows.items()):
-        end_ns = first_ns + (window+1)*window_ns
-        if end_ns > last_ns and not cfg.flush_last_window:
-            continue
-        _, op, states, members, cid, t = max(entries, key=lambda x: (x[0], -x[1]))
-        base = dynamic_base if baseline_ready_ns is not None and t > baseline_ready_ns else cfg.baseline_ms
-        baseline = 'dynamic' if base == dynamic_base and baseline_ready_ns is not None and t > baseline_ready_ns else 'initial'
-        item = slow_decision(comm, op, states, label, window, members, cid, base, baseline, detections, cfg)
-        if label == 'ring':
-            item = ring_wait.refine(item, states, op, window)
-        if item:
-            output.append(item)
+    slow = SlowWindows(comm, cfg, output.append)
+    for op, states, _ in sorted(completed, key=lambda x: x[2]):
+        slow.add(op, states, world, rank_hosts)
+    if cfg.flush_last_window:
+        slow.flush()
     return output
 
 
@@ -674,6 +743,8 @@ def add_decision_arguments(p):
     p.add_argument('--slow-warmup-ops', type=int, default=0,
                    help='skip these initial completed operations per communicator for slow analysis')
     p.add_argument('--baseline-s', type=float, default=120)
+    p.add_argument('--baseline-scope', choices=('communicator', 'signature'), default='communicator',
+                   help='learn independently by operation signature and wait for each baseline')
     p.add_argument('--rate-metric', choices=('paper', 'delta'), default='paper')
     p.add_argument('--ring-wait-gap', type=float, default=0.2,
                    help='minimum normalized directional wait score gap')
@@ -688,7 +759,8 @@ def decision_config(p, args, flush_last_window=False):
         p.error('durations, baseline and counts must be positive; require 0 <= alpha < beta <= 1')
     return Config(args.hang_s, args.window_s, args.baseline_ms, args.slow_threshold,
                   args.repeats, args.alpha, args.beta, args.baseline_rounds, args.baseline_s,
-                  args.rate_metric, flush_last_window, args.baseline_skip, args.ring_wait_gap, args.slow_warmup_ops)
+                  args.rate_metric, flush_last_window, args.baseline_skip, args.ring_wait_gap,
+                  args.slow_warmup_ops, args.baseline_scope)
 
 
 def main() -> int:

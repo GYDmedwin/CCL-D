@@ -12,87 +12,28 @@ import time
 
 from .ccld_analyze import (acknowledged_exclusion, add_decision_arguments, aligned_exclusion, analyze_comm, barrier,
                            completed_mismatch, decision_config, exclusion_report,
-                           result_common, slow_decision, slow_groups)
+                           result_common, SlowWindows)
 from .cross_domain import CrossDomainWaits
-from .ring_wait import RingWaitAttribution
 from .tree_s1_vote import CLASSIFIED, vote
 from ..tools.decode_async_wait import RECORD_BYTES, WaitDecoder
 from ..tools.live_transport import job_token, pull
 
 
-class SlowWindow:
-    def __init__(self, comm, cfg, emit):
-        self.comm, self.cfg, self.emit = comm, cfg, emit
-        self.first = None
-        self.window = 0
-        self.window_ns = max(1, int(cfg.window_s * 1e9))
-        self.winners = {}
-        self.detections = Counter()
-        self.ring_wait = RingWaitAttribution(cfg.ring_wait_gap, cfg.slow_threshold)
-        self.warmup_ops = cfg.slow_warmup_ops
-        self.skip = cfg.baseline_skip
-        self.baseline_first = None
-        self.baseline_count = 0
-        self.baseline_sum = 0.
-        self.baseline_ready = None
-
-    def add(self, op, states, world, rank_hosts=None):
-        if self.warmup_ops:
-            self.warmup_ops -= 1
-            return
-        when = states[0]['mono_ns']
-        if self.first is None:
-            self.first = when
-        window = (when - self.first) // self.window_ns
-        if window < self.window:
-            raise ValueError('a rank-0 completion arrived after its slow window closed')
-        if window > self.window:
-            self.flush()
-            self.window = window
-        if self.skip:
-            self.skip -= 1
-        elif self.baseline_ready is None:
-            if self.baseline_first is None:
-                self.baseline_first = when
-            cutoff = self.baseline_first + int(self.cfg.baseline_s * 1e9)
-            if when <= cutoff:
-                self.baseline_count += 1
-                self.baseline_sum += max(e['duration_ns'] for e in states.values()) / 1e6
-            if self.baseline_count == self.cfg.baseline_rounds or when >= cutoff:
-                self.baseline_ready = min(when, cutoff)
-        groups, warnings = slow_groups(states, world, rank_hosts)
-        if not groups:
-            item = result_common(self.comm, op, 'coverage')
-            item.update(kind='undetermined', roots=[], reason='slow comparison unavailable', warnings=warnings)
-            self.emit(item)
-        for label, members, channel in groups:
-            if len(members) < 2:
-                continue
-            durations = [states[r]['duration_ns'] for r in members]
-            score = (max(durations) - min(durations), -op)
-            if label not in self.winners or score > self.winners[label][0]:
-                dynamic = self.baseline_sum > 0 and self.baseline_ready is not None and when > self.baseline_ready
-                base = self.baseline_sum / self.baseline_count if dynamic else self.cfg.baseline_ms
-                self.winners[label] = (score, op, states, members, channel, base, dynamic)
-
+class SlowWindow(SlowWindows):
     def flush(self):
-        tree_states, tree_decisions = {}, []
-        for label, (_, op, states, members, channel, base, dynamic) in sorted(self.winners.items()):
-            item = slow_decision(self.comm, op, states, label, self.window, members, channel,
-                                 base, 'dynamic' if dynamic else 'initial', self.detections, self.cfg)
-            if label == 'ring':
-                item = self.ring_wait.refine(item, states, op, self.window)
-            if not item:
-                continue
+        tree_states, tree_decisions = defaultdict(dict), defaultdict(list)
+        for key, label, states, item in self.decisions():
             if label.startswith('tree:') and item['kind'] in CLASSIFIED:
-                tree_states[op] = states
-                tree_decisions.append(item)
+                tree_states[key][item['op_count']] = states
+                tree_decisions[key].append(item)
                 item = dict(item, kind='group_candidate', group_kind=item['kind'],
                             root_scope='tree_layer', candidate_ranks=item['roots'], roots=[])
             self.emit(item)
-        if tree_decisions:
-            self.emit(self.tree_decision(tree_states, tree_decisions))
-        self.winners.clear()
+        for key, decisions in tree_decisions.items():
+            outcome = self.tree_decision(tree_states[key], decisions)
+            if 'operation_profile' in decisions[0]:
+                outcome['operation_profile'] = decisions[0]['operation_profile']
+            self.emit(outcome)
 
     def tree_decision(self, states_by_op, decisions):
         ops = sorted(states_by_op)
@@ -138,7 +79,7 @@ class Communicator:
         self.gap = True
         self.pending.clear()
         self.completed_by_time.clear()
-        self.window.winners.clear()
+        self.window.profiles.clear()
         self.emit({'category': 'coverage_gap', 'kind': 'undetermined', 'roots': [],
                    'comm_hash': self.comm, 'op_count': op, 'reason': reason})
 
