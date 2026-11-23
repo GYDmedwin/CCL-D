@@ -266,6 +266,23 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(out[-1]['baseline'], 'dynamic')
         self.assertEqual(out[-1]['t_base_ms'], 15)
 
+    def test_linear_tree_uses_a_same_host_late_entry(self):
+        rows = []
+        for op, entered in ((1, 1_000_000_000), (2, 3_000_000_000)):
+            completed = entered + 62_000_000
+            for rank in range(4):
+                start = entered + (60_000_000 if rank == 2 else 0)
+                rows.append(ev(rank, 'complete', op=op, t=completed,
+                               duration=(completed - start) / 1e6, algorithm='Tree',
+                               host='one-host', start_mono_ns=start,
+                               channels=[{'id': 0, 'tree_parent': rank-1}]))
+        reports = analyze(rows, self.cfg)
+        self.assertEqual([(r['kind'], r['roots']) for r in reports if r['kind'] == 'S1'], [('S1', [2])])
+        self.assertTrue(any(r.get('method') == 'same_host_tree_entry_gap' for r in reports))
+        for row in rows:
+            row['host'] = f"node-{row['rank'] // 2}"
+        self.assertFalse(any(r['kind'] == 'S1' for r in analyze(rows, self.cfg)))
+
 
 if __name__ == '__main__':
     unittest.main()

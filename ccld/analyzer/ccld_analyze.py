@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .ring_wait import RingWaitAttribution
+else:
+    from ring_wait import RingWaitAttribution
+
 
 @dataclass(frozen=True)
 class Config:
@@ -32,6 +37,7 @@ class Config:
     rate_metric: str = 'paper'
     flush_last_window: bool = False
     baseline_skip: int = 0
+    ring_wait_gap: float = 0.2
 
 
 def load_records(paths: list[Path], allow_partial: bool = False) -> tuple[list[dict], list[str]]:
@@ -177,6 +183,16 @@ def comparable_groups(rank_events: dict[int, dict], world_size: int) -> tuple[li
     return groups, errors
 
 
+def slow_groups(states, world):
+    groups, warnings = comparable_groups(states, world)
+    if warnings != ['tree has no layer with at least two ranks'] or world < 3:
+        return groups, warnings
+    hosts = {event.get('host') for event in states.values()}
+    if len(hosts) == 1 and all(hosts):
+        return [('tree-chain', sorted(states), None)], []
+    return groups, warnings
+
+
 def count_score(event: dict, cid: int | None) -> float | None:
     channels = channel_map(event)
     chosen = [channels[cid]] if cid is not None and cid in channels else list(channels.values()) if cid is None else []
@@ -246,6 +262,18 @@ def slow_decision(comm, op, states, label, window, members, cid, base, baseline,
     ratio = (tmax-base)/base
     if ratio <= cfg.slow_threshold:
         return None
+    p = (tmax-tmin)/(tmax-base)
+    comp = min_candidates(durs)
+    entry_gap_ms = None
+    if label == 'tree-chain':
+        if p <= cfg.beta or any(type(states[r].get('start_mono_ns')) is not int for r in members):
+            return None
+        starts = sorted((states[r]['start_mono_ns'], r) for r in members)
+        latest, late_rank = starts[-1]
+        entry_gap_ms = (latest - starts[-2][0]) / 1e6
+        if (entry_gap_ms <= base or comp != [late_rank] or
+                any(states[r]['mono_ns'] < latest for r in members)):
+            return None
     detections[label] += 1
     item = result_common(comm, op, 'slow')
     item.update(group=label, window=int(window), t_base_ms=base, t_max_ms=tmax, t_min_ms=tmin,
@@ -254,8 +282,6 @@ def slow_decision(comm, op, states, label, window, members, cid, base, baseline,
         item.update(kind='detected', roots=[], reason='waiting for repetition threshold')
         return item
     locate_start = time.perf_counter_ns()
-    p = (tmax-tmin)/(tmax-base)
-    comp = min_candidates(durs)
     rates = comparable_rate_scores(states, members, cid, cfg.rate_metric)
     comm_roots = min_candidates(rates)
     if p > cfg.beta:
@@ -266,6 +292,8 @@ def slow_decision(comm, op, states, label, window, members, cid, base, baseline,
         kind, roots = ('S3', sorted(set(comp+comm_roots))) if comm_roots else ('undetermined', [])
     item.update(kind=kind, roots=roots, p=p, compute_roots=comp,
                 communication_roots=comm_roots, rate_metric=cfg.rate_metric, rate_scores=rates)
+    if entry_gap_ms is not None:
+        item.update(method='same_host_tree_entry_gap', entry_gap_ms=entry_gap_ms)
     if p < 0 or p > 1:
         item['baseline_warning'] = 'P is outside [0,1]; baseline is outside the observed duration range'
     item['location_latency_ms'] = (time.perf_counter_ns() - locate_start) / 1e6
@@ -443,7 +471,7 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
     window_ns = max(1, int(cfg.window_s * 1e9))
     windows = defaultdict(list)
     for op, states, t in completed:
-        groups, errors = comparable_groups(states, world)
+        groups, errors = slow_groups(states, world)
         if not groups:
             item = result_common(comm, op, 'coverage')
             item.update(kind='undetermined', roots=[],
@@ -456,6 +484,7 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
             times = [states[r]['duration_ns'] / 1e6 for r in members]
             windows[((t-first_ns)//window_ns, label)].append((max(times)-min(times), op, states, members, cid, t))
     detections = defaultdict(int)
+    ring_wait = RingWaitAttribution(cfg.ring_wait_gap, cfg.slow_threshold)
     last_ns = completed[-1][2]
     for (window, label), entries in sorted(windows.items()):
         end_ns = first_ns + (window+1)*window_ns
@@ -465,6 +494,8 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
         base = dynamic_base if baseline_ready_ns is not None and t > baseline_ready_ns else cfg.baseline_ms
         baseline = 'dynamic' if base == dynamic_base and baseline_ready_ns is not None and t > baseline_ready_ns else 'initial'
         item = slow_decision(comm, op, states, label, window, members, cid, base, baseline, detections, cfg)
+        if label == 'ring':
+            item = ring_wait.refine(item, states, op, window)
         if item:
             output.append(item)
     return output
@@ -540,17 +571,20 @@ def add_decision_arguments(p):
     p.add_argument('--baseline-skip', type=int, default=0, help='exclude initial warmup rounds from dynamic baseline')
     p.add_argument('--baseline-s', type=float, default=120)
     p.add_argument('--rate-metric', choices=('paper', 'delta'), default='paper')
+    p.add_argument('--ring-wait-gap', type=float, default=0.2,
+                   help='minimum normalized directional wait score gap')
 
 
 def decision_config(p, args, flush_last_window=False):
-    if (any(not math.isfinite(x) or x <= 0 for x in (args.hang_s, args.window_s, args.baseline_ms, args.baseline_s)) or
+    if (any(not math.isfinite(x) or x <= 0 for x in
+            (args.hang_s, args.window_s, args.baseline_ms, args.baseline_s, args.ring_wait_gap)) or
             not math.isfinite(args.slow_threshold) or args.slow_threshold < 0 or
             args.repeats < 1 or args.baseline_rounds < 1 or args.baseline_skip < 0 or
             not (0 <= args.alpha < args.beta <= 1)):
         p.error('durations, baseline and counts must be positive; require 0 <= alpha < beta <= 1')
     return Config(args.hang_s, args.window_s, args.baseline_ms, args.slow_threshold,
                   args.repeats, args.alpha, args.beta, args.baseline_rounds, args.baseline_s,
-                  args.rate_metric, flush_last_window, args.baseline_skip)
+                  args.rate_metric, flush_last_window, args.baseline_skip, args.ring_wait_gap)
 
 
 def main() -> int:

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import json
 import math
 from pathlib import Path
 import statistics
+import time
 
 
 def graph_wait_scores(states: dict[int, dict]) -> dict:
@@ -120,6 +121,51 @@ def decide(states: dict, threshold: float, slow_confirmed: bool) -> dict:
             'candidate_ranks': [r for r, n in sorted(votes.items()) if n >= 2] if detected else [],
             'trial_median_gap': statistics.median(gaps), 'operation_gaps': gaps,
             'qualifying_votes': dict(sorted(votes.items()))}
+
+
+class RingWaitAttribution:
+    """Require directionally consistent waits before attributing communication slowdown."""
+
+    def __init__(self, gap, slow_threshold):
+        self.gap = gap
+        self.slow_threshold = slow_threshold
+        self.rounds = deque(maxlen=3)
+        self.last_window = None
+
+    def refine(self, item, states, operation, window):
+        if item is None or not all(state.get('wait_probe') is True for state in states.values()):
+            self.rounds.clear()
+            return item
+        kind = item['kind']
+        mixed = kind == 'S3' or (kind == 'S1' and
+                item['t_min_ms'] > item['t_base_ms'] * (1 + self.slow_threshold))
+        if not (mixed or kind in ('S2', 'undetermined')):
+            self.rounds.clear()
+            return item
+        if (self.last_window is not None and window - self.last_window > 2) or (
+                self.rounds and self.rounds[-1][0] >= operation):
+            self.rounds.clear()
+        self.last_window = window
+        self.rounds.append((operation, states))
+        if len(self.rounds) < 3:
+            return dict(item, kind='detected', roots=[], reason='waiting for three directional samples')
+
+        started = time.perf_counter_ns()
+        try:
+            outcome = decide(dict(self.rounds), self.gap, slow_confirmed=True)
+            suspects = outcome['candidate_ranks']
+        except ValueError:
+            suspects = []
+        comp = item['compute_roots'] if mixed else []
+        if len(suspects) != 1 or (mixed and suspects[0] in comp):
+            if kind == 'S1':
+                return item
+            return dict(item, kind='undetermined', roots=[], reason='no consistent directional wait attribution')
+        elapsed_ms = (time.perf_counter_ns() - started) / 1e6
+        return dict(item, kind='S3' if mixed else 'S2',
+                    roots=sorted(set(comp + suspects)), communication_roots=suspects,
+                    compute_roots=comp, method='directional_ring_wait',
+                    location_latency_ms=(item.get('location_latency_ms') or 0) + elapsed_ms)
 
 
 def main() -> None:

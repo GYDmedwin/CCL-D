@@ -8,7 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'analyzer'))
-from ring_wait import completed_rounds, decide, graph_wait_scores
+from ring_wait import RingWaitAttribution, completed_rounds, decide, graph_wait_scores
 
 
 def sample_states():
@@ -34,6 +34,19 @@ def write_traces(root, states):
 
 
 class RingWaitTests(unittest.TestCase):
+    def test_directional_wait_requires_repeatable_rank_and_recovers_mixed_fault(self):
+        states = sample_states()
+        for base_kind, expected_kind, expected_ranks in (('S2', 'S2', [1]), ('S1', 'S3', [1, 2])):
+            attribution = RingWaitAttribution(gap=0.5, slow_threshold=2)
+            item = {'kind': base_kind, 'roots': [2], 'compute_roots': [2],
+                    't_min_ms': 6, 't_base_ms': 1}
+            for window in (0, 1):
+                pending = attribution.refine(item, states, 4+window, window)
+                self.assertEqual((pending['kind'], pending['roots']), ('detected', []))
+            final = attribution.refine(item, states, 6, 2)
+            self.assertEqual((final['kind'], final['roots']), (expected_kind, expected_ranks))
+            self.assertEqual(final['communication_roots'], [1])
+
     def test_wait_score_and_majority_require_a_slow_gate(self):
         states = sample_states()
         metrics = graph_wait_scores(states)

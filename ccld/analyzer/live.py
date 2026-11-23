@@ -10,9 +10,10 @@ import signal
 import sys
 import time
 
-from .ccld_analyze import (add_decision_arguments, analyze_comm, barrier, comparable_groups,
-                           decision_config, result_common, slow_decision)
+from .ccld_analyze import (add_decision_arguments, analyze_comm, barrier, decision_config,
+                           result_common, slow_decision, slow_groups)
 from .cross_domain import CrossDomainWaits
+from .ring_wait import RingWaitAttribution
 from .tree_s1_vote import CLASSIFIED, vote
 from ..tools.decode_async_wait import RECORD_BYTES, WaitDecoder
 from ..tools.live_transport import job_token, pull
@@ -26,6 +27,7 @@ class SlowWindow:
         self.window_ns = max(1, int(cfg.window_s * 1e9))
         self.winners = {}
         self.detections = Counter()
+        self.ring_wait = RingWaitAttribution(cfg.ring_wait_gap, cfg.slow_threshold)
         self.skip = cfg.baseline_skip
         self.baseline_first = None
         self.baseline_count = 0
@@ -53,7 +55,7 @@ class SlowWindow:
                 self.baseline_sum += max(e['duration_ns'] for e in states.values()) / 1e6
             if self.baseline_count == self.cfg.baseline_rounds or when >= cutoff:
                 self.baseline_ready = min(when, cutoff)
-        groups, warnings = comparable_groups(states, world)
+        groups, warnings = slow_groups(states, world)
         if not groups:
             item = result_common(self.comm, op, 'coverage')
             item.update(kind='undetermined', roots=[], reason='slow comparison unavailable', warnings=warnings)
@@ -73,6 +75,8 @@ class SlowWindow:
         for label, (_, op, states, members, channel, base, dynamic) in sorted(self.winners.items()):
             item = slow_decision(self.comm, op, states, label, self.window, members, channel,
                                  base, 'dynamic' if dynamic else 'initial', self.detections, self.cfg)
+            if label == 'ring':
+                item = self.ring_wait.refine(item, states, op, self.window)
             if not item:
                 continue
             if label.startswith('tree:') and item['kind'] in CLASSIFIED:
@@ -172,6 +176,14 @@ class Communicator:
         for item in analyze_comm(self.comm, progress + list(states.values()), self.cfg):
             if item['category'] != 'hang':
                 continue
+            if (self.last_hang is not None and self.last_hang[:2] == (item['op_count'], 'H1')
+                    and item['kind'] == 'H2'):
+                known_signatures = {
+                    tuple(signature) for signature in item.get('operation_signatures', {}).values()
+                    if all(value is not None and value != '' for value in signature)
+                }
+                if len(known_signatures) <= 1:
+                    continue
             key = (item['op_count'], item['kind'], tuple(item['roots']))
             if key != self.last_hang:
                 self.last_hang = key
