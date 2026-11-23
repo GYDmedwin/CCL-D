@@ -14,6 +14,7 @@ import sys
 import time
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -213,6 +214,34 @@ def operation_signature_partition(states: dict[int, dict], world_size: int,
     return {'status': 'minority', 'groups': reported, 'majority_ranks': sorted(majority), 'minority_ranks': roots}
 
 
+@lru_cache(maxsize=256)
+def tree_peer_layers(parents: tuple[int, ...]) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Compute and reuse peer layers for a channel's exact parent vector."""
+    world = len(parents)
+    if any(p < -1 or p >= world or p == r for r, p in enumerate(parents)):
+        raise ValueError('invalid or absent tree_parent')
+    if parents.count(-1) != 1:
+        raise ValueError('expected one root')
+
+    root = parents.index(-1)
+    depths: dict[int, int] = {root: 0}
+    layers: dict[int, list[int]] = defaultdict(list)
+    for rank in range(world):
+        node, path = rank, []
+        while node not in depths:
+            depths[node] = -1
+            path.append(node)
+            node = parents[node]
+        if depths[node] == -1:
+            raise ValueError('cycle in tree topology')
+        depth = depths[node]
+        for member in reversed(path):
+            depth += 1
+            depths[member] = depth
+        layers[depths[rank]].append(rank)
+    return tuple((depth, tuple(members)) for depth, members in sorted(layers.items()) if len(members) > 1)
+
+
 def comparable_groups(rank_events: dict[int, dict], world_size: int) -> tuple[list[tuple[str, list[int], int | None]], list[str]]:
     """Return (label, ranks, channel) groups. Tree groups need parent on all ranks."""
     algos = {str(event.get('algorithm', '')).lower() for event in rank_events.values()}
@@ -224,7 +253,7 @@ def comparable_groups(rank_events: dict[int, dict], world_size: int) -> tuple[li
         return [('ring', sorted(rank_events), None)], []
     if algorithm != 'tree':
         return [], [f'unsupported comparison algorithm: {algorithm}']
-    if len(rank_events) != world_size:
+    if not world_size or set(rank_events) != set(range(world_size)):
         return [], ['tree topology requires observations from every rank']
     channels = [channel_parents(rank_events[r]) for r in range(world_size)]
     ids = set(channels[0])
@@ -233,29 +262,17 @@ def comparable_groups(rank_events: dict[int, dict], world_size: int) -> tuple[li
     groups: list[tuple[str, list[int], int | None]] = []
     errors: list[str] = []
     for cid in sorted(ids):
-        parent = {r: channels[r][cid] for r in range(world_size)}
-        if any(type(p) is not int or p < -1 or p >= world_size or p == r for r, p in parent.items()):
+        parents = tuple(channel[cid] for channel in channels)
+        if any(type(p) is not int for p in parents):
             errors.append(f'channel {cid}: invalid or absent tree_parent')
             continue
-        if sum(p == -1 for p in parent.values()) != 1:
-            errors.append(f'channel {cid}: expected one root')
-            continue
-        levels: dict[int, list[int]] = defaultdict(list)
         try:
-            for rank in range(world_size):
-                depth, node, seen = 0, rank, set()
-                while parent[node] != -1:
-                    if node in seen:
-                        raise ValueError('cycle')
-                    seen.add(node)
-                    node = parent[node]
-                    depth += 1
-                levels[depth].append(rank)
-        except ValueError:
-            errors.append(f'channel {cid}: cycle in tree topology')
+            layers = tree_peer_layers(parents)
+        except ValueError as error:
+            errors.append(f'channel {cid}: {error}')
             continue
-        groups.extend((f'tree:channel={cid}:depth={depth}', members, cid)
-                      for depth, members in sorted(levels.items()) if len(members) > 1)
+        groups.extend((f'tree:channel={cid}:depth={depth}', list(members), cid)
+                      for depth, members in layers)
     if not groups and not errors:
         errors.append('tree has no layer with at least two ranks')
     return groups, errors

@@ -192,6 +192,22 @@ class DecisionTests(unittest.TestCase):
         events[1]['channels'][0]['recv_count'] = 1
         self.assertEqual(analyze(list(events.values()), self.cfg)[0]['roots'], [1])
 
+    def test_tree_validates_each_channel_and_does_not_share_mutable_groups(self):
+        events = {i: ev(i, 'snapshot', duration=2000, algorithm='Tree') for i in range(4)}
+        for rank, event in events.items():
+            event['channels'] = [
+                {'id': 0, 'tree_parent': [3, 3, 0, -1][rank]},
+                {'id': 1, 'tree_parent': [-1, 2, 1, 0][rank]},
+                {'id': 2, 'tree_parent': [-1, 0, 0, -1][rank]},
+                {'id': 3, 'tree_parent': [-1, 0, False, 1][rank]},
+            ]
+        groups, errors = comparable_groups(events, 4)
+        self.assertEqual(groups, [('tree:channel=0:depth=1', [0, 1], 0)])
+        self.assertEqual(errors, ['channel 1: cycle in tree topology', 'channel 2: expected one root',
+                                  'channel 3: invalid or absent tree_parent'])
+        groups[0][1].clear()
+        self.assertEqual(comparable_groups(events, 4)[0], [('tree:channel=0:depth=1', [0, 1], 0)])
+
     def test_chain_tree_reports_slow_coverage_unavailable_without_alarm(self):
         rows = [ev(i, 'complete', duration=100, algorithm='Tree') for i in range(4)]
         for rank, row in enumerate(rows):
