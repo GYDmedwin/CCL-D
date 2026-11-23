@@ -2,6 +2,7 @@
 """Decode fixed-size CCL-D binary records into the existing JSONL contract."""
 import argparse
 import ctypes
+from functools import lru_cache
 import json
 from pathlib import Path
 import signal
@@ -16,24 +17,33 @@ class Channel(ctypes.LittleEndianStructure):
                 ('sendDelta', ctypes.c_uint64), ('recvDelta', ctypes.c_uint64)]
 
 
+_HEADER_FIELDS = [
+    ('magic', ctypes.c_uint32), ('version', ctypes.c_uint32),
+    ('type', ctypes.c_uint32), ('reserved', ctypes.c_uint32),
+    ('hash', ctypes.c_uint64), ('seq', ctypes.c_uint64),
+    ('nowNs', ctypes.c_uint64), ('startNs', ctypes.c_uint64),
+    ('count', ctypes.c_uint64), ('bytes', ctypes.c_uint64), ('windowNs', ctypes.c_uint64),
+    ('rank', ctypes.c_uint32), ('nranks', ctypes.c_uint32),
+    ('frameBytes', ctypes.c_uint32), ('frameChannels', ctypes.c_uint32),
+    ('frameGroups', ctypes.c_uint32), ('pollUs', ctypes.c_uint32),
+    ('mode', ctypes.c_uint32), ('nChannels', ctypes.c_uint32),
+    ('host', ctypes.c_char * 64), ('op', ctypes.c_char * 16),
+    ('algorithm', ctypes.c_char * 16), ('protocol', ctypes.c_char * 16),
+    ('datatype', ctypes.c_char * 16), ('reason', ctypes.c_char * 64),
+]
+
+
+class _EventHeader(ctypes.LittleEndianStructure):
+    _fields_ = _HEADER_FIELDS
+
+
 class Event(ctypes.LittleEndianStructure):
-    _fields_ = [('magic', ctypes.c_uint32), ('version', ctypes.c_uint32),
-                ('type', ctypes.c_uint32), ('reserved', ctypes.c_uint32),
-                ('hash', ctypes.c_uint64), ('seq', ctypes.c_uint64),
-                ('nowNs', ctypes.c_uint64), ('startNs', ctypes.c_uint64),
-                ('count', ctypes.c_uint64), ('bytes', ctypes.c_uint64), ('windowNs', ctypes.c_uint64),
-                ('rank', ctypes.c_uint32), ('nranks', ctypes.c_uint32),
-                ('frameBytes', ctypes.c_uint32), ('frameChannels', ctypes.c_uint32),
-                ('frameGroups', ctypes.c_uint32), ('pollUs', ctypes.c_uint32),
-                ('mode', ctypes.c_uint32), ('nChannels', ctypes.c_uint32),
-                ('host', ctypes.c_char * 64), ('op', ctypes.c_char * 16),
-                ('algorithm', ctypes.c_char * 16), ('protocol', ctypes.c_char * 16),
-                ('datatype', ctypes.c_char * 16), ('reason', ctypes.c_char * 64),
-                ('channels', Channel * 32)]
+    _fields_ = [*_HEADER_FIELDS, ('channels', Channel * 32)]
 
 
 RECORD_BYTES = 2088
 assert ctypes.sizeof(Channel) == 56 and ctypes.sizeof(Event) == RECORD_BYTES
+assert ctypes.sizeof(_EventHeader) == Event.channels.offset
 KINDS = {1: 'comm_init', 2: 'entered', 3: 'snapshot', 4: 'complete', 5: 'heartbeat',
          6: 'dropped', 7: 'coverage_gap', 8: 'comm_end', 9: 'wait_observation'}
 CHANNEL_FIELDS = struct.Struct('<ii6Q')
@@ -96,13 +106,19 @@ class ChannelMetrics:
 
 
 def text(value):
-    return bytes(value).split(b'\0', 1)[0].decode('utf-8')
+    return _decode_text(bytes(value))
+
+
+@lru_cache(maxsize=128)
+def _decode_text(value):
+    return value.split(b'\0', 1)[0].decode('utf-8')
 
 
 def parse_event(raw):
     if len(raw) != RECORD_BYTES:
         raise ValueError('incomplete CCL-D binary record')
-    return Event.from_buffer_copy(raw)
+    # The channel payload is retained separately and decoded on demand.
+    return _EventHeader.from_buffer_copy(raw)
 
 
 def decode_event(e, raw):
@@ -130,7 +146,7 @@ def decode_event(e, raw):
         if result['op'] == 'P2PAllPeers':
             result.update(pattern='p2p_all_peers', duration_scope=text(e.reason))
         if e.type == 4:
-            factor = 2.0 if text(e.op) == 'AllReduce' else 1.0
+            factor = 2.0 if result['op'] == 'AllReduce' else 1.0
             result['busbw_gbps'] = e.bytes * factor * (e.nranks - 1) / e.nranks / duration if duration else 0.0
     elif e.type in (6, 7):
         result['reason'] = text(e.reason)
