@@ -218,6 +218,22 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual((warning['kind'], warning['roots']), ('undetermined', []))
         self.assertIn('tree has no layer with at least two ranks', warning['warnings'])
 
+    def test_chain_tree_can_detect_uniform_slowdown_after_signature_calibration(self):
+        rows = []
+        for op in range(1, 6):
+            finished = op * 2_000_000_000
+            for rank in range(4):
+                duration = 10 if op < 3 else 75
+                row = ev(rank, 'complete', op=op, t=finished, duration=duration, algorithm='Tree',
+                         host='shared-host', start_mono_ns=finished-int(duration*1e6))
+                row['channels'][0]['tree_parent'] = rank-1
+                rows.append(row)
+        cfg = Config(baseline_ms=10, baseline_rounds=2, baseline_scope='signature', window_s=1,
+                     repeats=2, flush_last_window=True)
+        observed = [(e['kind'], e['roots']) for e in analyze(rows, cfg)]
+        self.assertEqual(observed, [('detected', []), ('undetermined', []), ('undetermined', [])])
+        self.assertEqual(analyze(rows, self.cfg), [])
+
     def test_slow_requires_repetition_and_finds_s1(self):
         rows = []
         for op, t in enumerate((1_000_000_000, 2_100_000_000), 1):

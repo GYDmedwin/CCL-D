@@ -385,23 +385,32 @@ def slow_decision(comm, op, states, label, window, members, cid, base, baseline,
     p = (tmax-tmin)/(tmax-base)
     comp = min_candidates(durs)
     entry_gap_ms = None
+    uniform_tree_slow = False
     if label == 'tree-chain':
-        if p <= cfg.beta or any(type(states[r].get('start_mono_ns')) is not int for r in members):
+        if p > cfg.beta and all(type(states[r].get('start_mono_ns')) is int for r in members):
+            starts = sorted((states[r]['start_mono_ns'], r) for r in members)
+            latest, late_rank = starts[-1]
+            gap_ms = (latest - starts[-2][0]) / 1e6
+            if gap_ms > base and comp == [late_rank] and all(states[r]['mono_ns'] >= latest for r in members):
+                entry_gap_ms = gap_ms
+        uniform_tree_slow = (entry_gap_ms is None and cfg.baseline_scope == 'signature' and
+                             baseline == 'dynamic' and tmin > base * (1 + cfg.slow_threshold))
+        if entry_gap_ms is None and not uniform_tree_slow:
             return None
-        starts = sorted((states[r]['start_mono_ns'], r) for r in members)
-        latest, late_rank = starts[-1]
-        entry_gap_ms = (latest - starts[-2][0]) / 1e6
-        if (entry_gap_ms <= base or comp != [late_rank] or
-                any(states[r]['mono_ns'] < latest for r in members)):
-            return None
-    detections[label] += 1
+    detection_key = f'{label}:uniform' if uniform_tree_slow else label
+    detections[detection_key] += 1
     item = result_common(comm, op, 'slow')
     item.update(group=label, window=int(window), t_base_ms=base, t_max_ms=tmax, t_min_ms=tmin,
-                slowdown_ratio=ratio, detections=detections[label], baseline=baseline)
-    if detections[label] < cfg.repeats:
+                slowdown_ratio=ratio, detections=detections[detection_key], baseline=baseline)
+    if detections[detection_key] < cfg.repeats:
         item.update(kind='detected', roots=[], reason='waiting for repetition threshold')
         return item
     locate_start = time.perf_counter_ns()
+    if uniform_tree_slow:
+        item.update(kind='undetermined', roots=[], p=p, compute_roots=[], communication_roots=[],
+                    reason='all Tree ranks are slow and no peer layer is available for attribution',
+                    location_latency_ms=(time.perf_counter_ns() - locate_start) / 1e6)
+        return item
     rates = comparable_rate_scores(states, members, cid, cfg.rate_metric)
     comm_roots = min_candidates(rates)
     if p > cfg.beta:
