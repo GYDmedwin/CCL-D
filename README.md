@@ -1,112 +1,101 @@
-# CCL-D-DCU
+# CCL-D for RCCL
 
-CCL-D-DCU 是 RCCL 上的集合通信诊断实现。训练 rank 通过 HIP 映射的主机内存采集通信进度，节点代理在内存中缓冲二进制记录，独立分析器通过 TCP 拉取并诊断。
+CCL-D diagnoses slow and hanging collectives in RCCL workloads. GPU probes update mapped host-memory frames. A host thread samples the frames, and a node agent buffers the resulting binary records. An independent analyzer pulls the records over TCP and reports the affected collective and any supported root ranks.
 
-此分支延续 niheartent 的 RCCL 移植和提交历史。 [RCCL 移植来源](https://github.com/niheartent/CCL-D-DCU/tree/486a4ced7fce37b41b6b60689d6c2143b34f0a28)
+This branch targets RCCL 2.22.3-1 on gfx936 BW1000 accelerators. The validation environment uses DTK 26.04, HIP, and PyTorch 2.7.1. It includes single-node collective tests and 16-rank InfiniBand and FSDP runs. [Validation results](RESULTS.md)
 
-## 当前目标平台
+## Build
 
-- GPU：BW1000，`gfx936`
-- RCCL：2.22.3-1
-- 参考实现：NCCL 2.24.3-1 上的 CCL-D
-- 现有验收入口：AntCCL Evaluation 5.1
-- 已验证 Simple 和 LL。该构建的 gfx936 路径未启用 LL128。
-
-真机覆盖 AllReduce、AllGather、ReduceScatter、FSDP 和跨节点 IB。诊断的准确率、开销和适用范围见 [RESULTS.md](RESULTS.md)。
-
-## 构建 RCCL
-
-在已加载 ROCm/DTK 环境的机器上，从仓库根目录配置并构建 gfx936 版本：
+Load the ROCm or DTK environment on the build host and run these commands from the repository root.
 
 ```bash
 cmake -S . -B build-ccld-gfx936 \
-  -DGPU_TARGETS=gfx936 \
-  -DCOLLTRACE=ON \
-  -DCCLD_FAULT_INJECTION=OFF -DBUILD_TESTS=OFF
-cmake --build build-ccld-gfx936 -j
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGPU_TARGETS=gfx936 -DCOMPILING_TARGETS=gfx936 \
+  -DCOLLTRACE=ON -DCCLD_FAULT_INJECTION=OFF -DBUILD_TESTS=OFF
+cmake --build build-ccld-gfx936 --parallel 12
 ```
 
-`CCLD_FAULT_INJECTION=ON` 启用 H3/S2 实验的故障注入。在独立的 `build-ccld-gfx936-fault` 目录构建该版本。验收脚本支持用 `RCCL_BUILD_DIR` 和 `RCCL_LIB` 指定库。
+For quick compile and test cycles, set `ONLY_FUNCS` to the RCCL device functions exercised by the workload. Use the full build for workloads with dynamic collective or datatype selection. [Targeted build examples](RESULTS.md)
 
-开发时可用 [实测的定向构建配置](RESULTS.md#复跑通信基准) 通过 `ONLY_FUNCS` 只编译这轮要验证的设备函数。FSDP 的定向构建还要包含所用的 BF16 归约与其他实际操作。每种工具链、函数集和故障注入开关各用固定的节点本地构建目录。修改 C++ 后用 `cmake --build` 增量构建，并核对需要更新的库已重新链接。修改 Python 分析器或启动脚本时可继续使用已验证的库。Slurm 上可以单独提交 CPU 构建作业，把构建产物放到训练节点可访问的位置供 GPU 作业复用。
+## Run alongside training
 
-## 随训练在线运行
+Use the same code revision on the training and analysis hosts. Run the Python commands from the repository root with Python 3.10 or later. Create one token for the job with `openssl rand -hex 32` and export it as `CCLD_PULL_TOKEN` to every agent and to the analyzer.
 
-在所有节点代理和分析器的环境中设置相同的 `CCLD_PULL_TOKEN`，可用 `openssl rand -hex 32` 生成。各训练节点先启动一个代理，`TRAIN_NODE_ADDR` 是分析主机可访问的作业网地址。
+### Start a node agent
+
+On each training node, choose a job network address reachable by the analyzer and set `TRAIN_NODE_ADDR` to that address. Start one agent per node and keep the socket path for the training launcher on that node.
 
 ```bash
 socket_dir="$(mktemp -d)"
 export NCCL_CCLD_NODE_SOCKET="$socket_dir/ccld.sock"
-python3 -m ccld.tools.live_transport --socket "$NCCL_CCLD_NODE_SOCKET" \
-  --bind "$TRAIN_NODE_ADDR" --port 0
+python3 -m ccld.tools.live_transport \
+  --socket "$NCCL_CCLD_NODE_SOCKET" --bind "$TRAIN_NODE_ADDR" --port 0
 ```
 
-在分析主机从同一分支的仓库根目录运行。对每个代理传一个 `--node`，地址取该代理的 `CCLD_NODE_READY` 输出。
+### Start the analyzer
+
+On the analysis host, use the `HOST:PORT` printed in each agent's `CCLD_NODE_READY` line. Pass one `--node` per training node. The analyzer reads the binary buffers in memory and writes diagnosis events to standard output.
 
 ```bash
 python3 -m ccld.analyzer.live --node "$NODE_AGENT_ADDR" \
   --poll-s 0.025 --hang-s 300 --window-s 60 --baseline-ms 1 \
-  --decode-workers 4 --coalesce-completed
+  --baseline-scope signature --decode-workers 4 --coalesce-completed
 ```
 
-启动训练时继承本机代理的 socket 路径，并确保进程加载本分支的 `librccl`。以下是单节点示例，多节点用训练任务自己的分布式启动参数。
+### Start the training workload
+
+Pass the node-local socket path from the agent step to the training processes and load the instrumented library. The example uses four local ranks. For distributed training, use the existing launcher and pass the corresponding socket path on each node.
 
 ```bash
-export LD_LIBRARY_PATH="$PWD/build-ccld-gfx936${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LD_PRELOAD="$PWD/build-ccld-gfx936/librccl.so.1.0"
+export RCCL_BUILD_DIR="$PWD/build-ccld-gfx936"
+export LD_LIBRARY_PATH="$RCCL_BUILD_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_PRELOAD="$RCCL_BUILD_DIR/librccl.so.1.0"
 unset NCCL_CCLD_OUT_DIR
 export NCCL_CCLD_ENABLE=1 NCCL_CCLD_MODE=1 NCCL_CCLD_POLL_US=200
 export NCCL_CCLD_FRAME_BLOCKS=64
 torchrun --standalone --nproc-per-node=4 train.py
 ```
 
-在 Ring 上额外启用方向等待计数时，设置 `NCCL_ALGO=Ring NCCL_CCLD_WAIT_ENABLE=1`。用正常训练标定 `--baseline-ms` 和 slow 窗口。用 `--slow-warmup-ops` 按 communicator 跳过启动期的慢诊断和基线学习，hang 诊断和签名检查仍实时运行。设置 `NCCL_CCLD_OUT_DIR` 可改用落盘的二进制记录供回放。
+## Configure diagnosis
 
-混合大小或操作的训练可给分析器加上 `--baseline-scope signature`。每种操作签名分别学习耗时基线和累计 slow 窗口，达到该签名的学习门槛后开始 slow 诊断。`--baseline-rounds` 和 `--baseline-s` 分别设置样本数和学习时长。
+| Setting | Purpose |
+| --- | --- |
+| `NCCL_CCLD_POLL_US` | Time between samples of mapped progress counters on the training host. |
+| `NCCL_CCLD_DUMP_MS` | Time between progress snapshots for in-flight collectives. Completions emit their own records. |
+| `--poll-s` | Time between analyzer pulls from node agents. |
+| `--baseline-scope signature` | Learn separate slow baselines by operation, size, datatype, algorithm, protocol, channel count, and known reduction operator. |
+| `--slow-warmup-ops` | Skip the first configured number of eligible operations in each communicator when learning and evaluating slow baselines. Hang and signature checks continue. |
+| `--baseline-rounds`, `--baseline-s` | Set the baseline sample budget and learning time. Calibrate on a healthy run before reducing the slow window or the hang threshold. |
 
-同机 Ring 的混合慢诊断可在训练侧设置 `NCCL_CCLD_WAIT_ENABLE=1 NCCL_CCLD_DUMP_MS=1`，并给分析器加上 `--ring-wait-phases`。分析器以最后一个 rank 的入场时刻为界，用前后两侧的等待快照核对通信根因。快照间隔和拉取周期可按训练负载调整。分析器和二进制解码器应与训练库使用同一版本。
+### Directional waits
 
-## 运行 Evaluation 5.1
+For Ring with Simple or LL, set `NCCL_ALGO=Ring NCCL_CCLD_WAIT_ENABLE=1` on the training processes. To diagnose mixed computation and communication slowdown within a single training host, also set `NCCL_CCLD_DUMP_MS=1` and pass `--ring-wait-phases` to the analyzer. This mode compares wait snapshots around the last rank's entry.
 
-运行全部单节点场景前，先按拓扑、协议和消息大小标定等待阈值，再通过 `CCLD_WAIT_THRESHOLD` 传入。
+For pure communication slowdown in same-host Tree/Simple AllReduce, set `NCCL_ALGO=Tree NCCL_PROTO=Simple NCCL_CCLD_TREE_WAIT_ENABLE=1` and use `--baseline-scope signature` in the analyzer. The analyzer scores parent and child waits independently and uses adjacent operations to account for entry skew inherited from the previous collective. Configure `--tree-wait-gap` to set the minimum separation between the top scores. [Tree accuracy and overhead](RESULTS.md)
+
+### Record a trace for replay
+
+Set `NCCL_CCLD_OUT_DIR` to an existing directory on each training node to write binary files. Decode the directory from the same revision.
 
 ```bash
-CCLD_WAIT_THRESHOLD="$CALIBRATED_WAIT_THRESHOLD" \
-  tools/tests/run_antccl_eval51_gfx936.sh --case all
+python3 -m ccld.tools.decode_async_wait "$TRACE_DIR" "$JSONL_DIR"
+python3 -m ccld.analyzer.ccld_analyze "$JSONL_DIR" --baseline-ms 1 --baseline-scope signature
 ```
 
-先运行一个例程，例如 H1（rank 2 暂停进入 collective）：
+## Run validation
+
+Build a separate library with `CCLD_FAULT_INJECTION=ON` to run the controlled fault experiments. The Evaluation 5.1 runner accepts `RCCL_BUILD_DIR` and `RCCL_LIB` to select that build.
 
 ```bash
-tools/tests/run_antccl_eval51_gfx936.sh --case H1
-```
-
-可选场景为 `H1`、`H2`、`H2_SIM`、`H3`、`POST`、`S1`、`S2`。每次运行会在 `../results/antccl-eval51-<拓扑>-<时间>/` 下保存 workload、诊断日志和分析结果。可以指定输出目录：
-
-```bash
-CCLD_RUN="$PWD/results/my-eval51" \
+RCCL_BUILD_DIR="$PWD/build-ccld-gfx936-fault" \
   tools/tests/run_antccl_eval51_gfx936.sh --case H1
 ```
 
-双节点 8 rank/IB 验收命令：
+Run the script with `--help` for available cases and topology options. The S2 suite uses `CCLD_WAIT_THRESHOLD` calibrated for that protocol, message size, and topology. [Workloads, accuracy, and overhead](RESULTS.md)
 
-```bash
-CCLD_NODE1="$FIRST_HOST" CCLD_NODE2="$SECOND_HOST" CCLD_MASTER_ADDR="$FIRST_HOST" \
-  CCLD_WAIT_THRESHOLD="$CALIBRATED_WAIT_THRESHOLD" \
-  tools/tests/run_antccl_eval51_gfx936.sh --topology dual --case all
-```
+## Attribution and licenses
 
-双节点 Docker runner 从第一台节点通过 SSH 启动第二台节点，并检查两端 RCCL 日志中的 IB 记录。使用该脚本时两端应能访问同一仓库和结果目录。
+This branch builds on niheartent's RCCL port and preserves its commit history. [Original RCCL port](https://github.com/niheartent/CCL-D-DCU/tree/486a4ced7fce37b41b6b60689d6c2143b34f0a28)
 
-`H2` 检查已经完成的 collective 是否在预期轮次出现 count 或 operation 不一致。`H2_SIM` 验证模拟 hang 的分类。`S2` 的统一入口验证 slow 检测，并输出候选 rank。需要核对根因时，可使用 `tools/tests/validate_ccld_s2_strict.py` 检查多轮等待得分。
-
-## 依赖与结果
-
-本分支自带二进制 decoder、节点代理和分析器，来源是 NCCL 版 CCL-D 提交 `38e21d1`。验收入口默认使用当前检出的工具。用 `CCLD_NV_ROOT` 可以指定另一个分析器版本，也可用它为源码对照单测提供 NCCL 检出。
-
-```bash
-export CCLD_NV_ROOT=/path/to/nccl-CCL-D
-tools/tests/run_antccl_eval51_gfx936.sh --case H1
-```
-
-验收脚本默认将结果写入仓库同级的 `results/` 目录。
+See the [RCCL license](LICENSE.txt) and the [CCL-D license](ccld/LICENSE.txt).
