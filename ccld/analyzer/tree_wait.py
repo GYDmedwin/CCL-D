@@ -7,9 +7,11 @@ from typing import NamedTuple
 import time
 
 if __package__:
+    from .admission import RankAdmission
     from .clock_bounds import bracket_peer_waits, rank_clock_shifts
     from .ring_wait import PHASE_ENTRY_GAP_NS, PHASE_WINDOW_NS, phase_boundaries
 else:
+    from admission import RankAdmission
     from clock_bounds import bracket_peer_waits, rank_clock_shifts
     from ring_wait import PHASE_ENTRY_GAP_NS, PHASE_WINDOW_NS, phase_boundaries
 
@@ -64,9 +66,14 @@ def uniform_slowdown(states, hosts, base_ms, threshold, previous_ends=None, admi
         intervals = [when - previous_ends[rank] for rank, when in starts.items()]
         if min(intervals) >= 0:
             timing = intervals
+    all_slow = min(event['duration_ns'] for event in states.values()) > base_ms * (1 + threshold) * 1e6
+    if len(clock_hosts) > 1:
+        # Modest admission spread can follow a previous slow completion.
+        # Keep mixed-operation handling whenever any rank has substantial
+        # independent host-side delay, including ties between late entrants.
+        return all_slow and admission.max_excess_ns < RankAdmission.MIN_EXCESS_NS
     spread = admission.spread_ns if admission is not None else max(timing) - min(timing)
-    return (spread <= max(1_000_000, base_ms * 1e6) and
-            min(event['duration_ns'] for event in states.values()) > base_ms * (1 + threshold) * 1e6)
+    return all_slow and spread <= max(1_000_000, base_ms * 1e6)
 
 
 def directional_scores(states):
