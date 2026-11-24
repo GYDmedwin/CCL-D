@@ -51,3 +51,14 @@ class TreeWaitTests(unittest.TestCase):
         broken[3]['channels'][0]['tree_parent'] = 2
         with self.assertRaisesRegex(ValueError, 'Tree .* evidence'):
             directional_scores(broken)
+
+    def test_previous_completion_can_explain_inherited_entry_skew(self):
+        rows, hosts = states(), dict.fromkeys(range(4), 'same')
+        for row in rows.values():
+            row['start_mono_ns'] += 100_000_000
+        rows[3]['start_mono_ns'] += 3_000_000
+        ends = {rank: row['start_mono_ns'] - 60_000_000 for rank, row in rows.items()}
+        self.assertFalse(uniform_slowdown(rows, hosts, .5, 2))
+        self.assertTrue(uniform_slowdown(rows, hosts, .5, 2, ends))
+        rows[3]['start_mono_ns'] += 5_000_000
+        self.assertFalse(uniform_slowdown(rows, hosts, .5, 2, ends))

@@ -495,8 +495,14 @@ class SlowWindows:
         self.window_ns = max(1, int(cfg.window_s * 1e9))
         self.warmup_ops = cfg.slow_warmup_ops
         self.profiles = OrderedDict()
+        self.previous_tree = None
 
     def add(self, op, states, world, rank_hosts=None, snapshots=None):
+        previous_ends = None
+        if states[0].get('tree_wait_probe') is True:
+            if self.previous_tree is not None and self.previous_tree[0] == op - 1:
+                previous_ends = self.previous_tree[1]
+            self.previous_tree = op, {rank: event['mono_ns'] for rank, event in states.items()}
         if self.warmup_ops:
             self.warmup_ops -= 1
             return
@@ -526,7 +532,7 @@ class SlowWindows:
         tree_base = None
         if key and source == 'dynamic' and profile.fastest_total_ms:
             fastest = profile.fastest_total_ms / profile.count
-            if uniform_slowdown(states, rank_hosts or {}, fastest, self.cfg.slow_threshold):
+            if uniform_slowdown(states, rank_hosts or {}, fastest, self.cfg.slow_threshold, previous_ends):
                 tree_base = fastest
                 groups = [group for group in groups if group[0] != 'tree-chain']
                 groups.append(('tree-wait', sorted(states), None))

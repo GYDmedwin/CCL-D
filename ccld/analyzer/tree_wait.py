@@ -3,13 +3,22 @@ from collections import defaultdict, deque
 import time
 
 
-def uniform_slowdown(states, hosts, base_ms, threshold):
+def uniform_slowdown(states, hosts, base_ms, threshold, previous_ends=None):
     clock_hosts = {hosts.get(rank) for rank in states}
     if len(clock_hosts) != 1 or not all(isinstance(host, str) and host for host in clock_hosts):
         return False
-    starts = [event.get('start_mono_ns') for event in states.values()]
-    return (all(event.get('tree_wait_probe') is True for event in states.values()) and
-            all(type(when) is int for when in starts) and max(starts) - min(starts) <= max(1_000_000, base_ms * 1e6) and
+    starts = {rank: event.get('start_mono_ns') for rank, event in states.items()}
+    if (any(event.get('tree_wait_probe') is not True for event in states.values()) or
+            any(type(when) is not int for when in starts.values())):
+        return False
+    timing = starts.values()
+    if previous_ends is not None and previous_ends.keys() == starts.keys():
+        # Different completion times can lead to different entries in the
+        # next round even when every rank performs the same host work.
+        intervals = [when - previous_ends[rank] for rank, when in starts.items()]
+        if min(intervals) >= 0:
+            timing = intervals
+    return (max(timing) - min(timing) <= max(1_000_000, base_ms * 1e6) and
             min(event['duration_ns'] for event in states.values()) > base_ms * (1 + threshold) * 1e6)
 
 
