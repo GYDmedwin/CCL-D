@@ -16,7 +16,7 @@ import struct
 import time
 import zlib
 
-from .decode_ccld_binary import FRAGMENT_KINDS, FRAGMENT_VERSION, RECORD_BYTES
+from .decode_ccld_binary import FRAGMENT_KINDS, FRAGMENT_VERSION, RECORD_BYTES, TREE_WAIT
 from .wait_memory import WAIT_ROW
 from .wait_observation import LIMIT, evidence_record, peer_process, process_groups, receive_wait, wait_socket
 
@@ -153,7 +153,7 @@ async def receive_rank(reader, writer, buffer):
                 raw = data[offset:offset + RECORD_BYTES]
                 magic, version, kind, comm, rank, world = RECORD_HEADER.unpack_from(raw)
                 rank_identity = (comm, rank, world)
-                if (magic != 0x444c4343 or not 1 <= kind <= 8 or
+                if (magic != 0x444c4343 or not (1 <= kind <= 8 or kind == TREE_WAIT) or
                         (version != 1 and not (version == FRAGMENT_VERSION and kind in FRAGMENT_KINDS)) or
                         rank >= world or ended or
                         (identity is None and kind != 1) or

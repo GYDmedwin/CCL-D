@@ -11,7 +11,9 @@ import time
 RECORD_CHANNELS = 32
 MAX_CHANNELS = 128
 FRAGMENT_VERSION = 2
-FRAGMENT_KINDS = (3, 4, 7)
+RING_WAIT = 7
+TREE_WAIT = 10
+FRAGMENT_KINDS = (3, 4, RING_WAIT, TREE_WAIT)
 OBSERVED_PROGRESS = 1 << 31
 BUILTIN_REDUCTION = 1 << 30
 REDUCTIONS = ('sum', 'prod', 'max', 'min', 'avg')
@@ -47,7 +49,9 @@ KINDS = {1: 'comm_init', 2: 'entered', 3: 'snapshot', 4: 'complete', 5: 'heartbe
 CHANNEL_FIELDS = struct.Struct('<ii6Q')
 CHANNEL_PARENTS = struct.Struct('<ii48x')
 WAIT_CHANNEL_FIELDS = struct.Struct('<ii3Q24x')
-assert ctypes.sizeof(Channel) == CHANNEL_FIELDS.size == CHANNEL_PARENTS.size == WAIT_CHANNEL_FIELDS.size
+TREE_WAIT_CHANNEL_FIELDS = struct.Struct('<5i9I')
+assert (ctypes.sizeof(Channel) == CHANNEL_FIELDS.size == CHANNEL_PARENTS.size
+        == WAIT_CHANNEL_FIELDS.size == TREE_WAIT_CHANNEL_FIELDS.size)
 
 
 def channel_payload(raw, n_channels):
@@ -57,16 +61,17 @@ def channel_payload(raw, n_channels):
 
 class ChannelMetrics:
     """Keep binary channel data compact until a decision needs its metrics."""
-    __slots__ = ('payload', 'window_ns', 'wait_payload', '_decoded')
+    __slots__ = ('payload', 'window_ns', 'wait_payload', 'tree_wait_payload', '_decoded')
 
-    def __init__(self, payload, window_ns, wait_payload=None):
+    def __init__(self, payload, window_ns, wait_payload=None, tree_wait_payload=None):
         self.payload = payload
         self.window_ns = window_ns
         self.wait_payload = wait_payload
+        self.tree_wait_payload = tree_wait_payload
         self._decoded = None
 
     def __reduce__(self):
-        return (type(self), (self.payload, self.window_ns, self.wait_payload))
+        return (type(self), (self.payload, self.window_ns, self.wait_payload, self.tree_wait_payload))
 
     def parents(self):
         return dict(CHANNEL_PARENTS.iter_unpack(self.payload))
@@ -86,6 +91,12 @@ class ChannelMetrics:
             if self.wait_payload is not None:
                 wait = {cid: (prev, nxt, data, credit)
                         for cid, prev, data, credit, nxt in WAIT_CHANNEL_FIELDS.iter_unpack(self.wait_payload)}
+            tree = {}
+            if self.tree_wait_payload is not None:
+                for cid, parent, child0, child1, child2, _, *counts in TREE_WAIT_CHANNEL_FIELDS.iter_unpack(self.tree_wait_payload):
+                    neighbors = (parent, child0, child1, child2)
+                    tree[cid] = [dict(rank=peer, data_spins=counts[index], credit_spins=counts[index + 4])
+                                 for index, peer in enumerate(neighbors) if peer >= 0]
             channels = []
             for cid, parent, send, recv, send_changes, recv_changes, send_delta, recv_delta in CHANNEL_FIELDS.iter_unpack(self.payload):
                 channel = {'id': cid, 'tree_parent': parent,
@@ -98,6 +109,8 @@ class ChannelMetrics:
                     prev, nxt, data, credit = wait[cid]
                     channel.update(ring_prev=prev, ring_next=nxt, wait_data_spins=data,
                                    wait_credit_spins=credit)
+                if tree:
+                    channel['tree_wait_peers'] = tree[cid]
                 channels.append(channel)
             self._decoded = channels
         return self._decoded

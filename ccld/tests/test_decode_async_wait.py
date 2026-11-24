@@ -1,6 +1,7 @@
 import sys
 import json
 import pickle
+import struct
 import signal
 import subprocess
 import tempfile
@@ -48,6 +49,34 @@ def fragments(channel_count, wait=False):
 
 
 class WaitDecoderTests(unittest.TestCase):
+    def test_tree_wait_pairs_preserve_independent_child_counters(self):
+        progress = event(4)
+        progress.algorithm, progress.protocol = b'Tree', b'Simple'
+        progress.reason, progress.windowNs = b'tree_wait_v1', 100
+        progress.channels[0].parent = -1
+        side = event(10)
+        side.reserved = 4
+        payload = bytearray(bytes(side))
+        row = struct.Struct('<5i9I')
+        row.pack_into(payload, Event.channels.offset, 2, -1, 1, 2, -1, 0,
+                      0, 37, 50, 0, 0, 3, 4, 0)
+        decoder = WaitDecoder(defer_channels=True)
+        self.assertIsNone(decoder.consume(payload))
+        output = decoder.consume(bytes(progress))
+        decoder.finish()
+        self.assertTrue(output['tree_wait_probe'])
+        self.assertFalse(output['wait_probe'])
+        metrics = pickle.loads(pickle.dumps(output['channels']))
+        self.assertEqual(metrics[0]['tree_wait_peers'], [
+            {'rank': 1, 'data_spins': 37, 'credit_spins': 3},
+            {'rank': 2, 'data_spins': 50, 'credit_spins': 4},
+        ])
+
+        decoder.consume(payload)
+        progress.channels[0].parent = 3
+        with self.assertRaisesRegex(ValueError, 'inconsistent Tree-wait pair'):
+            decoder.consume(bytes(progress))
+
     def test_progress_timestamp_requires_the_feature_flag_and_a_valid_interval(self):
         progress = event(4)
         progress.startNs = (1 << 32) + 20

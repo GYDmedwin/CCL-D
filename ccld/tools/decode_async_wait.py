@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode experimental paired Ring-wait binary records, including live follow."""
+"""Decode paired directional wait records, including live follow."""
 import argparse
 import json
 import os
@@ -12,11 +12,13 @@ REPRO = Path(os.environ.get('CCLD_REPRO_ROOT', Path(__file__).resolve().parents[
 sys.path.insert(0, str(REPRO / 'tools'))
 if __package__:
     from .decode_ccld_binary import (CHANNEL_PARENTS, FRAGMENT_KINDS, FRAGMENT_VERSION, MAX_CHANNELS,
-                                     RECORD_BYTES, RECORD_CHANNELS, WAIT_CHANNEL_FIELDS, ChannelMetrics,
+                                     RECORD_BYTES, RECORD_CHANNELS, RING_WAIT, TREE_WAIT,
+                                     TREE_WAIT_CHANNEL_FIELDS, WAIT_CHANNEL_FIELDS, ChannelMetrics,
                                      Event, channel_payload, decode_event, parse_event, text)
 else:
     from decode_ccld_binary import (CHANNEL_PARENTS, FRAGMENT_KINDS, FRAGMENT_VERSION, MAX_CHANNELS,
-                                    RECORD_BYTES, RECORD_CHANNELS, WAIT_CHANNEL_FIELDS, ChannelMetrics,
+                                    RECORD_BYTES, RECORD_CHANNELS, RING_WAIT, TREE_WAIT,
+                                    TREE_WAIT_CHANNEL_FIELDS, WAIT_CHANNEL_FIELDS, ChannelMetrics,
                                     Event, channel_payload, decode_event, parse_event, text)
 
 
@@ -25,7 +27,7 @@ def fragment_info(e):
     index = (e.reserved >> 8) & 0xff
     total = (e.reserved >> 16) & 0xff
     if (e.type not in FRAGMENT_KINDS or e.reserved >> 24 or kind not in (3, 4) or
-            (e.type != 7 and kind != e.type) or not 2 <= total <= MAX_CHANNELS // RECORD_CHANNELS or
+            (e.type in (3, 4) and kind != e.type) or not 2 <= total <= MAX_CHANNELS // RECORD_CHANNELS or
             index >= total or not 1 <= e.nChannels <= RECORD_CHANNELS or
             (index < total - 1 and e.nChannels != RECORD_CHANNELS)):
         raise ValueError('invalid CCL-D fragment header')
@@ -49,21 +51,32 @@ class WaitDecoder:
         part = fragment_info(e) if e.version == FRAGMENT_VERSION else None
         if e.type == 1 and e.startNs:
             raise ValueError('new device-frame format requires decode_frame_wait.py')
-        if e.type == 7:
+        if e.type in (RING_WAIT, TREE_WAIT):
             if (e.magic != 0x444c4343 or e.nranks < 1 or e.rank >= e.nranks or
                     not 1 <= e.nChannels <= RECORD_CHANNELS or
                     (part is None and (e.version != 1 or e.reserved not in (3, 4)))):
-                raise ValueError('invalid Ring-wait record')
+                raise ValueError('invalid directional wait record')
             key = progress_key(e, e.reserved) if part is None else (*progress_key(e, part[0]), *part[1:])
             if key in self.pending or len(self.pending) >= 4096:
-                raise ValueError('duplicate or excessive unmatched Ring-wait records')
+                raise ValueError('duplicate or excessive unmatched wait records')
             payload = channel_payload(raw, e.nChannels)
-            ids = set()
-            for cid, prev, _, _, nxt in WAIT_CHANNEL_FIELDS.iter_unpack(payload):
-                if cid in ids or not 0 <= cid < MAX_CHANNELS or not 0 <= prev < e.nranks or nxt >= e.nranks:
-                    raise ValueError('invalid Ring-wait channel or neighbor')
-                ids.add(cid)
-            self.pending[key] = (ids, payload)
+            peers = {}
+            if e.type == RING_WAIT:
+                for cid, prev, _, _, nxt in WAIT_CHANNEL_FIELDS.iter_unpack(payload):
+                    if cid in peers or not 0 <= cid < MAX_CHANNELS or not 0 <= prev < e.nranks or nxt >= e.nranks:
+                        raise ValueError('invalid Ring-wait channel or neighbor')
+                    peers[cid] = prev
+            else:
+                for cid, parent, c0, c1, c2, reserved, *counts in TREE_WAIT_CHANNEL_FIELDS.iter_unpack(payload):
+                    neighbors = (parent, c0, c1, c2)
+                    active = [p for p in neighbors if p != -1]
+                    if (cid in peers or not 0 <= cid < MAX_CHANNELS or reserved or
+                            len(set(active)) != len(active) or
+                            any(not 0 <= p < e.nranks or p == e.rank for p in active) or
+                            any(counts[i] or counts[i + 4] for i, p in enumerate(neighbors) if p == -1)):
+                        raise ValueError('invalid Tree-wait channel or neighbor')
+                    peers[cid] = parent
+            self.pending[key] = (e.type, peers, payload)
             return None
         record = decode_event(e, raw, allow_fragment=part is not None)
         if e.type == 1:
@@ -71,15 +84,24 @@ class WaitDecoder:
             record['wait_requested'] = bool(e.count)
         elif e.type in (3, 4):
             channels = record['channels']
-            record['wait_probe'] = text(e.reason) == 'ring_wait_v1'
-            if record['wait_probe']:
+            layout = text(e.reason)
+            record['wait_probe'] = layout == 'ring_wait_v1'
+            if layout == 'tree_wait_v1':
+                record['tree_wait_probe'] = True
+            if record['wait_probe'] or record.get('tree_wait_probe'):
                 key = progress_key(e, e.type)
                 if part is not None:
                     key = (*key, *part[1:])
                 wait = self.pending.pop(key, None)
-                if wait is None or wait[0] != channels.parents().keys():
-                    raise ValueError('missing or inconsistent Ring-wait pair')
-                channels.wait_payload = wait[1]
+                parents = channels.parents()
+                if record['wait_probe']:
+                    if wait is None or wait[0] != RING_WAIT or wait[1].keys() != parents.keys():
+                        raise ValueError('missing or inconsistent Ring-wait pair')
+                    channels.wait_payload = wait[2]
+                else:
+                    if wait is None or wait[0] != TREE_WAIT or wait[1] != parents:
+                        raise ValueError('missing or inconsistent Tree-wait pair')
+                    channels.tree_wait_payload = wait[2]
             if part is not None:
                 record = self.join_fragments(progress_key(e, e.type), part[1], part[2], record)
                 if record is None:
@@ -109,11 +131,12 @@ class WaitDecoder:
         if ids[0] < 0 or ids[-1] >= MAX_CHANNELS or ids != list(range(ids[0], ids[0] + len(ids))):
             raise ValueError('invalid channels in progress fragments')
         wait = b''.join(chunk.wait_payload for chunk in channels) if first['wait_probe'] else None
-        return dict(first, n_channels=len(ids), channels=ChannelMetrics(payload, channels[0].window_ns, wait))
+        tree = b''.join(chunk.tree_wait_payload for chunk in channels) if first.get('tree_wait_probe') else None
+        return dict(first, n_channels=len(ids), channels=ChannelMetrics(payload, channels[0].window_ns, wait, tree))
 
     def finish(self):
         if self.pending:
-            raise ValueError('unmatched final Ring-wait records')
+            raise ValueError('unmatched final wait records')
         if self.fragments:
             raise ValueError('incomplete final progress fragments')
 
