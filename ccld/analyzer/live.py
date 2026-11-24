@@ -62,6 +62,7 @@ class Communicator:
     MAX_PENDING = 2048
     MAX_PHASE_OPERATIONS = 16
     MAX_PHASE_SNAPSHOTS = 32
+    RANK_LOSS_GRACE_NS = 1_000_000_000
 
     def __init__(self, comm, world, cfg, emit, clocks=None):
         self.comm, self.world, self.cfg, self.emit = comm, world, cfg, emit
@@ -70,6 +71,7 @@ class Communicator:
         self.rank_hosts = {}
         self.ended = set()
         self.rank_losses = {}
+        self.rank_loss_check = None
         self.pending = defaultdict(dict)
         self.phase_samples = OrderedDict() if cfg.ring_wait_phases or cfg.tree_cross_host_phases else None
         self.completed_by_time = []
@@ -111,6 +113,7 @@ class Communicator:
             self.ended.add(rank)
             if not self.gap:
                 self.rank_losses[rank] = event
+                self.rank_loss_check = None
             return
         if kind == 'comm_end':
             self.ended.add(rank)
@@ -171,23 +174,57 @@ class Communicator:
                 self.last_hang = key
                 self.emit(item)
 
+    def surviving_snapshots(self, loss):
+        rank, last_op = loss['rank'], loss['last_op_count']
+        samples = {}
+        # The affected rank was last seen in this operation, or its next
+        # entry is missing. A finished rank's older work cannot be the stall.
+        for op in (last_op, last_op + 1):
+            states = self.pending.get(op, {})
+            if states.get(rank, {}).get('event') in ('complete', 'skipped'):
+                continue
+            samples.update({(op, peer): event['mono_ns'] for peer, event in states.items()
+                            if peer not in self.ended and event['event'] == 'snapshot'})
+        return samples
+
+    def evaluate_rank_losses(self, caught_up):
+        shut_down = len(self.ended) == self.world
+        if not caught_up and not shut_down:
+            return
+        losses = [{'rank': rank, 'last_op_count': item['op_count'], 'process_exited': item['process_exited']}
+                  for rank, item in sorted(self.rank_losses.items())]
+        verified = [item for item in losses if item['process_exited']]
+        diagnosed = (self.last_hang is not None and self.last_hang[0] >= self.next_op and
+                     self.last_hang[1] in ('H2', 'H3'))
+        roots = []
+        if verified and not shut_down and not diagnosed and len(self.observed) == self.world:
+            now = time.monotonic_ns()
+            current = {item['rank']: self.surviving_snapshots(item) for item in verified}
+            if self.rank_loss_check is None:
+                self.rank_loss_check = now, current
+            seen, prior = self.rank_loss_check
+            if now - seen < self.RANK_LOSS_GRACE_NS:
+                return
+            # Let terminal records drain before attributing a disrupted
+            # collective. Require live peer evidence newer than the first
+            # caught-up view, comparing timestamps only on that peer.
+            roots = [rank for rank, samples in current.items()
+                     if any(when > prior[rank].get(key, -1) for key, when in samples.items())]
+        self.rank_losses.clear()
+        self.rank_loss_check = None
+        if roots:
+            self.mark_gap(None, 'verified process exit with surviving peers in outstanding collective work',
+                          category='rank_liveness', kind='rank_exit', roots=roots, rank_streams=losses)
+        else:
+            reason = ('rank stream ended without verified process exit' if not verified else
+                      'rank process exited without evidence of an interrupted collective')
+            self.mark_gap(None, reason, rank_streams=losses)
+
     def evaluate(self, allow_partial_hang):
         if self.rank_losses:
-            losses = [{'rank': rank, 'last_op_count': item['op_count'],
-                       'process_exited': item['process_exited']}
-                      for rank, item in sorted(self.rank_losses.items())]
-            self.rank_losses.clear()
-            roots = [item['rank'] for item in losses if item['process_exited']]
-            diagnosed = (self.last_hang is not None and self.last_hang[0] >= self.next_op and
-                         self.last_hang[1] in ('H2', 'H3'))
-            if roots and not diagnosed and len(roots) < self.world:
-                self.mark_gap(None, 'local process exited before the communicator ended',
-                              category='rank_liveness', kind='rank_exit', roots=roots, rank_streams=losses)
-            elif roots:
-                self.mark_gap(None, 'rank exits observed after a diagnosis or during communicator-wide shutdown',
-                              rank_streams=losses)
-            else:
-                self.mark_gap(None, 'rank stream closed without verified process exit', rank_streams=losses)
+            self.evaluate_rank_losses(allow_partial_hang)
+            if self.rank_losses:
+                return
         if self.gap:
             return
         while (states := self.pending.get(self.next_op)) is not None:
