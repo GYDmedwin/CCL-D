@@ -35,6 +35,14 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual((out[0]['kind'], out[0]['roots']), ('H1', [3]))
         self.assertEqual(analyze(rows[:-1], self.cfg)[0]['kind'], 'undetermined')
 
+    def test_h2_checks_complete_signatures_without_a_timeout(self):
+        rows = [ev(rank, 'complete', count=64 if rank == 2 else 256) for rank in range(4)]
+        out = analyze(rows, self.cfg)[0]
+        self.assertEqual((out['category'], out['kind'], out['roots']), ('collective_mismatch', 'H2', [2]))
+        rows[3]['count'] = 64
+        out = analyze(rows, self.cfg)[0]
+        self.assertEqual((out['kind'], out['roots']), ('undetermined', []))
+
     def test_h2_reports_completed_rank(self):
         rows = [ev(i, 'snapshot', duration=2000) for i in (0, 1, 2)]
         rows.append(ev(3, 'complete', duration=500, count=255))
@@ -166,7 +174,18 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(groups, [('tree:channel=0:depth=1', [1, 2], 0)])
         events[1]['channels'][0]['send_count'] = 1
         events[1]['channels'][0]['recv_count'] = 1
-        self.assertEqual(analyze(list(events.values()), self.cfg)[0]['roots'], [1])
+        unreferenced = analyze(list(events.values()), self.cfg)[0]
+        self.assertEqual((unreferenced['kind'], unreferenced['roots']), ('undetermined', []))
+        baseline = [ev(i, 'complete', algorithm='Tree') for i in range(4)]
+        for rank, event in events.items():
+            baseline[rank]['channels'][0]['tree_parent'] = event['channels'][0]['tree_parent']
+            event['op_count'] = 2
+        out = analyze(baseline + list(events.values()), self.cfg)[0]
+        self.assertEqual((out['kind'], out['roots'], out['reference_op_count']), ('H3', [1], 1))
+        events[3]['channels'][0].update(send_count=1, recv_count=1)
+        tied = analyze(baseline + list(events.values()), self.cfg)[0]
+        self.assertEqual((tied['kind'], tied['roots'], tied['candidate_ranks']),
+                         ('undetermined', [], [1, 3]))
 
     def test_chain_tree_reports_slow_coverage_unavailable_without_alarm(self):
         rows = [ev(i, 'complete', duration=100, algorithm='Tree') for i in range(4)]

@@ -77,8 +77,13 @@ and operation metadata.
 | Hang class | Evidence used for diagnosis |
 |---|---|
 | H1 | Prior rank progress shows that one or more ranks have yet to enter the collective. |
-| H2 | All ranks have entered. Some complete before the hang threshold while others remain hung, or all hang and a minority has a different operation signature. |
-| H3 | All ranks remain hung on a consistent operation, and comparable progress counts identify candidate ranks. |
+| H2 | Ranks disagree on the collective signature, or some ranks complete before the threshold while peers remain stuck. A strict majority is required to attribute a signature mismatch to the minority. |
+| H3 | All ranks remain hung on a consistent operation. Tree compares each rank with its own progress in a matching completed round. |
+
+The live analyzer reports `rank_exit` when a node agent can verify that a
+rank process exited before closing its communicator. It retains the rank and
+its last observed operation counter. Upgrade the node agent and analyzer
+together to use this record.
 
 For **cross-communicator wait attribution**, the training runtime supplies
 the exact collective IDs on both sides of an observed wait. For an H1 alert,

@@ -11,10 +11,10 @@ import time
 REPRO = Path(os.environ.get('CCLD_REPRO_ROOT', Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(REPRO / 'tools'))
 if __package__:
-    from .decode_ccld_binary import (Event, RECORD_BYTES, WAIT_CHANNEL_FIELDS, channel_payload,
+    from .decode_ccld_binary import (Event, RANK_STREAM_LOST, RECORD_BYTES, WAIT_CHANNEL_FIELDS, channel_payload,
                                      decode_event, parse_event, text)
 else:
-    from decode_ccld_binary import (Event, RECORD_BYTES, WAIT_CHANNEL_FIELDS, channel_payload,
+    from decode_ccld_binary import (Event, RANK_STREAM_LOST, RECORD_BYTES, WAIT_CHANNEL_FIELDS, channel_payload,
                                     decode_event, parse_event, text)
 
 
@@ -45,7 +45,11 @@ class WaitDecoder:
             self.pending[key] = (ids, payload)
             return None
         record = decode_event(e, raw)
-        if e.type == 1:
+        if e.type == RANK_STREAM_LOST:
+            stream = e.hash, e.rank
+            for key in [key for key in self.pending if key[:2] == stream]:
+                del self.pending[key]
+        elif e.type == 1:
             record['wait_frame_bytes'] = e.count
             record['wait_requested'] = bool(e.count)
         elif e.type in (3, 4):

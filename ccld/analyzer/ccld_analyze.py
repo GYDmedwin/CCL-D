@@ -12,10 +12,17 @@ import math
 import socket
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+if __package__:
+    from .tree_hang import tree_hang
+else:
+    from tree_hang import tree_hang
+
+SIGNATURE_FIELDS = ('op', 'count', 'datatype', 'algorithm', 'protocol')
 
 
 @dataclass(frozen=True)
@@ -105,7 +112,8 @@ def channel_parents(event: dict) -> dict[int, int]:
     return {cid: channel.get('tree_parent') for cid, channel in channel_map(event).items()}
 
 
-def operation_signature_partition(states: dict[int, dict], world_size: int) -> dict:
+def operation_signature_partition(states: dict[int, dict], world_size: int,
+                                  event_type='snapshot') -> dict:
     """Separate inconsistent all-hung signatures only under a strict-majority assumption."""
     if set(states) != set(range(world_size)):
         return {'status': 'incomplete', 'groups': []}
@@ -113,8 +121,8 @@ def operation_signature_partition(states: dict[int, dict], world_size: int) -> d
     for rank in range(world_size):
         event = states[rank]
         op, count, dtype, algorithm, protocol = (event.get(k) for k in
-                                                  ('op', 'count', 'datatype', 'algorithm', 'protocol'))
-        if (event.get('event') != 'snapshot' or type(count) is not int or count < 0 or
+                                                  SIGNATURE_FIELDS)
+        if (event.get('event') != event_type or type(count) is not int or count < 0 or
                 any(not isinstance(x, str) or not x.strip() for x in (op, dtype, algorithm, protocol))):
             return {'status': 'incomplete', 'groups': []}
         key = (op.strip().lower(), count, dtype.strip().lower(), algorithm.strip().lower(), protocol.strip().lower())
@@ -240,6 +248,29 @@ def result_common(comm: str, op_count: int | None, category: str) -> dict:
             'timing_note': 'offline input has no analyzer-side fault/arrival timestamps'}
 
 
+def completed_mismatch(comm, op, states, world):
+    """Check metadata disagreement even when every rank reports completion."""
+    first = states[0]
+    fields = SIGNATURE_FIELDS
+    if all(event is first or all(event.get(k) == first.get(k) for k in fields)
+           for event in states.values()):
+        return None
+    started = time.perf_counter_ns()
+    partition = operation_signature_partition(states, world, event_type='complete')
+    if partition['status'] not in ('minority', 'ambiguous'):
+        return None
+    item = result_common(comm, op, 'collective_mismatch')
+    item.update(kind='H2' if partition['status'] == 'minority' else 'undetermined',
+                roots=partition.get('minority_ranks', []),
+                operation_signature_groups=partition['groups'],
+                reason='all ranks reported completion with inconsistent operation signatures',
+                location_latency_ms=(time.perf_counter_ns() - started) / 1e6)
+    if partition['status'] == 'minority':
+        item['signature_majority_ranks'] = partition['majority_ranks']
+        item['signature_heuristic'] = 'strict_majority_assumed_correct'
+    return item
+
+
 def slow_decision(comm, op, states, label, window, members, cid, base, baseline, detections, cfg):
     durs = {r: states[r]['duration_ns'] / 1e6 for r in members}
     tmax, tmin = max(durs.values()), min(durs.values())
@@ -272,7 +303,7 @@ def slow_decision(comm, op, states, label, window, members, cid, base, baseline,
     return item
 
 
-def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
+def analyze_comm(comm: str, events: list[dict], cfg: Config, *, tree_references=()) -> list[dict]:
     sizes = {e['world_size'] for e in events}
     if len(sizes) != 1:
         return [{'comm_hash': comm, 'category': 'invalid', 'reason': 'inconsistent world_size'}]
@@ -304,6 +335,7 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
                            'reason': event.get('reason', 'untraced activity')})
     completed: list[tuple[int, dict[int, dict], int]] = []
     earliest_incomplete = None
+    tree_references = deque(tree_references, maxlen=4)
     for op, records in sorted(by_op.items()):
         if gap_boundaries and op > min(gap_boundaries):
             item = result_common(comm, op, 'invalid')
@@ -343,8 +375,14 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
         if not measured or is_barrier:
             continue
         if all_complete and blocked_by is None:
+            mismatch = completed_mismatch(comm, op, states, world)
+            if mismatch:
+                output.append(mismatch)
+                continue
             # Rank 0's local completion clock defines window boundaries.
             completed.append((op, states, states[0]['mono_ns']))
+            if str(states[0].get('algorithm', '')).lower() == 'tree':
+                tree_references.append(states)
         long_events = [e for e in measured if e['duration_ns'] >= cfg.hang_s * 1e9]
         if not long_events:
             continue
@@ -403,6 +441,11 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
                     hang.update(kind='undetermined', roots=[],
                                 reason=('incomplete operation signatures' if partition['status'] == 'incomplete'
                                         else 'conflicting operation signatures have no strict majority'))
+                    hang['location_latency_ms'] = (time.perf_counter_ns() - locate_start) / 1e6
+                    output.append(hang)
+                    continue
+                if str(states[0].get('algorithm', '')).lower() == 'tree':
+                    hang.update(tree_hang(states, tree_references, cfg.hang_s * 1e9))
                     hang['location_latency_ms'] = (time.perf_counter_ns() - locate_start) / 1e6
                     output.append(hang)
                     continue

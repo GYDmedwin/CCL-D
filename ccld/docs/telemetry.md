@@ -10,7 +10,25 @@ A producer must identify and disclose dropped/overwritten frames, unsupported al
 
 ## Analyzer semantics and limitations
 
-`analyzer/ccld_analyze.py` groups by communicator and operation counter. `Ring` compares all observed ranks; `Tree` reconstructs each channel's actual parent graph and compares ranks at equal depth, skipping singleton layers. Missing topology or invalid graphs do not fall back to all-rank comparisons. Hang classification follows H1/H2/H3 in the request. H1 requires a prior record for the rank, and a missing log is undetermined; even so, an old log cannot distinguish a paused process from a delayed log. H2 is the paper's completed-versus-hung heuristic, not proof that an operation signature mismatched. H3 returns all tied minimum candidates instead of falsely selecting a single rank.
+The analyzer groups records by communicator and operation counter. Ring
+compares progress across ranks with matching channels. For Tree H3 it
+compares each rank's progress with that rank's completed progress on the
+same operation signature and channel topology. Tied minima retain their
+candidate ranks and leave the root undetermined. A missing reference leaves
+the diagnosis undetermined. Equal-depth comparisons remain available for
+Tree slow analysis.
+
+A completed round with inconsistent operation signatures emits
+`collective_mismatch`. The analyzer locates the minority ranks when one
+signature has a strict majority. It keeps the result undetermined on a tie
+and excludes the round from slow baseline learning.
+
+The live node agent records a premature rank stream closure with
+`comm_hash`, rank and the last observed operation counter. It can verify
+process exit using the local process identity captured at connection time.
+A verified exit can produce a `rank_exit` diagnosis. A socket closure
+without process evidence remains a rank-scoped coverage gap. The anomaly
+output preserves earlier H2 or H3 diagnoses if rank exits follow them.
 
 An incomplete earlier operation makes subsequent operations indeterminate, since ranks advancing from a mismatch can otherwise make blocked peers look like a new H1 cause. This conservative ordering can delay a diagnosis when independent streams overlap. For H2, a completion only counts as an un-hung rank if its duration is below the hang threshold; callbacks released after an error or abort can otherwise make victims appear to be causes. Completions are host-callback observations, not proof of successful CUDA execution.
 
@@ -31,7 +49,7 @@ signatures proceed to the H3 count rule. The paper introduces Operation Type
 Set for inconsistent operations, but its stated decision tree identifies H2
 from ranks that have already completed. Applying a majority-signature rule
 when all ranks hang is this reproduction's additional heuristic; a minority
-is not proof of causation. The earlier completed-rank H2 rule is unchanged.
+is not proof of causation. A completed round is also checked for inconsistent signatures.
 
 For a completed operation with no comparable rank group, the analyzer emits a
 `category: coverage`, `kind: undetermined` record with a reason and topology

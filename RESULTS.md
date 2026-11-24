@@ -627,3 +627,24 @@ decoding, dropped-record handling, base diagnosis and a synthetic live Ring
 gate. The refactored normalized Ring score was also compared with the prior
 implementation on 1,000 randomly generated valid topologies. These tests are
 not a substitute for repeating the GPU validation matrix on this export.
+
+## Matching-round Tree progress and rank exit
+
+Held-out H100 AllReduce trials used two nodes with eight GPUs per node.
+The table counts exact communicator-rank diagnoses in controlled tests.
+
+| Scenario | Exact diagnosis | Control or placement |
+| --- | ---: | --- |
+| Tree H3 | 4/4 | Simple, LL, and LL128. The target changed between nodes. |
+| Tree H2 with completed operations | 2/2 | Different counts on a single rank. All ranks emitted completion. |
+| Ring H3 | 1/1 | Same bounded GPU spin mechanism. |
+| Tree H1 | 1/1 | Rank delayed before entering the operation. |
+| Rank process exit | 4/4 | Tree and Ring with exits on both hosts. |
+| Healthy | 5/5 clear | Three Hang controls and two matched process-exit controls. |
+
+The Tree H3 rule compares each rank against its own progress in a matching
+completed collective. The exit test confirms that the target GPU stream
+is still in flight before the rank process signals itself. The node agent
+verifies the exit independently and records the latest operation it actually
+received from that rank. The H3 trials simulate a stall with a bounded
+device spin. The exit trials model a separate process-liveness fault.
