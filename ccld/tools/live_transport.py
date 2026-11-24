@@ -23,6 +23,7 @@ from .wait_observation import LIMIT, evidence_record, peer_process, process_grou
 
 PROTOCOL = b'CCLDP002'
 CLOCK_PROTOCOL = b'CCLDC001'
+MULTIPLEXED_RANKS = b'CCLDMS01'
 REQUEST = struct.Struct('!8s32sQ')
 RESPONSE = struct.Struct('!8s16sQQIIQQ')
 CLOCK_RESPONSE = struct.Struct('!8s16sQQ64s')
@@ -171,9 +172,12 @@ def rank_stream_lost_record(identity, op_count, exited):
 async def receive_rank(reader, writer, buffer):
     buffer.active += 1
     process = peer_process(writer)
-    identity, ended, bound, remainder = None, False, False, b''
-    last_op = 0
+    ranks = {}
+    seen = False
     try:
+        prefix = await reader.readexactly(len(MULTIPLEXED_RANKS))
+        multiplexed = prefix == MULTIPLEXED_RANKS
+        remainder = b'' if multiplexed else prefix
         while data := await reader.read(64 * RECORD_BYTES):
             data = remainder + data
             boundary = len(data) // RECORD_BYTES * RECORD_BYTES
@@ -183,22 +187,25 @@ async def receive_rank(reader, writer, buffer):
                 rank_identity = (comm, rank, world)
                 if (magic != 0x444c4343 or not (1 <= kind <= 8 or kind == TREE_WAIT) or
                         (version != 1 and not (version == FRAGMENT_VERSION and kind in FRAGMENT_KINDS)) or
-                        rank >= world or ended or
-                        (identity is None and kind != 1) or
-                        (identity is not None and (kind == 1 or identity != rank_identity))):
+                        rank >= world):
                     raise ValueError('invalid rank telemetry stream')
-                if process is not None and kind == 1:
-                    buffer.bind_rank(process, rank_identity)
-                    bound = True
-                identity = rank_identity
-                last_op = max(last_op, op_count)
-                ended = kind == 8
+                if kind == 1:
+                    if rank_identity in ranks or (seen and not multiplexed):
+                        raise ValueError('unexpected rank telemetry registration')
+                    ranks[rank_identity] = 0
+                    seen = True
+                    if process is not None:
+                        buffer.bind_rank(process, rank_identity)
+                elif rank_identity not in ranks:
+                    raise ValueError('event belongs to an unregistered rank')
+                ranks[rank_identity] = max(ranks[rank_identity], op_count)
                 buffer.append(raw)
-                if ended and bound:
-                    buffer.unbind_rank(process, identity)
-                    bound = False
+                if kind == 8:
+                    del ranks[rank_identity]
+                    if process is not None:
+                        buffer.unbind_rank(process, rank_identity)
             remainder = data[boundary:]
-        if identity is not None and not ended:
+        if ranks:
             exited = process_exited(process)
             if process is not None:
                 # The telemetry socket can close before GPU context teardown
@@ -208,15 +215,17 @@ async def receive_rank(reader, writer, buffer):
                         break
                     await asyncio.sleep(.05)
                     exited = process_exited(process)
-            buffer.append(rank_stream_lost_record(identity, last_op, exited))
-        elif not ended or remainder:
+            for identity, last_op in ranks.items():
+                buffer.append(rank_stream_lost_record(identity, last_op, exited))
+        elif not seen or remainder:
             buffer.failed += 1
-    except (OSError, ValueError):
+    except (OSError, ValueError, asyncio.IncompleteReadError):
         buffer.failed += 1
     finally:
         buffer.active -= 1
-        if bound:
-            buffer.unbind_rank(process, identity)
+        if process is not None:
+            for identity in ranks:
+                buffer.unbind_rank(process, identity)
         writer.close()
         with suppress(OSError):
             await writer.wait_closed()

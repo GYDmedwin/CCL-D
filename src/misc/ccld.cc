@@ -7,6 +7,7 @@
 #include "collectives.h"
 #include "debug.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -19,9 +20,11 @@
 #include <mutex>
 #include <new>
 #include <pthread.h>
+#include <string>
 #include <thread>
 #include <time.h>
 #include <unistd.h>
+#include <vector>
 
 static uint64_t ccldNow() {
   struct timespec t;
@@ -62,13 +65,14 @@ struct CcldSlot {
   uint64_t changesSend[CCLD_MAX_CHANNELS] = {}, changesRecv[CCLD_MAX_CHANNELS] = {};
 };
 struct CcldState {
-  std::mutex waitMu;
-  std::condition_variable cv;
-  std::atomic<bool> stop{false}, writerStop{false}, ioFailed{false};
   std::atomic<int> callbacksOutstanding{0};
+  std::atomic<unsigned> activeFrames{0};
   std::atomic<uint64_t> counter{0}, logDrops{0}, lastDroppedSeq{0};
   FILE* out = nullptr;
-  CcldNodeStream nodeStream;
+  // Sample and writer flags respectively use the worker's registry mutex.
+  bool probeStop = false, probeDone = false, deviceFailed = false;
+  bool writerStop = false, writerDone = false, ioFailed = false;
+  uint64_t nextPollNs = 0, lastHeartbeatNs = 0;
   CcldFrame* frame = nullptr;
   CcldFrame* device = nullptr;
   CcldWaitChannel* waitFrame = nullptr;
@@ -77,7 +81,6 @@ struct CcldState {
   size_t waitBytes = 0, waitBlockBytes = 0;
   size_t frameBytes = 0;
   unsigned frameChannels = 0, frameGroups = 0, frameBlocks = CCLD_BLOCKS;
-  std::thread thread, writer;
   std::unique_ptr<CcldSlot[]> slots;
   CcldPending pending[256];
   std::unique_ptr<CcldQueue<CcldLogEvent>> logQueue;
@@ -122,40 +125,17 @@ static void ccldStatus(CcldState* s, const char*, uint64_t seq, const char* reas
   ccldCopyString(e.reason, sizeof(e.reason), reason);
   ccldLog(s, e);
 }
-static void ccldWriter(CcldState* s) {
-  (void)pthread_setname_np(pthread_self(), "ccld-writer");
-  CcldLogEvent batch[16];
-  for (;;) {
-    size_t n = 0;
-    uint64_t lost = s->logDrops.exchange(0, std::memory_order_acq_rel);
-    if (lost) {
-      batch[n] = ccldLogBase(s, CcldLogDropped, s->lastDroppedSeq.load(std::memory_order_relaxed), ccldNow());
-      batch[n].count = lost;
-      ccldCopyString(batch[n].reason, sizeof(batch[n].reason), "binary_queue_overflow");
-      ++n;
-    }
-    while (n < 16 && s->logQueue->pop(batch[n])) ++n;
-    if (n) {
-      if (s->ioFailed.load(std::memory_order_relaxed)) continue;
-      const bool sent = s->out ?
-          (fwrite(batch, sizeof(CcldLogEvent), n, s->out) == n && fflush(s->out) == 0) :
-          s->nodeStream.write(batch, n * sizeof(CcldLogEvent));
-      if (!sent) {
-        s->ioFailed.store(true, std::memory_order_relaxed);
-        s->nodeStream.close();
-        WARN("CCL-D telemetry writer lost its sink");
-      }
-    } else if (s->writerStop.load(std::memory_order_acquire)) {
-      break;
-    } else {
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
+static size_t ccldReadBatch(CcldState* s, CcldLogEvent* batch, size_t capacity) {
+  size_t n = 0;
+  uint64_t lost = s->logDrops.exchange(0, std::memory_order_acq_rel);
+  if (lost) {
+    batch[n] = ccldLogBase(s, CcldLogDropped, s->lastDroppedSeq.load(std::memory_order_relaxed), ccldNow());
+    batch[n].count = lost;
+    ccldCopyString(batch[n].reason, sizeof(batch[n].reason), "binary_queue_overflow");
+    ++n;
   }
-  if (!s->out && !s->ioFailed.load(std::memory_order_relaxed)) {
-    CcldLogEvent end = ccldLogBase(s, CcldLogEnd, s->counter.load(std::memory_order_relaxed), ccldNow());
-    if (!s->nodeStream.write(&end, sizeof(end))) WARN("CCL-D could not deliver final telemetry marker");
-    s->nodeStream.close();
-  }
+  while (n < capacity && s->logQueue->pop(batch[n])) ++n;
+  return n;
 }
 static uint64_t ccldLoad(const uint64_t* p) {
   return *(const volatile uint64_t*)p;
@@ -235,63 +215,255 @@ static void ccldEmit(CcldState* s, int idx, const char* type, uint64_t now) {
   ccldLog(s, e);
   slot.lastDumpNs = now;
 }
-static void ccldWorker(CcldState* s) {
-  (void)pthread_setname_np(pthread_self(), "ccld-probe");
-  const bool deviceReady = !s->useEvent || cudaSetDevice(s->cudaDev) == cudaSuccess;
-  std::unique_lock<std::mutex> lock(s->waitMu);
-  if (!deviceReady) ccldStatus(s, "dropped", 0, "event_worker_device_setup_failed");
-  uint64_t lastHeartbeat = ccldNow();
-  while (!s->stop.load(std::memory_order_acquire)) {
-    s->cv.wait_for(lock, std::chrono::microseconds(s->pollUs));
-    uint64_t now = ccldNow();
-    for (unsigned i = 0; i < s->frameBlocks; ++i) {
-      CcldSlot& slot = s->slots[i];
-      if (slot.phase.load(std::memory_order_acquire) != 2) continue;
-      ccldSample(s, i);
-      if (s->useEvent && deviceReady && slot.eventRecorded.load(std::memory_order_acquire) &&
-          !slot.done.load(std::memory_order_relaxed) && !slot.eventFailed) {
-        cudaError_t query = cudaEventQuery(slot.completionEvent);
-        if (query == cudaSuccess) {
-          ccldSample(s, i); // Re-read after CUDA confirms the kernel has completed.
-          slot.endNs.store(ccldNow(), std::memory_order_relaxed);
-          slot.done.store(true, std::memory_order_release);
-        } else if (query != cudaErrorNotReady) {
-          slot.eventFailed = true;
-          ccldStatus(s, "dropped", slot.seq, "completion_event_query_failed");
-        }
-      }
-      if (slot.done.load(std::memory_order_acquire)) {
-        uint64_t end = slot.endNs.load(std::memory_order_relaxed);
-        ccldEmit(s, i, "complete", end);
-        slot.phase.store(0, std::memory_order_release);
-      } else if (now >= slot.lastDumpNs &&
-                 now - slot.lastDumpNs >= (slot.treeWait ? s->treeDumpNs : s->dumpNs)) {
-        ccldEmit(s, i, "snapshot", now);
-      }
-    }
-    if (now - lastHeartbeat >= s->dumpNs) {
-      ccldLog(s, ccldLogBase(s, CcldLogHeartbeat, s->counter.load(std::memory_order_relaxed), now));
-      lastHeartbeat = now;
-    }
-  }
-  // Drain already completed slots even if shutdown follows a callback quickly.
+static void ccldPoll(CcldState* s, bool deviceReady, uint64_t now, bool draining) {
   for (unsigned i = 0; i < s->frameBlocks; ++i) {
     CcldSlot& slot = s->slots[i];
     if (slot.phase.load(std::memory_order_acquire) != 2) continue;
     ccldSample(s, i);
     if (s->useEvent && deviceReady && slot.eventRecorded.load(std::memory_order_acquire) &&
-        !slot.done.load(std::memory_order_relaxed) && !slot.eventFailed && cudaEventQuery(slot.completionEvent) == cudaSuccess) {
-      ccldSample(s, i);
-      slot.endNs.store(ccldNow(), std::memory_order_relaxed);
-      slot.done.store(true, std::memory_order_release);
+        !slot.done.load(std::memory_order_relaxed) && !slot.eventFailed) {
+      cudaError_t query = cudaEventQuery(slot.completionEvent);
+      if (query == cudaSuccess) {
+        ccldSample(s, i);
+        slot.endNs.store(ccldNow(), std::memory_order_relaxed);
+        slot.done.store(true, std::memory_order_release);
+      } else if (!draining && query != cudaErrorNotReady) {
+        slot.eventFailed = true;
+        ccldStatus(s, "dropped", slot.seq, "completion_event_query_failed");
+      }
     }
     if (slot.done.load(std::memory_order_acquire)) {
       ccldEmit(s, i, "complete", slot.endNs.load(std::memory_order_relaxed));
+      s->activeFrames.fetch_sub(1, std::memory_order_release);
       slot.phase.store(0, std::memory_order_release);
-    } else {
-      ccldEmit(s, i, "snapshot", ccldNow());
+    } else if (draining ||
+               (now >= slot.lastDumpNs && now - slot.lastDumpNs >= (slot.treeWait ? s->treeDumpNs : s->dumpNs))) {
+      ccldEmit(s, i, "snapshot", now);
     }
   }
+}
+
+// Registry locks only serialize worker loops and communicator lifecycle.
+// Collective enqueue keeps using its own bounded queue and frame slots.
+class CcldProcessWorkers {
+  std::mutex probeMu, writerMu;
+  std::mutex probeWakeMu;
+  std::condition_variable probeCv, probeRetiredCv, writerCv;
+  uint64_t probeGeneration = 0;
+  std::vector<CcldState*> probes, writers;
+  std::thread probe, writer;
+  bool stopProbe = false, stopWriter = false;
+  CcldNodeStream stream;
+  std::string socketPath;
+  size_t onlineUsers = 0;
+  bool connected = false;
+
+  bool selectDevice(CcldState* s, int& currentDevice) {
+    if (!s->useEvent) return true;
+    if (s->deviceFailed) return false;
+    if (s->cudaDev == currentDevice) return true;
+    if (cudaSetDevice(s->cudaDev) == cudaSuccess) {
+      currentDevice = s->cudaDev;
+      return true;
+    }
+    s->deviceFailed = true;
+    currentDevice = -1;
+    ccldStatus(s, "dropped", 0, "event_worker_device_setup_failed");
+    return false;
+  }
+
+  void probeLoop() {
+    (void)pthread_setname_np(pthread_self(), "ccld-probe");
+    int currentDevice = -1;
+    while (true) {
+      std::unique_lock<std::mutex> wakeLock(probeWakeMu);
+      const uint64_t generation = probeGeneration;
+      wakeLock.unlock();
+
+      uint64_t deadline = UINT64_MAX;
+      {
+        std::lock_guard<std::mutex> lock(probeMu);
+        if (stopProbe) return;
+        for (auto it = probes.begin(); it != probes.end();) {
+          CcldState* s = *it;
+          uint64_t now = ccldNow();
+          if (s->probeStop) {
+            ccldPoll(s, selectDevice(s, currentDevice), now, true);
+            it = probes.erase(it);
+            s->probeDone = true;
+            probeRetiredCv.notify_all();
+            continue;
+          }
+          if (now >= s->nextPollNs && s->activeFrames.load(std::memory_order_acquire) != 0) {
+            ccldPoll(s, selectDevice(s, currentDevice), now, false);
+            s->nextPollNs = ccldNow() + s->pollUs * 1000;
+          }
+          if (s->activeFrames.load(std::memory_order_acquire) != 0) {
+            deadline = std::min(deadline, s->nextPollNs);
+          }
+          if (now - s->lastHeartbeatNs >= s->dumpNs) {
+            ccldLog(s, ccldLogBase(s, CcldLogHeartbeat, s->counter.load(std::memory_order_relaxed), now));
+            s->lastHeartbeatNs = now;
+          }
+          deadline = std::min(deadline, s->lastHeartbeatNs + s->dumpNs);
+          ++it;
+        }
+      }
+
+      // A transition during the scan changes the generation. A transition
+      // during parking shares this lock with the condition-variable wait.
+      wakeLock.lock();
+      auto ready = [this, generation] { return probeGeneration != generation; };
+      if (deadline == UINT64_MAX) {
+        probeCv.wait(wakeLock, ready);
+      } else {
+        const uint64_t now = ccldNow();
+        if (deadline > now) probeCv.wait_for(wakeLock, std::chrono::nanoseconds(deadline - now), ready);
+      }
+    }
+  }
+
+  void send(const CcldLogEvent* batch, size_t n) {
+    if (n && connected && !stream.write(batch, n * sizeof(CcldLogEvent))) {
+      connected = false;
+      stream.close();
+      WARN("CCL-D shared writer lost its node agent");
+    }
+  }
+
+  void writerLoop() {
+    (void)pthread_setname_np(pthread_self(), "ccld-writer");
+    constexpr size_t perComm = 16, maxBatch = 64;
+    CcldLogEvent mixed[maxBatch], file[perComm];
+    while (true) {
+      std::unique_lock<std::mutex> lock(writerMu);
+      if (stopWriter) return;
+      if (writers.empty()) {
+        writerCv.wait(lock);
+        continue;
+      }
+      size_t used = 0;
+      bool worked = false;
+      for (auto it = writers.begin(); it != writers.end();) {
+        CcldState* s = *it;
+        if (!s->out && used + perComm > maxBatch) {
+          send(mixed, used);
+          used = 0;
+        }
+        size_t n = ccldReadBatch(s, s->out ? file : mixed + used, perComm);
+        if (n) {
+          worked = true;
+          if (!s->out) {
+            used += n;
+          } else if (!s->ioFailed &&
+                     (fwrite(file, sizeof(CcldLogEvent), n, s->out) != n || fflush(s->out) != 0)) {
+            s->ioFailed = true;
+            WARN("CCL-D shared writer lost a file sink");
+          }
+        }
+        if (n || !s->writerStop) {
+          ++it;
+          continue;
+        }
+        if (!s->out) {
+          mixed[used++] = ccldLogBase(s, CcldLogEnd, s->counter.load(std::memory_order_relaxed), ccldNow());
+          --onlineUsers;
+        }
+        it = writers.erase(it);
+        s->writerDone = true;
+        writerCv.notify_all();
+      }
+      send(mixed, used);
+      if (onlineUsers == 0 && !socketPath.empty()) {
+        stream.close();
+        connected = false;
+        socketPath.clear();
+      }
+      if (!worked && !writers.empty()) writerCv.wait_for(lock, std::chrono::milliseconds(2));
+    }
+  }
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lock(probeMu);
+      stopProbe = true;
+    }
+    wakeProbe();
+    {
+      std::lock_guard<std::mutex> lock(writerMu);
+      stopWriter = true;
+    }
+    writerCv.notify_all();
+    if (probe.joinable()) probe.join();
+    if (writer.joinable()) writer.join();
+  }
+
+ public:
+  CcldProcessWorkers() {
+    probe = std::thread(&CcldProcessWorkers::probeLoop, this);
+    try {
+      writer = std::thread(&CcldProcessWorkers::writerLoop, this);
+    } catch (...) {
+      stop();
+      throw;
+    }
+  }
+  ~CcldProcessWorkers() { stop(); }
+
+  void wakeProbe() {
+    std::lock_guard<std::mutex> lock(probeWakeMu);
+    ++probeGeneration;
+    probeCv.notify_one();
+  }
+
+  bool attach(CcldState* s, const char* path) {
+    std::unique_lock<std::mutex> plock(probeMu, std::defer_lock);
+    std::unique_lock<std::mutex> wlock(writerMu, std::defer_lock);
+    std::lock(plock, wlock);
+    probes.reserve(probes.size() + 1);
+    writers.reserve(writers.size() + 1);
+    if (path) {
+      if (onlineUsers == 0) {
+        std::string name(path);
+        constexpr char preface[] = "CCLDMS01";
+        if (!stream.open(path) || !stream.write(preface, sizeof(preface) - 1)) {
+          stream.close();
+          return false;
+        }
+        socketPath.swap(name);
+        connected = true;
+      } else if (!connected || socketPath != path) {
+        return false;
+      }
+      ++onlineUsers;
+    }
+    s->lastHeartbeatNs = ccldNow();
+    probes.push_back(s);
+    writers.push_back(s);
+    wakeProbe();
+    writerCv.notify_one();
+    return true;
+  }
+
+  void detach(CcldState* s) {
+    {
+      std::unique_lock<std::mutex> lock(probeMu);
+      s->probeStop = true;
+      wakeProbe();
+      probeRetiredCv.wait(lock, [s] { return s->probeDone; });
+    }
+    {
+      std::unique_lock<std::mutex> lock(writerMu);
+      s->writerStop = true;
+      writerCv.notify_all();
+      writerCv.wait(lock, [s] { return s->writerDone; });
+    }
+  }
+};
+
+static CcldProcessWorkers& ccldProcessWorkers() {
+  static CcldProcessWorkers workers;
+  return workers;
 }
 void ccldInit(ncclComm* comm) {
   static_assert(MAXCHANNELS <= CCLD_MAX_CHANNELS, "increase CCLD_MAX_CHANNELS");
@@ -340,11 +512,7 @@ void ccldInit(ncclComm* comm) {
   const uint64_t dumpMs = envNumber("NCCL_CCLD_DUMP_MS", 1000, 10, 60000);
   s->dumpNs = dumpMs * 1000000ull;
   s->treeDumpNs = envNumber("NCCL_CCLD_TREE_SNAPSHOT_MS", dumpMs, 1, 60000) * 1000000ull;
-  if (inMemory) {
-    if (!s->nodeStream.open(nodeSocket)) {
-      WARN("CCL-D cannot connect to local node agent; telemetry disabled"); delete s; return;
-    }
-  } else {
+  if (!inMemory) {
     char path[4096];
     int n = snprintf(path, sizeof(path), "%s/ccld-%016" PRIx64 "-rank%d-pid%ld.ccldbin", dir, s->hash, s->rank, (long)getpid());
     if (n < 0 || size_t(n) >= sizeof(path) || (s->out = fopen(path, "wb")) == nullptr) {
@@ -419,13 +587,14 @@ void ccldInit(ncclComm* comm) {
   ccldCopyString(init.host, sizeof(init.host), s->host);
   ccldCopyString(init.reason, sizeof(init.reason), s->useEvent ? "event_query" : "hostfunc");
   ccldLog(s, init);
+  bool registered = false;
   try {
-    s->writer = std::thread(ccldWriter, s);
-    s->thread = std::thread(ccldWorker, s);
+    registered = ccldProcessWorkers().attach(s, inMemory ? nodeSocket : nullptr);
   } catch (const std::exception& e) {
-    WARN("CCL-D thread creation failed: %s", e.what());
-    s->writerStop.store(true, std::memory_order_release);
-    if (s->writer.joinable()) s->writer.join();
+    WARN("CCL-D shared worker setup failed: %s", e.what());
+  }
+  if (!registered) {
+    WARN("CCL-D shared telemetry registration failed");
     if (s->useEvent) for (unsigned i = 0; i < s->frameBlocks; ++i) cudaEventDestroy(s->slots[i].completionEvent);
     if (s->waitFrame) cudaFreeHost(s->waitFrame);
     cudaFreeHost(s->frame); delete s; return;
@@ -544,10 +713,11 @@ void ccldPlan(ncclComm* comm, ncclKernelPlan* plan) {
   }
   slot.done.store(false, std::memory_order_relaxed); slot.endNs.store(0, std::memory_order_relaxed);
   slot.eventRecorded.store(false, std::memory_order_relaxed); slot.eventFailed = false;
+  const bool wasIdle = s->activeFrames.fetch_add(1, std::memory_order_release) == 0;
   slot.phase.store(2, std::memory_order_release);
   work->ccldSlotPlus1 = index + 1;
   plan->ccldSlotPlus1 = index + 1;
-  s->cv.notify_one();
+  if (wasIdle) ccldProcessWorkers().wakeProbe();
 }
 static void CUDART_CB ccldDone(void* data) {
   CcldCallback* cb = static_cast<CcldCallback*>(data);
@@ -555,7 +725,6 @@ static void CUDART_CB ccldDone(void* data) {
   CcldSlot& slot = s->slots[cb->slot];
   slot.endNs.store(ccldNow(), std::memory_order_relaxed);
   slot.done.store(true, std::memory_order_release);
-  s->cv.notify_one();
   delete cb;
   // This must be the callback's last access to s; destruction checks it.
   s->callbacksOutstanding.fetch_sub(1, std::memory_order_release);
@@ -567,7 +736,6 @@ void ccldCallbackEnqueue(ncclComm* comm, ncclKernelPlan* plan, cudaStream_t stre
     cudaError_t err = cudaEventRecord(slot.completionEvent, stream);
     if (err == cudaSuccess) {
       slot.eventRecorded.store(true, std::memory_order_release);
-      s->cv.notify_one();
     } else {
       ccldStatus(s, "dropped", slot.seq, "completion_event_record_failed");
       WARN("CCL-D event record failed: %s", cudaGetErrorString(err));
@@ -589,11 +757,7 @@ void ccldCallbackEnqueue(ncclComm* comm, ncclKernelPlan* plan, cudaStream_t stre
 void ccldFree(ncclComm* comm) {
   CcldState* s = static_cast<CcldState*>(comm->ccldState);
   if (!s) return;
-  s->stop.store(true, std::memory_order_release);
-  s->cv.notify_one();
-  s->thread.join();
-  s->writerStop.store(true, std::memory_order_release);
-  s->writer.join();
+  ccldProcessWorkers().detach(s);
   bool active = false;
   for (unsigned i = 0; i < s->frameBlocks; ++i) active |= s->slots[i].phase.load(std::memory_order_acquire) != 0;
   active |= s->callbacksOutstanding.load(std::memory_order_acquire) != 0;
