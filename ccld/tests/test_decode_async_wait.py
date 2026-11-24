@@ -77,6 +77,28 @@ class WaitDecoderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'inconsistent Tree-wait pair'):
             decoder.consume(bytes(progress))
 
+    def test_fragmented_tree_progress_waits_for_the_last_peer_record(self):
+        decoder = WaitDecoder(defer_channels=True)
+        row = struct.Struct('<5i9I')
+        for progress in fragments(33):
+            progress.algorithm, progress.reason = b'Tree', b'tree_wait_v1'
+            wait = Event.from_buffer_copy(bytes(progress))
+            wait.type = 10
+            payload = bytearray(bytes(wait))
+            for index in range(progress.nChannels):
+                cid = progress.channels[index].id
+                progress.channels[index].parent = 4
+                row.pack_into(payload, Event.channels.offset + index * row.size,
+                              cid, 4, 1, 2, -1, 0, cid, 1, 2, 0, 0, 3, 4, 0)
+            self.assertIsNone(decoder.consume(payload))
+            result = decoder.consume(bytes(progress))
+            if progress.nChannels == 32:
+                self.assertIsNone(result)
+        decoder.finish()
+        self.assertEqual(result['n_channels'], 33)
+        self.assertEqual(result['channels'][-1]['tree_wait_peers'][0],
+                         {'rank': 4, 'data_spins': 32, 'credit_spins': 0})
+
     def test_progress_timestamp_requires_the_feature_flag_and_a_valid_interval(self):
         progress = event(4)
         progress.startNs = (1 << 32) + 20
