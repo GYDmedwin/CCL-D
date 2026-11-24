@@ -11,15 +11,15 @@ from unittest.mock import AsyncMock, Mock, patch
 from ccld.analyzer.ccld_analyze import Config, analyze, comparable_groups
 from ccld.analyzer.live import Endpoint, LiveAnalysis, SlowWindow, make_analysis
 from ccld.tools.decode_async_wait import Event, WaitDecoder
-from ccld.tools.live_transport import NodeBuffer, Pull, rank_stream_lost_record, receive_rank
+from ccld.tools.live_transport import MULTIPLEXED_RANKS, NodeBuffer, Pull, rank_stream_lost_record, receive_rank
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def event(kind, rank, op, when, duration=0):
+def event(kind, rank, op, when, duration=0, *, comm=42):
     e = Event()
     e.magic, e.version, e.type = 0x444c4343, 1, kind
-    e.hash, e.rank, e.nranks = 42, rank, 2
+    e.hash, e.rank, e.nranks = comm, rank, 2
     e.seq, e.nowNs, e.windowNs = op, when, 1000
     if kind in (3, 4):
         e.startNs = when - duration
@@ -46,7 +46,12 @@ class RankStreamLossTests(unittest.IsolatedAsyncioTestCase):
         analysis.add(decoder.consume(event(1, 0, 0, 0)))
         for raw in buffer.records[:buffer.end]:
             analysis.add(decoder.consume(raw))
-        analysis.evaluate()
+        with patch('ccld.analyzer.live.time.monotonic_ns', return_value=1_000_000_000):
+            analysis.evaluate()
+        self.assertFalse(results)
+        analysis.add(decoder.consume(event(3, 0, 4, 2_001_000_000, 1_500_000_000)))
+        with patch('ccld.analyzer.live.time.monotonic_ns', return_value=2_001_000_000):
+            analysis.evaluate()
         self.assertEqual([(x['kind'], x['roots']) for x in results], [('rank_exit', [1])])
         self.assertEqual(results[0]['rank_streams'],
                          [{'rank': 1, 'last_op_count': 4, 'process_exited': True}])
@@ -63,6 +68,71 @@ class RankStreamLossTests(unittest.IsolatedAsyncioTestCase):
         analysis.evaluate()
         self.assertEqual([(x['category'], x['roots']) for x in results], [('coverage_gap', [])])
         self.assertEqual(results[0]['rank_streams'][0]['rank'], 1)
+
+    async def test_verified_exit_after_the_last_completion_is_a_coverage_gap(self):
+        results = []
+        analysis, decoder = LiveAnalysis(Config(baseline_ms=1.), results.append), WaitDecoder()
+        for rank in range(2):
+            analysis.add(decoder.consume(event(1, rank, 0, 0)))
+            analysis.add(decoder.consume(event(4, rank, 1, 10_000, 500)))
+        analysis.evaluate()
+        analysis.add(decoder.consume(rank_stream_lost_record((42, 1, 2), 1, True)))
+        analysis.evaluate()
+        self.assertFalse(results)
+        analysis.add(decoder.consume(event(8, 0, 1, 20_000)))
+        analysis.evaluate()
+        self.assertEqual([(row['category'], row['roots']) for row in results], [('coverage_gap', [])])
+
+    async def test_peer_last_completion_can_arrive_after_the_rank_loss(self):
+        results = []
+        analysis, decoder = LiveAnalysis(Config(baseline_ms=1.), results.append), WaitDecoder()
+        for rank in range(2):
+            analysis.add(decoder.consume(event(1, rank, 0, 0)))
+        analysis.add(decoder.consume(event(3, 0, 1, 1_000, 500)))
+        analysis.add(decoder.consume(rank_stream_lost_record((42, 1, 2), 1, True)))
+        with patch('ccld.analyzer.live.time.monotonic_ns', return_value=1_000_000_000):
+            analysis.evaluate()
+        analysis.add(decoder.consume(event(4, 0, 1, 1_500, 1_000)))
+        with patch('ccld.analyzer.live.time.monotonic_ns', return_value=2_100_000_000):
+            analysis.evaluate()
+        self.assertEqual([(row['category'], row['roots']) for row in results], [('coverage_gap', [])])
+
+
+
+class MultiplexedRankTests(unittest.IsolatedAsyncioTestCase):
+    async def receive(self, header, records):
+        buffer = NodeBuffer(16)
+        transport = asyncio.StreamReader()
+        transport.feed_data(header + b''.join(records))
+        transport.feed_eof()
+        writer = Mock(wait_closed=AsyncMock())
+        with patch('ccld.tools.live_transport.peer_process', return_value=(42, '100')), \
+                patch('ccld.tools.live_transport.process_exited', return_value=True):
+            await receive_rank(transport, writer, buffer)
+        self.assertEqual(buffer.active, 0)
+        self.assertFalse(buffer.process_streams)
+        self.assertFalse(buffer.binding_since)
+        return buffer
+
+    async def test_clean_ends_of_two_interleaved_communicators(self):
+        records = [event(1, 0, 0, 0), event(1, 1, 0, 1, comm=57),
+                   event(2, 1, 1, 2, comm=57), event(8, 0, 0, 3),
+                   event(4, 1, 1, 4, comm=57), event(8, 1, 1, 5, comm=57)]
+        buffer = await self.receive(MULTIPLEXED_RANKS, records)
+        self.assertEqual((buffer.failed, buffer.end), (0, len(records)))
+        self.assertEqual(buffer.records[:buffer.end], records)
+
+    async def test_disconnect_labels_every_live_rank_and_keeps_ended_rank_closed(self):
+        records = [event(1, 0, 0, 0), event(1, 1, 0, 0, comm=57), event(1, 1, 0, 0, comm=99),
+                   event(2, 0, 4, 1), event(2, 1, 7, 1, comm=57), event(8, 1, 0, 3, comm=99)]
+        buffer = await self.receive(MULTIPLEXED_RANKS, records)
+        self.assertEqual((buffer.failed, buffer.end), (0, len(records) + 2))
+        lost = [Event.from_buffer_copy(raw) for raw in buffer.records[len(records):buffer.end]]
+        self.assertEqual({(r.hash, r.rank, r.seq, r.reserved) for r in lost}, {(42, 0, 4, 1), (57, 1, 7, 1)})
+
+    async def test_only_multiplexed_transport_can_open_multiple_ranks(self):
+        buffer = await self.receive(b'', [event(1, 0, 0, 0), event(1, 1, 0, 0, comm=57)])
+        self.assertEqual((buffer.failed, buffer.end), (1, 1))
 
 
 class LiveDecisionTests(unittest.TestCase):
