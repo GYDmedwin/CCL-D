@@ -10,6 +10,7 @@ class AdmissionEvidence(NamedTuple):
     spread_ns: float
     delayed_rank: int | None
     confirmed_rank: int | None
+    max_excess_ns: float
 
 
 class RankAdmission:
@@ -54,4 +55,4 @@ class RankAdmission:
         delayed = rank if largest >= self.MIN_EXCESS_NS and largest - max(second, 0) >= self.MIN_SEPARATION_NS else None
         self.votes.append(delayed)
         confirmed = delayed if delayed is not None and self.votes.count(delayed) >= 3 else None
-        return AdmissionEvidence(largest - excess[-1][0], delayed, confirmed)
+        return AdmissionEvidence(largest - excess[-1][0], delayed, confirmed, largest)
