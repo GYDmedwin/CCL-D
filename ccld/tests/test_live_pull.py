@@ -6,11 +6,12 @@ import signal
 import sys
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, Mock, patch
 
 from ccld.analyzer.ccld_analyze import Config, analyze, comparable_groups
 from ccld.analyzer.live import Endpoint, LiveAnalysis, SlowWindow, make_analysis
 from ccld.tools.decode_async_wait import Event, WaitDecoder
-from ccld.tools.live_transport import NodeBuffer, Pull
+from ccld.tools.live_transport import NodeBuffer, Pull, rank_stream_lost_record, receive_rank
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -26,6 +27,42 @@ def event(kind, rank, op, when, duration=0):
     e.count, e.bytes, e.nChannels = (0 if kind == 1 else 4096), 16384, 1
     e.channels[0].send = e.channels[0].recv = 40
     return bytes(e)
+
+
+class RankStreamLossTests(unittest.IsolatedAsyncioTestCase):
+    async def test_known_exit_is_scoped_and_propagates_with_last_operation(self):
+        buffer = NodeBuffer(16)
+        stream = asyncio.StreamReader()
+        stream.feed_data(event(1, 1, 0, 0) + event(2, 1, 4, 100))
+        stream.feed_eof()
+        writer = Mock(wait_closed=AsyncMock())
+        with patch('ccld.tools.live_transport.peer_process', return_value=(42, '100')), \
+                patch('ccld.tools.live_transport.process_exited', return_value=True):
+            await receive_rank(stream, writer, buffer)
+        self.assertEqual((buffer.failed, buffer.end), (0, 3))
+
+        results = []
+        analysis, decoder = LiveAnalysis(Config(baseline_ms=1.), results.append), WaitDecoder()
+        analysis.add(decoder.consume(event(1, 0, 0, 0)))
+        for raw in buffer.records[:buffer.end]:
+            analysis.add(decoder.consume(raw))
+        analysis.evaluate()
+        self.assertEqual([(x['kind'], x['roots']) for x in results], [('rank_exit', [1])])
+        self.assertEqual(results[0]['rank_streams'],
+                         [{'rank': 1, 'last_op_count': 4, 'process_exited': True}])
+        # A later peer teardown belongs to the already disrupted communicator.
+        analysis.add(decoder.consume(rank_stream_lost_record((42, 0, 2), 5, True)))
+        analysis.evaluate()
+        self.assertEqual(len(results), 1)
+
+    async def test_socket_eof_without_exit_proof_is_a_rank_scoped_gap(self):
+        results = []
+        analysis, decoder = LiveAnalysis(Config(baseline_ms=1.), results.append), WaitDecoder()
+        analysis.add(decoder.consume(event(1, 1, 0, 0)))
+        analysis.add(decoder.consume(rank_stream_lost_record((42, 1, 2), 2, False)))
+        analysis.evaluate()
+        self.assertEqual([(x['category'], x['roots']) for x in results], [('coverage_gap', [])])
+        self.assertEqual(results[0]['rank_streams'][0]['rank'], 1)
 
 
 class LiveDecisionTests(unittest.TestCase):

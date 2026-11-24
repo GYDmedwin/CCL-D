@@ -42,10 +42,11 @@ class Event(ctypes.LittleEndianStructure):
                 ('channels', Channel * RECORD_CHANNELS)]
 
 
+RANK_STREAM_LOST = 11
 RECORD_BYTES = 2088
 assert ctypes.sizeof(Channel) == 56 and ctypes.sizeof(Event) == RECORD_BYTES
 KINDS = {1: 'comm_init', 2: 'entered', 3: 'snapshot', 4: 'complete', 5: 'heartbeat',
-         6: 'dropped', 7: 'coverage_gap', 8: 'comm_end', 9: 'wait_observation'}
+         6: 'dropped', 7: 'coverage_gap', 8: 'comm_end', 9: 'wait_observation', RANK_STREAM_LOST: 'rank_stream_lost'}
 CHANNEL_FIELDS = struct.Struct('<ii6Q')
 CHANNEL_PARENTS = struct.Struct('<ii48x')
 WAIT_CHANNEL_FIELDS = struct.Struct('<ii3Q24x')
@@ -163,6 +164,10 @@ def decode_event(e, raw, allow_fragment=False):
         result['reason'] = text(e.reason)
         if e.type == 6 and result['reason'] == 'binary_queue_overflow':
             result['dropped_records'] = e.count
+    elif e.type == RANK_STREAM_LOST:
+        if e.reserved not in (0, 1) or e.nChannels or e.startNs:
+            raise ValueError('invalid rank stream closure record')
+        result['process_exited'] = bool(e.reserved)
     elif e.type == 9:
         if (e.reserved not in (1, 2) or not e.windowNs or not e.seq or not e.count
                 or e.startNs == e.hash or e.bytes >= 2**32):

@@ -208,3 +208,37 @@ Tree 分组的 Python CPU 微基准使用重复的链形和二叉拓扑。4 rank
 H2 的签名含操作名、count、数据类型、算法、协议及各 rank 都能识别的内置归约运算符。慢诊断可用 communicator 或操作签名的耗时基线。主机入队、轮询首次进展和发现 HIP event 完成分别记录。
 
 H100 参考数据与本次使用的消息、阈值和 GPU 数不同。论文中的低开销数字需要在各平台、各工作负载独立测量。 [NCCL 参考结果](https://github.com/GYDmedwin/CCL-D/blob/38e21d19b89abaae3d28fed935425534ce150090/RESULTS.md)
+
+## Rank-local progress, process liveness, and mixed slowdown
+
+| Controlled scenario | Configuration | Exact roots |
+| --- | --- | ---: |
+| Tree H3 | Two BW1000 nodes, 4+4, Simple and LL | 2/2 |
+| Tree H3 | Four cards on one host, native and logical branching Tree | 4/6 |
+| Tree S2 | Two BW1000 nodes, 4+4, Simple | 2/2 |
+| Tree S3 | Four cards on one host, native and logical branching Tree, Simple | 5/6 |
+| Ring S3 | Two BW1000 nodes, 4+4, Simple and LL | 10/10 |
+| Ring S3 | Two BW1000 nodes, 8+8, Simple and LL | 10/10 |
+| Ring S1 and S2 | Two BW1000 nodes, 8+8, Simple and LL | 5/5 |
+| Rank process exit | Two single-host cases and one 4+4 case | 3/3 |
+
+Both fresh Ring S3 matrices used independently launched workloads. Verified
+healthy controls in those matrices had no confirmed alerts. The 8+8 result
+includes placements with both injected ranks on the same host and on
+different hosts. The analyzer uses completion-to-admission intervals on
+each rank's own clock and directional Ring waits to locate the two roots.
+It can use the learned fastest-rank baseline when all participants remain
+slow. This avoids using the duration spread alone when it cannot separate
+the two causes.
+
+The two native Tree/Simple H3 cases with tied normalized progress returned
+candidate sets and no exact root. The weaker same-host Tree S3 case
+confirmed the computation rank only. The process-exit trials used a rank
+that signaled itself after submitting an operation and checking that its
+GPU stream had yet to finish.
+
+On the retained 32-case 8+8 Ring matrix, two alternating passes per
+version gave median analysis CPU times of 105.4 ms before the change and
+98.9 ms after it, per case. All 20 mixed cases in the retained captures
+were located by the updated analyzer. This measurement covers the
+binary-record replay and decision code on the same data.

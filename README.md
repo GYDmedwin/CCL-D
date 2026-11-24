@@ -70,9 +70,31 @@ torchrun --standalone --nproc-per-node=4 train.py
 
 ### Directional waits
 
-For Ring with Simple or LL, set `NCCL_ALGO=Ring NCCL_CCLD_WAIT_ENABLE=1` on the training processes. To diagnose mixed computation and communication slowdown within a single training host, also set `NCCL_CCLD_DUMP_MS=1` and pass `--ring-wait-phases` to the analyzer. This mode compares wait snapshots around the last rank's entry.
+For Ring with Simple or LL, set `NCCL_ALGO=Ring NCCL_CCLD_WAIT_ENABLE=1`
+on the training processes. Enable `--ring-wait-phases` in the analyzer
+for mixed slowdown. Within one host, set `NCCL_CCLD_DUMP_MS=1` to sample
+waits around the last rank's entry. Across hosts, use
+`--baseline-scope signature` and collect at least three intervals between
+completed and subsequent collective calls. The analyzer compares these
+intervals with each rank's own baseline and checks them against repeated
+directional waits. The host timestamps stay on their own clocks.
 
-For pure communication slowdown in same-host Tree/Simple AllReduce, set `NCCL_ALGO=Tree NCCL_PROTO=Simple NCCL_CCLD_TREE_WAIT_ENABLE=1` and use `--baseline-scope signature` in the analyzer. The analyzer scores parent and child waits independently and uses adjacent operations to account for entry skew inherited from the previous collective. Configure `--tree-wait-gap` to set the minimum separation between the top scores. [Tree accuracy and overhead](RESULTS.md)
+For Tree/Simple AllReduce, set
+`NCCL_ALGO=Tree NCCL_PROTO=Simple NCCL_CCLD_TREE_WAIT_ENABLE=1` and use
+`--baseline-scope signature`. The analyzer scores parent and child waits
+separately. Same-host mixed attribution also uses
+`NCCL_CCLD_DUMP_MS=1` and `--ring-wait-phases` to compare waits before
+and after the delayed rank enters. `--tree-wait-gap` sets the required
+separation between the top communication scores. [Validation](RESULTS.md)
+
+### Hang and process exit
+
+Tree H3 compares each rank's progress against a matching completed round.
+Tied progress can leave several candidates. A live node agent reports
+`rank_exit` with the communicator rank and its last observed operation
+counter when it verifies local process exit. If it can establish only
+the socket closure, it reports a coverage gap. Upgrade the node agent and
+analyzer together.
 
 ### Record a trace for replay
 

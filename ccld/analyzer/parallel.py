@@ -45,7 +45,7 @@ def _decode_coalesced(records, indices, keep_wait_snapshots=False):
         if kind == 'complete':
             earlier = pending.get(stream, {}).pop(key, ())
             if earlier and keep_wait_snapshots and any(
-                    prev['event'] == 'snapshot' and prev.get('wait_probe') is True for _, prev in earlier):
+                    prev['event'] == 'snapshot' and (prev.get('wait_probe') is True or prev.get('tree_wait_probe') is True) for _, prev in earlier):
                 updates.extend(earlier)
             elif earlier:
                 # The coordinator evaluates only after the whole batch. Keep

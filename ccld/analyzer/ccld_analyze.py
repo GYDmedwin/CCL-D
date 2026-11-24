@@ -12,17 +12,21 @@ import math
 import socket
 import sys
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 if __package__:
-    from .ring_wait import RingWaitAttribution, phase_boundaries
+    from .admission import RankAdmission
+    from .ring_wait import RankMixedWait, RingWaitAttribution, phase_boundaries
+    from .tree_hang import tree_hang
     from .tree_wait import TreeWaitAttribution, uniform_slowdown
 else:
-    from ring_wait import RingWaitAttribution, phase_boundaries
+    from admission import RankAdmission
+    from ring_wait import RankMixedWait, RingWaitAttribution, phase_boundaries
+    from tree_hang import tree_hang
     from tree_wait import TreeWaitAttribution, uniform_slowdown
 
 
@@ -408,8 +412,9 @@ def slow_decision(comm, op, states, label, window, members, cid, base, baseline,
     if detections[detection_key] < cfg.repeats:
         item.update(kind='detected', roots=[], reason='waiting for repetition threshold')
         return item
-    if label == 'tree-wait':
-        item.update(kind='undetermined', roots=[], method='tree_directional_wait', baseline_metric='fastest_rank')
+    if label in ('tree-wait', 'tree-mixed', 'ring-mixed', 'ring-wait'):
+        item.update(kind='S2' if label == 'ring-wait' else 'undetermined', roots=[],
+                    compute_roots=[], communication_roots=[], baseline_metric='fastest_rank')
         return item
     locate_start = time.perf_counter_ns()
     if uniform_tree_slow:
@@ -462,9 +467,11 @@ class SlowProfile:
         self.winners = {}
         self.detections = defaultdict(int)
         self.ring_wait = RingWaitAttribution(cfg.ring_wait_gap, cfg.slow_threshold, cfg.ring_wait_phases, cfg.alpha)
-        self.tree_wait = None
+        self.tree_wait = {}
+        self.admission = None
+        self.ring_mixed = None
 
-    def observe(self, when, states, cfg):
+    def observe(self, when, states, cfg, collect_fastest=False):
         if self.skip:
             self.skip -= 1
         elif self.ready is None:
@@ -474,7 +481,7 @@ class SlowProfile:
             if when <= cutoff:
                 self.count += 1
                 self.total_ms += max(e['duration_ns'] for e in states.values()) / 1e6
-                if states[0].get('tree_wait_probe') is True:
+                if collect_fastest:
                     self.fastest_total_ms += min(e['duration_ns'] for e in states.values()) / 1e6
             if self.count == cfg.baseline_rounds or when >= cutoff:
                 self.ready = min(when, cutoff)
@@ -525,17 +532,47 @@ class SlowWindows:
             profile = self.profiles[key] = SlowProfile(self.cfg)
         else:
             self.profiles.move_to_end(key)
-        base, source = profile.observe(when, states, self.cfg)
+        tree_probe = key and states[0].get('tree_wait_probe') is True
+        ring_probe = key and self.cfg.ring_wait_phases and states[0].get('wait_probe') is True
+        hosts = {rank_hosts.get(rank) for rank in states} if rank_hosts and (tree_probe or ring_probe) else set()
+        cross_host = len(hosts) > 1 and all(isinstance(host, str) and host for host in hosts)
+        track_admission = bool(tree_probe or (ring_probe and cross_host))
+        base, source = profile.observe(when, states, self.cfg, track_admission)
+        admission = None
+        if track_admission:
+            if profile.admission is None:
+                profile.admission = RankAdmission()
+            admission = profile.admission.observe(op, states, source == 'dynamic')
         if key and source == 'initial':
             return
         groups, warnings = slow_groups(states, world, rank_hosts)
-        tree_base = None
-        if key and source == 'dynamic' and profile.fastest_total_ms:
+        tree_base = ring_base = None
+        tree_bounds = None
+        if tree_probe and source == 'dynamic' and profile.fastest_total_ms:
             fastest = profile.fastest_total_ms / profile.count
-            if uniform_slowdown(states, rank_hosts or {}, fastest, self.cfg.slow_threshold, previous_ends):
+            if uniform_slowdown(states, rank_hosts or {}, fastest, self.cfg.slow_threshold,
+                               previous_ends, admission):
                 tree_base = fastest
                 groups = [group for group in groups if group[0] != 'tree-chain']
                 groups.append(('tree-wait', sorted(states), None))
+            elif (snapshots and not cross_host and admission is not None
+                  and admission.confirmed_rank is not None):
+                bounds = phase_boundaries(states, snapshots, rank_hosts or {})
+                if bounds is not None and bounds[0] == admission.confirmed_rank:
+                    tree_bounds = bounds
+                    tree_base = fastest
+                    groups.append(('tree-mixed', sorted(states), None))
+        if (ring_probe and cross_host and source == 'dynamic' and profile.fastest_total_ms
+                and admission is not None):
+            fastest = profile.fastest_total_ms / profile.count
+            all_slow = min(event['duration_ns'] for event in states.values()) > fastest * (1 + self.cfg.slow_threshold) * 1e6
+            if all_slow:
+                if admission.confirmed_rank is not None:
+                    ring_base = fastest
+                    groups = [('ring-mixed', sorted(states), None)]
+                elif admission.delayed_rank is None and admission.spread_ns <= max(3_000_000, fastest * 1e6):
+                    ring_base = fastest
+                    groups = [('ring-wait', sorted(states), None)]
         if not groups:
             item = result_common(self.comm, op, 'coverage')
             item.update(kind='undetermined', roots=[], reason='slow comparison unavailable', warnings=warnings)
@@ -544,23 +581,31 @@ class SlowWindows:
             if len(members) < 2:
                 continue
             durations = [states[r]['duration_ns'] for r in members]
-            score = (min(durations) if label == 'tree-wait' else max(durations) - min(durations)), -op
+            score = (min(durations) if label in ('tree-wait', 'ring-mixed', 'ring-wait') else max(durations) - min(durations)), -op
             if label not in profile.winners or score > profile.winners[label][0]:
                 bounds = phase_boundaries(states, snapshots, rank_hosts or {}) if label == 'ring' and snapshots else None
-                group_base = tree_base if label == 'tree-wait' else base
-                profile.winners[label] = score, op, states, members, channel, group_base, source, bounds
+                if label == 'tree-mixed':
+                    bounds = tree_bounds
+                group_base = tree_base if label in ('tree-wait', 'tree-mixed') else base
+                if label in ('ring-mixed', 'ring-wait'):
+                    group_base = ring_base
+                profile.winners[label] = score, op, states, members, channel, group_base, source, bounds, admission
 
     def decisions(self):
         for key, profile in sorted(self.profiles.items()):
-            for label, (_, op, states, members, channel, base, source, bounds) in sorted(profile.winners.items()):
+            for label, (_, op, states, members, channel, base, source, bounds, admission) in sorted(profile.winners.items()):
                 item = slow_decision(self.comm, op, states, label, self.window, members, channel,
                                      base, source, profile.detections, self.cfg)
-                if label == 'ring':
+                if label in ('ring', 'ring-wait'):
                     item = profile.ring_wait.refine(item, states, op, self.window, bounds)
-                elif label == 'tree-wait' and item:
-                    if profile.tree_wait is None:
-                        profile.tree_wait = TreeWaitAttribution(self.cfg.tree_wait_gap)
-                    item = profile.tree_wait.refine(item, states, op, self.window)
+                elif label == 'ring-mixed' and item:
+                    if profile.ring_mixed is None:
+                        profile.ring_mixed = RankMixedWait(self.cfg.ring_wait_gap)
+                    item = profile.ring_mixed.refine(item, states, op, self.window, admission.confirmed_rank)
+                elif label in ('tree-wait', 'tree-mixed') and item:
+                    if label not in profile.tree_wait:
+                        profile.tree_wait[label] = TreeWaitAttribution(self.cfg.tree_wait_gap)
+                    item = profile.tree_wait[label].refine(item, states, op, self.window, bounds)
                 if item:
                     if key:
                         item['operation_profile'] = dict(zip(PROFILE_FIELDS, key))
@@ -572,7 +617,7 @@ class SlowWindows:
             self.emit(item)
 
 
-def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
+def analyze_comm(comm: str, events: list[dict], cfg: Config, *, tree_references=()) -> list[dict]:
     sizes = {e['world_size'] for e in events}
     if len(sizes) != 1:
         return [{'comm_hash': comm, 'category': 'invalid', 'reason': 'inconsistent world_size'}]
@@ -607,6 +652,7 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
                            'reason': event.get('reason', 'untraced activity')})
     completed: list[tuple[int, dict[int, dict], int]] = []
     earliest_incomplete = None
+    tree_references = deque(tree_references, maxlen=4)
     for op in sorted(by_op.keys() | dropped.keys()):
         records = by_op.get(op, [])
         if gap_boundaries and op > min(gap_boundaries):
@@ -657,6 +703,8 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
                 continue
             # Rank 0's local completion clock defines window boundaries.
             completed.append((op, states, states[0]['mono_ns']))
+            if str(states[0].get('algorithm', '')).lower() == 'tree':
+                tree_references.append(states)
         long_events = [e for e in measured if e['duration_ns'] >= cfg.hang_s * 1e9]
         if not long_events:
             continue
@@ -718,6 +766,11 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
                     hang['location_latency_ms'] = (time.perf_counter_ns() - locate_start) / 1e6
                     output.append(hang)
                     continue
+                if str(states[0].get('algorithm', '')).lower() == 'tree':
+                    hang.update(tree_hang(states, tree_references, cfg.hang_s * 1e9))
+                    hang['location_latency_ms'] = (time.perf_counter_ns() - locate_start) / 1e6
+                    output.append(hang)
+                    continue
                 groups, errors = comparable_groups(states, world)
                 comparisons = []
                 for label, members, cid in groups:
@@ -737,10 +790,10 @@ def analyze_comm(comm: str, events: list[dict], cfg: Config) -> list[dict]:
     slow = SlowWindows(comm, cfg, output.append)
     for op, states, _ in sorted(completed, key=lambda x: x[2]):
         snapshots = None
-        if cfg.ring_wait_phases and states[0].get('wait_probe') is True:
+        if cfg.ring_wait_phases and (states[0].get('wait_probe') is True or states[0].get('tree_wait_probe') is True):
             snapshots = defaultdict(list)
             for event in by_op[op]:
-                if event['event'] == 'snapshot' and event.get('wait_probe') is True:
+                if event['event'] == 'snapshot' and (event.get('wait_probe') is True or event.get('tree_wait_probe') is True):
                     snapshots[event['rank']].append(event)
         slow.add(op, states, world, rank_hosts, snapshots)
     if cfg.flush_last_window:

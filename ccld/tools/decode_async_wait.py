@@ -12,12 +12,12 @@ REPRO = Path(os.environ.get('CCLD_REPRO_ROOT', Path(__file__).resolve().parents[
 sys.path.insert(0, str(REPRO / 'tools'))
 if __package__:
     from .decode_ccld_binary import (CHANNEL_PARENTS, FRAGMENT_KINDS, FRAGMENT_VERSION, MAX_CHANNELS,
-                                     RECORD_BYTES, RECORD_CHANNELS, RING_WAIT, TREE_WAIT,
+                                     RANK_STREAM_LOST, RECORD_BYTES, RECORD_CHANNELS, RING_WAIT, TREE_WAIT,
                                      TREE_WAIT_CHANNEL_FIELDS, WAIT_CHANNEL_FIELDS, ChannelMetrics,
                                      Event, channel_payload, decode_event, parse_event, text)
 else:
     from decode_ccld_binary import (CHANNEL_PARENTS, FRAGMENT_KINDS, FRAGMENT_VERSION, MAX_CHANNELS,
-                                    RECORD_BYTES, RECORD_CHANNELS, RING_WAIT, TREE_WAIT,
+                                    RANK_STREAM_LOST, RECORD_BYTES, RECORD_CHANNELS, RING_WAIT, TREE_WAIT,
                                     TREE_WAIT_CHANNEL_FIELDS, WAIT_CHANNEL_FIELDS, ChannelMetrics,
                                     Event, channel_payload, decode_event, parse_event, text)
 
@@ -79,7 +79,14 @@ class WaitDecoder:
             self.pending[key] = (e.type, peers, payload)
             return None
         record = decode_event(e, raw, allow_fragment=part is not None)
-        if e.type == 1:
+        if e.type == RANK_STREAM_LOST:
+            stream = e.hash, e.rank
+            for key in [key for key in self.pending if key[:2] == stream]:
+                del self.pending[key]
+
+            for key in [key for key in self.fragments if key[:2] == stream]:
+                del self.fragments[key]
+        elif e.type == 1:
             record['wait_frame_bytes'] = e.count
             record['wait_requested'] = bool(e.count)
         elif e.type in (3, 4):

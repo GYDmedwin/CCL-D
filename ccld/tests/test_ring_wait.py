@@ -8,6 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'analyzer'))
+from ccld_analyze import Config, SlowWindows
 from ring_wait import RingWaitAttribution, completed_rounds, decide, graph_wait_scores
 
 
@@ -34,6 +35,34 @@ def write_traces(root, states):
 
 
 class RingWaitTests(unittest.TestCase):
+    def test_cross_host_mixed_gate_uses_rank_local_intervals_and_fastest_baseline(self):
+        cfg = Config(baseline_ms=1, baseline_scope='signature', baseline_skip=1, baseline_rounds=3,
+                     slow_threshold=2, window_s=.04, repeats=2, ring_wait_phases=True)
+        for slow_kind, expected in (('S2', [1]), ('S3', [1, 5])):
+            alerts = []
+            windows = SlowWindows('c', cfg, alerts.append)
+            clocks = {rank: 10_000_000_000 if rank >= 4 else 0 for rank in range(8)}
+            hosts = {rank: 'node-b' if rank >= 4 else 'node-a' for rank in clocks}
+            for operation in range(1, 14):
+                states = sample_states()
+                for rank, event in states.items():
+                    start = clocks[rank] + 70_000_000
+                    if operation >= 5:
+                        if slow_kind == 'S3' and rank == 5:
+                            start += 6_000_000
+                        duration = (9 if rank == 5 else 13) * 1_000_000
+                    else:
+                        duration = (16 if rank == 0 else 1) * 1_000_000
+                    clocks[rank] = start + duration
+                    event.update(event='complete', op='AllReduce', algorithm='RING', protocol='LL',
+                                 count=4096, datatype='float32', n_channels=1,
+                                 duration_ns=duration, start_mono_ns=start, mono_ns=clocks[rank])
+                windows.add(operation, states, 8, hosts)
+            windows.flush()
+            matches = [item for item in alerts if item.get('kind') == slow_kind and item['roots']]
+            self.assertTrue(matches)
+            self.assertTrue(all(item['roots'] == expected for item in matches))
+
     def test_directional_wait_requires_repeatable_rank_and_recovers_mixed_fault(self):
         states = sample_states()
         for base_kind, expected_kind, expected_ranks in (('S2', 'S2', [1]), ('S1', 'S3', [1, 2])):

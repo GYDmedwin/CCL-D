@@ -267,6 +267,43 @@ class RingWaitAttribution:
                     location_latency_ms=(item.get('location_latency_ms') or 0) + elapsed_ms)
 
 
+class RankMixedWait:
+    """Require separate and repeated host-admission and Ring wait evidence."""
+
+    def __init__(self, gap):
+        self.gap = gap
+        self.rounds = deque(maxlen=3)
+        self.last_window = None
+
+    def refine(self, item, states, operation, window, delayed_rank):
+        if self.last_window is not None and (window - self.last_window > 2 or
+                self.rounds and self.rounds[-1][0] >= operation):
+            self.rounds.clear()
+        self.last_window = window
+        started = time.perf_counter_ns()
+        sender = None
+        try:
+            score = graph_wait_scores(states)
+            suspects = score['forced_top_ranks']
+            if len(suspects) == 1 and score['top_gap'] >= self.gap and suspects[0] != delayed_rank:
+                sender = suspects[0]
+        except ValueError:
+            pass
+        vote = delayed_rank, sender
+        self.rounds.append((operation, vote))
+        if (item['kind'] != 'detected' and len(self.rounds) == 3 and sender is not None
+                and sum(previous == vote for _, previous in self.rounds) >= 2):
+            item.update(kind='S3', roots=sorted(vote), compute_roots=[delayed_rank],
+                        communication_roots=[sender], method='ring_wait_and_rank_admission',
+                        location_latency_ms=(time.perf_counter_ns() - started) / 1e6)
+        elif sender is None or len(self.rounds) == 3 and item['kind'] != 'detected':
+            item.update(kind='undetermined', compute_roots=[delayed_rank],
+                        reason='no repeated independent Ring communication root')
+        else:
+            item.update(kind='detected', reason='waiting for repeated independent Ring signals')
+        return item
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('trace_dir', type=Path, help='decoded rank JSONL files for one communicator')

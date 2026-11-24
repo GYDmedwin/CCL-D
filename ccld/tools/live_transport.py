@@ -16,14 +16,14 @@ import struct
 import time
 import zlib
 
-from .decode_ccld_binary import FRAGMENT_KINDS, FRAGMENT_VERSION, RECORD_BYTES, TREE_WAIT
+from .decode_ccld_binary import Event, RANK_STREAM_LOST, FRAGMENT_KINDS, FRAGMENT_VERSION, RECORD_BYTES, TREE_WAIT
 from .wait_memory import WAIT_ROW
 from .wait_observation import LIMIT, evidence_record, peer_process, process_groups, receive_wait, wait_socket
 
 PROTOCOL = b'CCLDP002'
 REQUEST = struct.Struct('!8s32sQ')
 RESPONSE = struct.Struct('!8s16sQQIIQQ')
-RECORD_HEADER = struct.Struct('<III4xQ48xII')
+RECORD_HEADER = struct.Struct('<III4xQQ40xII')
 MAX_PULL = 4096
 
 
@@ -141,17 +141,41 @@ class NodeBuffer:
         return header, payload
 
 
+def process_exited(process):
+    if process is None:
+        return False
+    pid, started = process
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+        return fields[19] != started or fields[0] in ('Z', 'X', 'x')
+    except FileNotFoundError:
+        return True
+    except (IndexError, OSError):
+        return False
+
+
+def rank_stream_lost_record(identity, op_count, exited):
+    record = Event()
+    record.magic, record.version, record.type = 0x444c4343, 1, RANK_STREAM_LOST
+    record.hash, record.rank, record.nranks = identity
+    record.seq = op_count
+    record.nowNs = time.monotonic_ns()
+    record.reserved = int(exited)
+    return bytes(record)
+
+
 async def receive_rank(reader, writer, buffer):
     buffer.active += 1
     process = peer_process(writer)
     identity, ended, bound, remainder = None, False, False, b''
+    last_op = 0
     try:
         while data := await reader.read(64 * RECORD_BYTES):
             data = remainder + data
             boundary = len(data) // RECORD_BYTES * RECORD_BYTES
             for offset in range(0, boundary, RECORD_BYTES):
                 raw = data[offset:offset + RECORD_BYTES]
-                magic, version, kind, comm, rank, world = RECORD_HEADER.unpack_from(raw)
+                magic, version, kind, comm, op_count, rank, world = RECORD_HEADER.unpack_from(raw)
                 rank_identity = (comm, rank, world)
                 if (magic != 0x444c4343 or not (1 <= kind <= 8 or kind == TREE_WAIT) or
                         (version != 1 and not (version == FRAGMENT_VERSION and kind in FRAGMENT_KINDS)) or
@@ -163,13 +187,25 @@ async def receive_rank(reader, writer, buffer):
                     buffer.bind_rank(process, rank_identity)
                     bound = True
                 identity = rank_identity
+                last_op = max(last_op, op_count)
                 ended = kind == 8
                 buffer.append(raw)
                 if ended and bound:
                     buffer.unbind_rank(process, identity)
                     bound = False
             remainder = data[boundary:]
-        if not ended or remainder:
+        if identity is not None and not ended:
+            exited = process_exited(process)
+            if process is not None:
+                # The telemetry socket can close before GPU context teardown
+                # lets Linux reap the owning process. Other streams still run.
+                for _ in range(20):
+                    if exited:
+                        break
+                    await asyncio.sleep(.05)
+                    exited = process_exited(process)
+            buffer.append(rank_stream_lost_record(identity, last_op, exited))
+        elif not ended or remainder:
             buffer.failed += 1
     except (OSError, ValueError):
         buffer.failed += 1

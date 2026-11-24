@@ -190,7 +190,18 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(groups, [('tree:channel=0:depth=1', [1, 2], 0)])
         events[1]['channels'][0]['send_count'] = 1
         events[1]['channels'][0]['recv_count'] = 1
-        self.assertEqual(analyze(list(events.values()), self.cfg)[0]['roots'], [1])
+        unreferenced = analyze(list(events.values()), self.cfg)[0]
+        self.assertEqual((unreferenced['kind'], unreferenced['roots']), ('undetermined', []))
+        baseline = [ev(i, 'complete', algorithm='Tree') for i in range(4)]
+        for rank, event in events.items():
+            baseline[rank]['channels'][0]['tree_parent'] = event['channels'][0]['tree_parent']
+            event['op_count'] = 2
+        out = analyze(baseline + list(events.values()), self.cfg)[0]
+        self.assertEqual((out['kind'], out['roots'], out['reference_op_count']), ('H3', [1], 1))
+        events[3]['channels'][0].update(send_count=1, recv_count=1)
+        tied = analyze(baseline + list(events.values()), self.cfg)[0]
+        self.assertEqual((tied['kind'], tied['roots'], tied['candidate_ranks']),
+                         ('undetermined', [], [1, 3]))
 
     def test_tree_validates_each_channel_and_does_not_share_mutable_groups(self):
         events = {i: ev(i, 'snapshot', duration=2000, algorithm='Tree') for i in range(4)}

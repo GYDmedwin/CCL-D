@@ -67,16 +67,18 @@ class Communicator:
         self.observed = {}
         self.rank_hosts = {}
         self.ended = set()
+        self.rank_losses = {}
         self.pending = defaultdict(dict)
         self.phase_samples = OrderedDict() if cfg.ring_wait_phases else None
         self.completed_by_time = []
+        self.tree_references = deque(maxlen=4)
         self.rank0_entry_ns = 0
         self.next_op = 1
         self.last_hang = None
         self.window = SlowWindow(comm, cfg, emit)
         self.gap = False
 
-    def mark_gap(self, op, reason):
+    def mark_gap(self, op, reason, **fields):
         if self.gap:
             return
         self.gap = True
@@ -84,9 +86,11 @@ class Communicator:
         if self.phase_samples is not None:
             self.phase_samples.clear()
         self.completed_by_time.clear()
+        self.tree_references.clear()
         self.window.profiles.clear()
-        self.emit({'category': 'coverage_gap', 'kind': 'undetermined', 'roots': [],
-                   'comm_hash': self.comm, 'op_count': op, 'reason': reason})
+        item = {'category': 'coverage_gap', 'kind': 'undetermined', 'roots': [],
+                'comm_hash': self.comm, 'op_count': op, 'reason': reason}
+        self.emit(dict(item, **fields))
 
     def add(self, event):
         rank, op, kind = event['rank'], event['op_count'], event['event']
@@ -100,6 +104,11 @@ class Communicator:
             self.rank_hosts[rank] = event.get('host')
         elif rank not in self.observed or rank in self.ended:
             self.mark_gap(op, 'event outside an initialized rank stream')
+            return
+        if kind == 'rank_stream_lost':
+            self.ended.add(rank)
+            if not self.gap:
+                self.rank_losses[rank] = event
             return
         if kind == 'comm_end':
             self.ended.add(rank)
@@ -127,7 +136,8 @@ class Communicator:
             if (previous is None or kind == 'complete' or
                     (previous['event'] != 'complete' and event['mono_ns'] >= previous['mono_ns'])):
                 states[rank] = event
-            if self.phase_samples is not None and kind == 'snapshot' and event.get('wait_probe') is True:
+            if (self.phase_samples is not None and kind == 'snapshot' and
+                    (event.get('wait_probe') is True or event.get('tree_wait_probe') is True)):
                 if op not in self.phase_samples and len(self.phase_samples) == self.MAX_PHASE_OPERATIONS:
                     self.phase_samples.popitem(last=False)
                 samples = self.phase_samples.setdefault(op, {})
@@ -142,7 +152,8 @@ class Communicator:
         progress = [{'comm_hash': self.comm, 'rank': rank, 'world_size': self.world,
                      'op_count': op, 'mono_ns': 0, 'event': 'heartbeat'}
                     for rank, op in self.observed.items()]
-        for item in analyze_comm(self.comm, progress + list(states.values()), self.cfg):
+        for item in analyze_comm(self.comm, progress + list(states.values()), self.cfg,
+                                 tree_references=self.tree_references):
             if item['category'] != 'hang':
                 continue
             if (self.last_hang is not None and self.last_hang[:2] == (item['op_count'], 'H1')
@@ -159,6 +170,22 @@ class Communicator:
                 self.emit(item)
 
     def evaluate(self, allow_partial_hang):
+        if self.rank_losses:
+            losses = [{'rank': rank, 'last_op_count': item['op_count'],
+                       'process_exited': item['process_exited']}
+                      for rank, item in sorted(self.rank_losses.items())]
+            self.rank_losses.clear()
+            roots = [item['rank'] for item in losses if item['process_exited']]
+            diagnosed = (self.last_hang is not None and self.last_hang[0] >= self.next_op and
+                         self.last_hang[1] in ('H2', 'H3'))
+            if roots and not diagnosed and len(roots) < self.world:
+                self.mark_gap(None, 'local process exited before the communicator ended',
+                              category='rank_liveness', kind='rank_exit', roots=roots, rank_streams=losses)
+            elif roots:
+                self.mark_gap(None, 'rank exits observed after a diagnosis or during communicator-wide shutdown',
+                              rank_streams=losses)
+            else:
+                self.mark_gap(None, 'rank stream closed without verified process exit', rank_streams=losses)
         if self.gap:
             return
         while (states := self.pending.get(self.next_op)) is not None:
@@ -190,6 +217,8 @@ class Communicator:
             else:
                 self.diagnose_hang(states)
                 heapq.heappush(self.completed_by_time, (states[0]['mono_ns'], op, states))
+                if str(states[0].get('algorithm', '')).lower() == 'tree':
+                    self.tree_references.append(states)
         # Sampling cyclic slots can observe a later op's completion first.
         # A future rank-0 completion cannot precede its own entry, and the
         # finalized entries above advance in operation order.
@@ -335,7 +364,7 @@ def address(value):
 
 def emit(item):
     now = time.monotonic_ns()
-    if item.get('category') in ('hang', 'slow', 'cross_domain', 'collective_mismatch'):
+    if item.get('category') in ('rank_liveness', 'hang', 'slow', 'cross_domain', 'collective_mismatch'):
         item = dict(item, observer_mono_ns=now, timing_note='analyzer local observation time')
     print(json.dumps(item, sort_keys=True), flush=True)
 
