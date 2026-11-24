@@ -313,7 +313,7 @@ struct alignas(16) ncclDevWorkColl {
   // 0 disables CCL-D for this work; 1..512 select a mapped frame slot.
   // Kept as a separate field because RCCL's existing bitfields are full.
   uint16_t ccldSlotPlus1;
-  uint16_t ccldReserved;
+  uint16_t ccldTreeWait;
 #ifdef CCLD_FAULT_INJECTION
   uint64_t ccldFaultCycles;
   uint32_t ccldFaultKind;

@@ -18,6 +18,12 @@ struct CcldWaitChannel {
   uint64_t data, credit;
 };
 
+constexpr unsigned CCLD_TREE_PEERS = 4;
+struct CcldTreeWaitChannel {
+  // Slot 0 is the parent. Slots 1 through 3 follow ncclTree::down.
+  CcldWaitChannel peers[CCLD_TREE_PEERS];
+};
+
 static inline void ccldWaitTotals(const CcldWaitChannel* waits, unsigned groups,
                                   uint64_t* data, uint64_t* credit) {
   uint64_t dataTotal = 0, creditTotal = 0;

@@ -42,6 +42,7 @@ struct CcldState {
   CcldMappedAllocation waitAllocation;
   CcldFrame* frame = nullptr;
   CcldWaitChannel* waitFrame = nullptr;
+  std::unique_ptr<ncclTree[]> treeTopology;
   unsigned frameChannels = 0;
   unsigned frameGroups = 0;
   unsigned frameBlocks = CCLD_BLOCKS;
@@ -73,6 +74,7 @@ struct CcldState {
     const char* protocol = nullptr;
     int channelLo = 0, channelHi = -1;
     ChannelSample* channels = nullptr;
+    const CcldTreeWaitChannel* treeWait = nullptr;
   };
   std::unique_ptr<Slot[]> slots;
   std::unique_ptr<ChannelSample[]> samples;
@@ -193,7 +195,7 @@ static void ccldSample(CcldState* state, unsigned index, bool done) {
   CcldBlock* block = ccldFrameBlock(state->frame, index, state->frameChannels, state->frameGroups);
   CcldChannel* channels = reinterpret_cast<CcldChannel*>(
       reinterpret_cast<unsigned char*>(block) + offsetof(CcldBlock, channel));
-  const CcldWaitChannel* waits = state->waitFrame == nullptr ? nullptr :
+  const CcldWaitChannel* waits = state->waitFrame == nullptr || state->treeTopology ? nullptr :
       reinterpret_cast<const CcldWaitChannel*>(
           reinterpret_cast<const unsigned char*>(state->waitFrame) + index * state->waitBlockBytes);
   uint64_t progress = 0;
@@ -221,7 +223,8 @@ static void ccldSample(CcldState* state, unsigned index, bool done) {
 
 static size_t ccldEmitPart(CcldState* state, CcldState::Slot& slot, CcldLogType type,
                         uint64_t now, unsigned part, unsigned parts, CcldLogEvent* records) {
-  CcldLogEvent* wait = state->waitFrame != nullptr ? records : nullptr;
+  const bool tree = slot.treeWait != nullptr;
+  CcldLogEvent* wait = tree || (state->waitFrame != nullptr && !state->treeTopology) ? records : nullptr;
   CcldLogEvent& event = records[wait != nullptr];
   event = ccldLogBase(state, type, slot.seq, now);
   if (parts > 1) {
@@ -243,11 +246,11 @@ static size_t ccldEmitPart(CcldState* state, CcldState::Slot& slot, CcldLogType 
   snprintf(event.protocol, sizeof(event.protocol), "%s", slot.protocol ? slot.protocol : "");
   snprintf(event.datatype, sizeof(event.datatype), "%s", slot.datatype ? slot.datatype : "");
   if (wait != nullptr) {
-    *wait = ccldLogBase(state, CcldLogRingWait, slot.seq, now);
+    *wait = ccldLogBase(state, tree ? CcldLogTreeWait : CcldLogRingWait, slot.seq, now);
     wait->version = event.version;
     wait->reserved = parts > 1 ? event.reserved : type;
     wait->nChannels = event.nChannels;
-    snprintf(event.reason, sizeof(event.reason), "%s", "ring_wait_v1");
+    snprintf(event.reason, sizeof(event.reason), "%s", tree ? "tree_wait_v1" : "ring_wait_v1");
   }
   for (unsigned i = 0; i < event.nChannels; ++i) {
     const unsigned channel = slot.channelLo + offset + i;
@@ -258,7 +261,20 @@ static size_t ccldEmitPart(CcldState* state, CcldState::Slot& slot, CcldLogType 
     sample.dumpSend = sample.lastSend;
     sample.dumpRecv = sample.lastRecv;
     sample.changesSend = sample.changesRecv = 0;
-    if (wait != nullptr) {
+    if (tree) {
+      const ncclTree& topology = state->treeTopology[channel];
+      CcldTreeLogChannel row{};
+      row.id = channel;
+      row.parent = topology.up;
+      static_assert(CCLD_TREE_PEERS - 1 == NCCL_MAX_TREE_ARITY, "Tree peer count differs");
+      for (unsigned p = 0; p < CCLD_TREE_PEERS - 1; ++p) row.children[p] = topology.down[p];
+      for (unsigned p = 0; p < CCLD_TREE_PEERS; ++p) {
+        const auto& edge = slot.treeWait[channel].peers[p];
+        row.data[p] = std::min<uint64_t>(ccldLoad(&edge.data), UINT32_MAX);
+        row.credit[p] = std::min<uint64_t>(ccldLoad(&edge.credit), UINT32_MAX);
+      }
+      memcpy(&wait->channels[i], &row, sizeof(row));
+    } else if (wait != nullptr) {
       wait->channels[i] = {static_cast<int32_t>(channel), sample.ringPrev,
           sample.waitData, sample.waitCredit, static_cast<uint64_t>(sample.ringNext), 0, 0, 0};
     }
@@ -401,6 +417,20 @@ void ccldInit(struct ncclComm* comm) {
   const bool waitRequested = ccldEnvNumber("NCCL_CCLD_WAIT_ENABLE", 0, 0, 1) == 1;
   if (waitRequested && state->frameGroups != 1)
     WARN("CCL-D wait probe requires NCCL_ALGO=Ring");
+  const bool treeRequested = ccldEnvNumber("NCCL_CCLD_TREE_WAIT_ENABLE", 0, 0, 1) == 1;
+  const bool treeWait = treeRequested && algorithm != nullptr && strcasecmp(algorithm, "Tree") == 0;
+  if (treeRequested && !treeWait)
+    WARN("CCL-D Tree wait probe requires NCCL_ALGO=Tree");
+  if (treeWait) {
+    state->treeTopology.reset(new (std::nothrow) ncclTree[state->frameChannels]);
+    if (!state->treeTopology) {
+      WARN("CCL-D Tree wait topology allocation failed");
+      delete state;
+      return;
+    }
+    for (unsigned c = 0; c < state->frameChannels; ++c)
+      state->treeTopology[c] = comm->channels[c].tree;
+  }
   state->frameBlocks = static_cast<unsigned>(ccldEnvNumber(
       "NCCL_CCLD_FRAME_BLOCKS", CCLD_BLOCKS, CCLD_BLOCKS, CCLD_MAX_BLOCKS));
   state->slots.reset(new (std::nothrow) CcldState::Slot[state->frameBlocks]);
@@ -424,8 +454,8 @@ void ccldInit(struct ncclComm* comm) {
   state->frame = static_cast<CcldFrame*>(state->frameAllocation.host);
   state->frame->mode = mode;
   state->frame->detectChannel = state->frameChannels;
-  if (waitRequested && state->frameGroups == 1) {
-    state->waitBlockBytes = state->frameChannels * state->frameGroups * sizeof(CcldWaitChannel);
+  if (treeWait || (waitRequested && state->frameGroups == 1)) {
+    state->waitBlockBytes = state->frameChannels * (treeWait ? sizeof(CcldTreeWaitChannel) : sizeof(CcldWaitChannel));
     state->waitBytes = state->frameBlocks * state->waitBlockBytes;
     error = ccldMappedHostAlloc(&state->waitAllocation, state->waitBytes);
     if (error != hipSuccess) {
@@ -696,6 +726,9 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   state->frame->detectChannel = descriptor.channelHi - descriptor.channelLo + 1;
   slot.seq = plan->ccldSeq;
   slot.startNs = start.ns;
+  slot.treeWait = state->treeTopology && treeAllReduce && plan->ccldProtocol == NCCL_PROTO_SIMPLE ?
+      reinterpret_cast<const CcldTreeWaitChannel*>(
+          reinterpret_cast<const unsigned char*>(state->waitFrame) + index * state->waitBlockBytes) : nullptr;
   slot.firstProgressNs = 0;
   slot.count = start.count;
   slot.bytes = start.bytes;
@@ -721,6 +754,7 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   slot.eventFailed.store(false, std::memory_order_relaxed);
   slot.phase.store(2, std::memory_order_release);
   work->ccldSlotPlus1 = static_cast<uint16_t>(index + 1);
+  work->ccldTreeWait = slot.treeWait != nullptr;
   plan->ccldSlotPlus1 = static_cast<uint16_t>(index + 1);
   state->cv.notify_one();
 }

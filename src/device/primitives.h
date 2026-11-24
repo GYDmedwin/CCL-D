@@ -35,13 +35,23 @@ __device__ __forceinline__ void ccldCount(CcldChannel* channel, int tid, int gro
 }
 
 __device__ __forceinline__ CcldWaitChannel* ccldWaitOutput(ncclDevWorkColl* work, int group) {
-  if (work == nullptr || work->ccldSlotPlus1 == 0 || ncclShmem.comm.ccldWaitFrame == nullptr) return nullptr;
+  if (work == nullptr || work->ccldSlotPlus1 == 0 || ncclShmem.comm.ccldWaitFrame == nullptr ||
+      ncclShmem.comm.ccldGroups != 1) return nullptr;
   const unsigned g = group == 0 ? 0 : 1;
   if (g >= ncclShmem.comm.ccldGroups) return nullptr;
   unsigned char* base = reinterpret_cast<unsigned char*>(ncclShmem.comm.ccldWaitFrame) +
       (work->ccldSlotPlus1 - 1) * ncclShmem.comm.ccldWaitBlockBytes +
       (ncclShmem.channelId * ncclShmem.comm.ccldGroups + g) * sizeof(CcldWaitChannel);
   return reinterpret_cast<CcldWaitChannel*>(base);
+}
+
+__device__ __forceinline__ CcldWaitChannel* ccldTreeWaitOutput(ncclDevWorkColl* work, unsigned peerSlot) {
+  if (work == nullptr || work->ccldSlotPlus1 == 0 || !work->ccldTreeWait ||
+      ncclShmem.comm.ccldWaitFrame == nullptr) return nullptr;
+  auto* base = reinterpret_cast<unsigned char*>(ncclShmem.comm.ccldWaitFrame) +
+      (work->ccldSlotPlus1 - 1) * ncclShmem.comm.ccldWaitBlockBytes;
+  auto* channels = reinterpret_cast<CcldTreeWaitChannel*>(base);
+  return &channels[ncclShmem.channelId].peers[peerSlot];
 }
 
 __device__ __forceinline__ void ccldWaitAdd(CcldWaitChannel* output, int group, bool credit, uint64_t delta) {

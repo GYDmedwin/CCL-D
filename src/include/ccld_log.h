@@ -19,12 +19,20 @@ enum CcldLogType : uint32_t {
   CcldLogHeartbeat = 5,
   CcldLogDropped = 6,
   CcldLogRingWait = 7,
-  CcldLogEnd = 8
+  CcldLogEnd = 8,
+  CcldLogTreeWait = 10
 };
 
 struct CcldLogChannel {
   int32_t id, parent;
   uint64_t send, recv, sendChanges, recvChanges, sendDelta, recvDelta;
+};
+
+struct CcldTreeLogChannel {
+  int32_t id, parent;
+  int32_t children[CCLD_TREE_PEERS - 1];
+  uint32_t reserved;
+  uint32_t data[CCLD_TREE_PEERS], credit[CCLD_TREE_PEERS];
 };
 
 struct CcldLogEvent {
@@ -36,6 +44,8 @@ struct CcldLogEvent {
 };
 
 static_assert(sizeof(CcldLogChannel) == 56, "binary channel layout changed");
+static_assert(sizeof(CcldTreeLogChannel) == sizeof(CcldLogChannel),
+              "Tree wait channels must fit the wire record");
 static_assert(sizeof(CcldLogEvent) == 2088, "binary event layout changed");
 static_assert(std::is_trivially_copyable<CcldLogEvent>::value,
               "binary records must be trivially copyable");
