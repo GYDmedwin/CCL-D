@@ -20,8 +20,10 @@ from typing import Any
 
 if __package__:
     from .ring_wait import RingWaitAttribution, phase_boundaries
+    from .tree_wait import TreeWaitAttribution, uniform_slowdown
 else:
     from ring_wait import RingWaitAttribution, phase_boundaries
+    from tree_wait import TreeWaitAttribution, uniform_slowdown
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class Config:
     slow_warmup_ops: int = 0
     baseline_scope: str = 'communicator'
     ring_wait_phases: bool = False
+    tree_wait_gap: float = 0.2
 
 
 def load_records(paths: list[Path], allow_partial: bool = False) -> tuple[list[dict], list[str]]:
@@ -405,6 +408,9 @@ def slow_decision(comm, op, states, label, window, members, cid, base, baseline,
     if detections[detection_key] < cfg.repeats:
         item.update(kind='detected', roots=[], reason='waiting for repetition threshold')
         return item
+    if label == 'tree-wait':
+        item.update(kind='undetermined', roots=[], method='tree_directional_wait', baseline_metric='fastest_rank')
+        return item
     locate_start = time.perf_counter_ns()
     if uniform_tree_slow:
         item.update(kind='undetermined', roots=[], p=p, compute_roots=[], communication_roots=[],
@@ -452,9 +458,11 @@ class SlowProfile:
         self.first = self.ready = None
         self.count = 0
         self.total_ms = 0.
+        self.fastest_total_ms = 0.
         self.winners = {}
         self.detections = defaultdict(int)
         self.ring_wait = RingWaitAttribution(cfg.ring_wait_gap, cfg.slow_threshold, cfg.ring_wait_phases, cfg.alpha)
+        self.tree_wait = None
 
     def observe(self, when, states, cfg):
         if self.skip:
@@ -466,6 +474,8 @@ class SlowProfile:
             if when <= cutoff:
                 self.count += 1
                 self.total_ms += max(e['duration_ns'] for e in states.values()) / 1e6
+                if states[0].get('tree_wait_probe') is True:
+                    self.fastest_total_ms += min(e['duration_ns'] for e in states.values()) / 1e6
             if self.count == cfg.baseline_rounds or when >= cutoff:
                 self.ready = min(when, cutoff)
         if self.total_ms and self.ready is not None and when > self.ready:
@@ -513,6 +523,13 @@ class SlowWindows:
         if key and source == 'initial':
             return
         groups, warnings = slow_groups(states, world, rank_hosts)
+        tree_base = None
+        if key and source == 'dynamic' and profile.fastest_total_ms:
+            fastest = profile.fastest_total_ms / profile.count
+            if uniform_slowdown(states, rank_hosts or {}, fastest, self.cfg.slow_threshold):
+                tree_base = fastest
+                groups = [group for group in groups if group[0] != 'tree-chain']
+                groups.append(('tree-wait', sorted(states), None))
         if not groups:
             item = result_common(self.comm, op, 'coverage')
             item.update(kind='undetermined', roots=[], reason='slow comparison unavailable', warnings=warnings)
@@ -521,10 +538,11 @@ class SlowWindows:
             if len(members) < 2:
                 continue
             durations = [states[r]['duration_ns'] for r in members]
-            score = max(durations) - min(durations), -op
+            score = (min(durations) if label == 'tree-wait' else max(durations) - min(durations)), -op
             if label not in profile.winners or score > profile.winners[label][0]:
                 bounds = phase_boundaries(states, snapshots, rank_hosts or {}) if label == 'ring' and snapshots else None
-                profile.winners[label] = score, op, states, members, channel, base, source, bounds
+                group_base = tree_base if label == 'tree-wait' else base
+                profile.winners[label] = score, op, states, members, channel, group_base, source, bounds
 
     def decisions(self):
         for key, profile in sorted(self.profiles.items()):
@@ -533,6 +551,10 @@ class SlowWindows:
                                      base, source, profile.detections, self.cfg)
                 if label == 'ring':
                     item = profile.ring_wait.refine(item, states, op, self.window, bounds)
+                elif label == 'tree-wait' and item:
+                    if profile.tree_wait is None:
+                        profile.tree_wait = TreeWaitAttribution(self.cfg.tree_wait_gap)
+                    item = profile.tree_wait.refine(item, states, op, self.window)
                 if item:
                     if key:
                         item['operation_profile'] = dict(zip(PROFILE_FIELDS, key))
@@ -798,11 +820,13 @@ def add_decision_arguments(p):
                    help='minimum normalized directional wait score gap')
     p.add_argument('--ring-wait-phases', action='store_true',
                    help='require same-host post-entry wait snapshots for mixed Ring slowdown')
+    p.add_argument('--tree-wait-gap', type=float, default=0.2,
+                   help='minimum relative difference between the top Tree wait scores')
 
 
 def decision_config(p, args, flush_last_window=False):
     if (any(not math.isfinite(x) or x <= 0 for x in
-            (args.hang_s, args.window_s, args.baseline_ms, args.baseline_s, args.ring_wait_gap)) or
+            (args.hang_s, args.window_s, args.baseline_ms, args.baseline_s, args.ring_wait_gap, args.tree_wait_gap)) or
             not math.isfinite(args.slow_threshold) or args.slow_threshold < 0 or
             args.repeats < 1 or args.baseline_rounds < 1 or args.baseline_skip < 0 or args.slow_warmup_ops < 0 or
             not (0 <= args.alpha < args.beta <= 1)):
@@ -810,7 +834,7 @@ def decision_config(p, args, flush_last_window=False):
     return Config(args.hang_s, args.window_s, args.baseline_ms, args.slow_threshold,
                   args.repeats, args.alpha, args.beta, args.baseline_rounds, args.baseline_s,
                   args.rate_metric, flush_last_window, args.baseline_skip, args.ring_wait_gap,
-                  args.slow_warmup_ops, args.baseline_scope, args.ring_wait_phases)
+                  args.slow_warmup_ops, args.baseline_scope, args.ring_wait_phases, args.tree_wait_gap)
 
 
 def main() -> int:
