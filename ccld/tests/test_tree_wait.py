@@ -1,6 +1,6 @@
 import unittest
 
-from ccld.analyzer.tree_wait import TreeWaitAttribution, directional_scores, uniform_slowdown
+from ccld.analyzer.tree_wait import TreePhase, TreeWaitAttribution, directional_scores, uniform_slowdown
 
 
 def states():
@@ -21,6 +21,35 @@ def states():
 
 
 class TreeWaitTests(unittest.TestCase):
+    def test_confirmed_admission_is_reported_without_communication_evidence(self):
+        attribution = TreeWaitAttribution(.2)
+        phase = TreePhase(2, None, 5_000_000, 300_000)
+        for operation in range(1, 5):
+            result = attribution.refine({'kind': 'undetermined', 't_base_ms': 1},
+                                        states(), operation, operation, phase)
+            self.assertEqual((result['kind'], result['compute_roots'], result['communication_roots']),
+                             ('S1', [2], []))
+
+    def test_ambiguous_admission_cannot_upgrade_repeated_communication_to_mixed(self):
+        attribution = TreeWaitAttribution(.2)
+        phase = TreePhase(2, {}, 5_000_000, 300_000, False)
+        for operation in range(1, 4):
+            result = attribution.refine({'kind': 'undetermined', 't_base_ms': 1},
+                                        states(), operation, operation, phase)
+        self.assertEqual((result['kind'], result['admission_candidates'], result['roots']),
+                         ('S2', [2], [3]))
+
+    def test_phase_votes_keep_their_communication_support_when_admission_is_ambiguous(self):
+        attribution = TreeWaitAttribution(.2)
+        phases = [TreePhase(2, {}, 5_000_000, 300_000, False),
+                  TreePhase(2, None, 5_000_000, 300_000),
+                  TreePhase(2, {}, 5_000_000, 300_000)]
+        for operation, phase in enumerate(phases, 1):
+            result = attribution.refine({'kind': 'undetermined', 't_base_ms': 1},
+                                        states(), operation, operation, phase)
+        self.assertEqual((result['kind'], result['compute_roots'], result['communication_roots']),
+                         ('S3', [2], [3]))
+
     def test_propagated_wait_is_removed_and_leaf_is_attributed_after_repetition(self):
         rows = states()
         scores = directional_scores(rows)

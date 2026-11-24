@@ -22,12 +22,12 @@ if __package__:
     from .admission import RankAdmission
     from .ring_wait import RankMixedWait, RingWaitAttribution, phase_boundaries
     from .tree_hang import tree_hang
-    from .tree_wait import TreeWaitAttribution, uniform_slowdown
+    from .tree_wait import TreeWaitAttribution, tree_phase, uniform_slowdown
 else:
     from admission import RankAdmission
     from ring_wait import RankMixedWait, RingWaitAttribution, phase_boundaries
     from tree_hang import tree_hang
-    from tree_wait import TreeWaitAttribution, uniform_slowdown
+    from tree_wait import TreeWaitAttribution, tree_phase, uniform_slowdown
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,7 @@ class Config:
     baseline_scope: str = 'communicator'
     ring_wait_phases: bool = False
     tree_wait_gap: float = 0.2
+    tree_cross_host_phases: bool = False
 
 
 def load_records(paths: list[Path], allow_partial: bool = False) -> tuple[list[dict], list[str]]:
@@ -504,7 +505,7 @@ class SlowWindows:
         self.profiles = OrderedDict()
         self.previous_tree = None
 
-    def add(self, op, states, world, rank_hosts=None, snapshots=None):
+    def add(self, op, states, world, rank_hosts=None, snapshots=None, clocks=None):
         previous_ends = None
         if states[0].get('tree_wait_probe') is True:
             if self.previous_tree is not None and self.previous_tree[0] == op - 1:
@@ -545,7 +546,8 @@ class SlowWindows:
             admission = profile.admission.observe(op, states, source == 'dynamic')
         if key and source == 'initial':
             return
-        groups, warnings = slow_groups(states, world, rank_hosts)
+        phased_tree = tree_probe and cross_host and self.cfg.tree_cross_host_phases
+        groups, warnings = ([], []) if phased_tree else slow_groups(states, world, rank_hosts)
         tree_base = ring_base = None
         tree_bounds = None
         if tree_probe and source == 'dynamic' and profile.fastest_total_ms:
@@ -555,10 +557,9 @@ class SlowWindows:
                 tree_base = fastest
                 groups = [group for group in groups if group[0] != 'tree-chain']
                 groups.append(('tree-wait', sorted(states), None))
-            elif (snapshots and not cross_host and admission is not None
-                  and admission.confirmed_rank is not None):
-                bounds = phase_boundaries(states, snapshots, rank_hosts or {})
-                if bounds is not None and bounds[0] == admission.confirmed_rank:
+            elif admission is not None and admission.confirmed_rank is not None and (snapshots or clocks is not None):
+                bounds = tree_phase(states, snapshots, rank_hosts or {}, admission.confirmed_rank, clocks)
+                if bounds is not None:
                     tree_bounds = bounds
                     tree_base = fastest
                     groups.append(('tree-mixed', sorted(states), None))
@@ -573,7 +574,7 @@ class SlowWindows:
                 elif admission.delayed_rank is None and admission.spread_ns <= max(3_000_000, fastest * 1e6):
                     ring_base = fastest
                     groups = [('ring-wait', sorted(states), None)]
-        if not groups:
+        if not groups and not phased_tree:
             item = result_common(self.comm, op, 'coverage')
             item.update(kind='undetermined', roots=[], reason='slow comparison unavailable', warnings=warnings)
             self.emit(item)
@@ -581,7 +582,12 @@ class SlowWindows:
             if len(members) < 2:
                 continue
             durations = [states[r]['duration_ns'] for r in members]
-            score = (min(durations) if label in ('tree-wait', 'ring-mixed', 'ring-wait') else max(durations) - min(durations)), -op
+            if label == 'tree-mixed' and cross_host:
+                score = (tree_bounds.limits is not None, tree_bounds.confirmed_admission,
+                         tree_bounds.tail_ns, -op)
+            else:
+                score = (min(durations) if label in ('tree-wait', 'ring-mixed', 'ring-wait') else
+                         max(durations) - min(durations)), -op
             if label not in profile.winners or score > profile.winners[label][0]:
                 bounds = phase_boundaries(states, snapshots, rank_hosts or {}) if label == 'ring' and snapshots else None
                 if label == 'tree-mixed':
@@ -893,7 +899,8 @@ def decision_config(p, args, flush_last_window=False):
     return Config(args.hang_s, args.window_s, args.baseline_ms, args.slow_threshold,
                   args.repeats, args.alpha, args.beta, args.baseline_rounds, args.baseline_s,
                   args.rate_metric, flush_last_window, args.baseline_skip, args.ring_wait_gap,
-                  args.slow_warmup_ops, args.baseline_scope, args.ring_wait_phases, args.tree_wait_gap)
+                  args.slow_warmup_ops, args.baseline_scope, args.ring_wait_phases, args.tree_wait_gap,
+                  getattr(args, 'tree_cross_host_phases', False))
 
 
 def main() -> int:

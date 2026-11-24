@@ -4,7 +4,7 @@ import pathlib
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-NV = pathlib.Path(os.environ.get("CCLD_NV_ROOT", "/workspace/nv/CCL-D"))
+NV_ROOT = os.environ.get("CCLD_NV_ROOT")
 
 
 class LlCounterHooksTest(unittest.TestCase):
@@ -29,10 +29,23 @@ class LlCounterHooksTest(unittest.TestCase):
         self.assertIn("const bool ringCollective = plan->ccldAlgorithm == NCCL_ALGO_RING", source)
         self.assertIn("const bool treeAllReduce = plan->ccldAlgorithm == NCCL_ALGO_TREE", source)
 
-    def test_reference_module_is_ncccl_ccld_ll(self):
-        nv = (NV / "src/device/prims_ll.h").read_text()
+    @unittest.skipUnless(NV_ROOT, "set CCLD_NV_ROOT to the NCCL checkout for source parity checks")
+    def test_nccl_reference_waits_and_tree_bindings(self):
+        root = pathlib.Path(NV_ROOT)
+        nv = (root / "src/device/prims_ll.h").read_text()
         self.assertIn("if (SEND) waitSend(divUp(nelem, EltPerLine)*sizeof(ncclLLFifoLine));", nv)
         self.assertIn("if (RECV) {\n      for (int i=0; i < MaxRecv; i++) incRecv(i);", nv)
+        self.assertIn("const bool track = tid == 0 && ccldWaitChannel;", nv)
+        simple = (root / "src/device/prims_simple.h").read_text()
+        self.assertRegex(simple, r"const bool track = [^;]*ccldWaitChannel[^;]*index == 0")
+        tree = (root / "src/device/all_reduce.h").read_text()
+        start = tree.index("void runTreeUpDown")
+        updown = tree[start:tree.index("template<typename T, typename RedOp>", start)]
+        self.assertGreaterEqual(updown.count("work->redOpArg, 0, 0, 0, work"), 2)
+        start = tree.index("void runTreeSplit")
+        split = tree[start:tree.index("template<typename T, typename RedOp>", start)]
+        self.assertGreaterEqual(split.count("work->redOpArg"), 3)
+        self.assertGreaterEqual(split.count("work)"), 3)
 
     def test_async_writer_is_only_sink_for_telemetry(self):
         source = (ROOT / "src/misc/ccld.cc").read_text()
@@ -57,31 +70,19 @@ class LlCounterHooksTest(unittest.TestCase):
         self.assertIn("decode_ccld_binary.py", script)
         self.assertIn("comm_end", script)
 
-    def test_wait_probe_hooks_follow_nv_wait_sites(self):
-        nv_simple = (NV / "src/device/prims_simple.h").read_text()
-        nv_ll = (NV / "src/device/prims_ll.h").read_text()
+    def test_wait_probe_hooks_use_lead_threads(self):
         simple = (ROOT / "src/device/prims_simple.h").read_text()
         ll = (ROOT / "src/device/prims_ll.h").read_text()
-        self.assertIn("const bool track = ccldWaitChannel && index == 0;", nv_simple)
         self.assertIn("const bool track = ccldWaitChannel != nullptr && index == 0;", simple)
-        self.assertIn("const bool track = tid == 0 && ccldWaitChannel;", nv_ll)
         self.assertIn("const bool track = tid == 0 && ccldWaitChannel != nullptr;", ll)
         self.assertIn("NCCL_CCLD_WAIT_ENABLE", (ROOT / "src/misc/ccld.cc").read_text())
 
-    def test_tree_primitive_work_binding_matches_nv(self):
-        nv = (NV / "src/device/all_reduce.h").read_text()
+    def test_tree_primitive_work_bindings(self):
         rccl = (ROOT / "src/device/all_reduce.h").read_text()
-        nv_updown = nv[nv.index("void runTreeUpDown"):nv.index("template<typename T, typename RedOp>", nv.index("void runTreeUpDown"))]
         rccl_updown = rccl[rccl.index("void runTreeUpDown"):rccl.index("void runTreeSplit")]
-        self.assertIn("work->redOpArg, 0, 0, 0, work", nv_updown)
-        self.assertIn("work->redOpArg, 0, 0, 0, work", rccl_updown)
-        self.assertGreaterEqual(nv_updown.count("work->redOpArg, 0, 0, 0, work"), 2)
         self.assertGreaterEqual(rccl_updown.count("work->redOpArg, 0, 0, 0, work"), 2)
-        nv_split = nv[nv.index("void runTreeSplit"):nv.index("template<typename T, typename RedOp>", nv.index("void runTreeSplit"))]
         rccl_split = rccl[rccl.index("void runTreeSplit"):rccl.index("template<typename T, typename RedOp>", rccl.index("void runTreeSplit"))]
-        self.assertGreaterEqual(nv_split.count("work->redOpArg"), 3)
         self.assertGreaterEqual(rccl_split.count("work->redOpArg"), 3)
-        self.assertGreaterEqual(nv_split.count("work)"), 3)
         self.assertGreaterEqual(rccl_split.count("work)"), 3)
 
     def test_fault_injection_isolated_and_nv_mapped(self):

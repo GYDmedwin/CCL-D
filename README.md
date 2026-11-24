@@ -1,123 +1,122 @@
 # CCL-D for RCCL
 
-CCL-D diagnoses slow and hanging collectives in RCCL workloads. GPU probes update mapped host-memory frames. A host thread samples the frames, and a node agent buffers the resulting binary records. An independent analyzer pulls the records over TCP and reports the affected collective and any supported root ranks.
+CCL-D detects and locates slow or stalled collective operations in distributed
+training. This branch instruments RCCL **2.22.3-1**. DCU kernels write
+progress counters to mapped host memory. Rank-local monitors sample the
+counters, node agents buffer the records in memory, and a separate CPU
+analyzer pulls those records over the job network.
 
-This branch targets RCCL 2.22.3-1 on gfx936 BW1000 accelerators. The validation environment uses DTK 26.04, HIP, and PyTorch 2.7.1. It includes single-node collective tests and 16-rank InfiniBand and FSDP runs. [Validation results](RESULTS.md)
+[Paper](https://doi.org/10.1145/3774934.3786429) · [NCCL version](https://github.com/GYDmedwin/CCL-D/tree/main) · [Validation results](RESULTS.md)
 
 ## Build
 
-Load the ROCm or DTK environment on the build host and run these commands from the repository root.
+Load your HIP toolchain and use Python 3.10 or later. This example builds
+for BW1000 (`gfx936`) and writes `build-ccld-gfx936/librccl.so.1.0`.
 
 ```bash
+git clone --branch rccl https://github.com/GYDmedwin/CCL-D.git
+cd CCL-D
 cmake -S . -B build-ccld-gfx936 \
   -DCMAKE_BUILD_TYPE=Release \
   -DGPU_TARGETS=gfx936 -DCOMPILING_TARGETS=gfx936 \
   -DCOLLTRACE=ON -DCCLD_FAULT_INJECTION=OFF -DBUILD_TESTS=OFF
 cmake --build build-ccld-gfx936 --parallel 12
+python3 -m unittest discover -s ccld/tests
 ```
 
-For quick compile and test cycles, set `ONLY_FUNCS` to the RCCL device functions exercised by the workload. Use the full build for workloads with dynamic collective or datatype selection. [Targeted build examples](RESULTS.md)
+The BW1000 validation used DTK 26.04 and PyTorch 2.7.1. Use the full build
+for training that selects collectives and datatypes at runtime. See the
+[targeted-build examples](RESULTS.md).
 
-## Run alongside training
+## Run with your training job
 
-Use the same code revision on the training and analysis hosts. Run the Python commands from the repository root with Python 3.10 or later. Create one token for the job with `openssl rand -hex 32` and export it as `CCLD_PULL_TOKEN` to every agent and to the analyzer.
+Use the same CCL-D revision for the agents and analyzer. Generate one token
+with `openssl rand -hex 32` and export it as `CCLD_PULL_TOKEN` wherever the
+agents or analyzer run.
 
-### Start a node agent
+1. **Start one agent per training node.** Set `TRAIN_NODE_ADDR` to the node
+   address reachable from the analyzer. Keep the local socket path for
+   that node's training ranks.
 
-On each training node, choose a job network address reachable by the analyzer and set `TRAIN_NODE_ADDR` to that address. Start one agent per node and keep the socket path for the training launcher on that node.
+   ```bash
+   socket_dir="$(mktemp -d)"
+   export NCCL_CCLD_NODE_SOCKET="$socket_dir/ccld.sock"
+   python3 -m ccld.tools.live_transport \
+     --socket "$NCCL_CCLD_NODE_SOCKET" --bind "$TRAIN_NODE_ADDR" --port 0
+   ```
 
-```bash
-socket_dir="$(mktemp -d)"
-export NCCL_CCLD_NODE_SOCKET="$socket_dir/ccld.sock"
-python3 -m ccld.tools.live_transport \
-  --socket "$NCCL_CCLD_NODE_SOCKET" --bind "$TRAIN_NODE_ADDR" --port 0
-```
+2. **Start the analyzer on a CPU host.** Use the `HOST:PORT` shown in each
+   agent's `CCLD_NODE_READY` line. The analyzer prints JSON decisions to
+   standard output.
 
-### Start the analyzer
+   ```bash
+   python3 -m ccld.analyzer.live --node "$AGENT_A" --node "$AGENT_B" \
+     --baseline-ms 1 --baseline-scope signature --poll-s 0.2
+   ```
 
-On the analysis host, use the `HOST:PORT` printed in each agent's `CCLD_NODE_READY` line. Pass one `--node` per training node. The analyzer reads the binary buffers in memory and writes diagnosis events to standard output.
+3. **Launch training with the instrumented library.** Export the agent
+   socket for each node into that node's training ranks. Set
+   `RCCL_BUILD_DIR` to the build directory and use the job's existing
+   PyTorch or MPI launcher.
 
-```bash
-python3 -m ccld.analyzer.live --node "$NODE_AGENT_ADDR" \
-  --poll-s 0.025 --hang-s 300 --window-s 60 --baseline-ms 1 \
-  --baseline-scope signature --decode-workers 4 --coalesce-completed
-```
+   ```bash
+   export NCCL_CCLD_NODE_SOCKET=/path/to/local/ccld.sock
+   export RCCL_BUILD_DIR=/path/to/CCL-D/build-ccld-gfx936
+   export NCCL_CCLD_ENABLE=1 NCCL_CCLD_MODE=1
+   export LD_LIBRARY_PATH="$RCCL_BUILD_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+   export LD_PRELOAD="$RCCL_BUILD_DIR/librccl.so.1.0${LD_PRELOAD:+:$LD_PRELOAD}"
+   ```
 
-### Start the training workload
+Keep the agents running until the analyzer drains their buffers. The
+analyzer's `--poll-s` controls how often it pulls records. Set
+`--baseline-scope signature` to learn separate slow baselines by collective
+and `--slow-warmup-ops` to exclude initial calls from slow analysis.
 
-Pass the node-local socket path from the agent step to the training processes and load the instrumented library. The example uses four local ranks. For distributed training, use the existing launcher and pass the corresponding socket path on each node.
+## Diagnose collectives
 
-```bash
-export RCCL_BUILD_DIR="$PWD/build-ccld-gfx936"
-export LD_LIBRARY_PATH="$RCCL_BUILD_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LD_PRELOAD="$RCCL_BUILD_DIR/librccl.so.1.0"
-unset NCCL_CCLD_OUT_DIR
-export NCCL_CCLD_ENABLE=1 NCCL_CCLD_MODE=1 NCCL_CCLD_POLL_US=200
-export NCCL_CCLD_FRAME_BLOCKS=64
-torchrun --standalone --nproc-per-node=4 train.py
-```
-
-## Configure diagnosis
-
-| Setting | Purpose |
-| --- | --- |
-| `NCCL_CCLD_POLL_US` | Time between samples of mapped progress counters on the training host. |
-| `NCCL_CCLD_DUMP_MS` | Time between progress snapshots for in-flight collectives. Completions emit their own records. |
-| `--poll-s` | Time between analyzer pulls from node agents. |
-| `--baseline-scope signature` | Learn separate slow baselines by operation, size, datatype, algorithm, protocol, channel count, and known reduction operator. |
-| `--slow-warmup-ops` | Skip the first configured number of eligible operations in each communicator when learning and evaluating slow baselines. Hang and signature checks continue. |
-| `--baseline-rounds`, `--baseline-s` | Set the baseline sample budget and learning time. Calibrate on a healthy run before reducing the slow window or the hang threshold. |
+H1 identifies a rank that has yet to enter a collective. H2 uses mismatched
+signatures or partial completion. H3 uses stalled progress. A node agent
+can also report a verified rank process exit. Slow diagnoses can identify
+delayed entry, communication slowdown, or both. The analyzer reports the
+evidence and any root ranks it can confirm.
 
 ### Directional waits
 
-For Ring with Simple or LL, set `NCCL_ALGO=Ring NCCL_CCLD_WAIT_ENABLE=1`
-on the training processes. Enable `--ring-wait-phases` in the analyzer
-for mixed slowdown. Within one host, set `NCCL_CCLD_DUMP_MS=1` to sample
-waits around the last rank's entry. Across hosts, use
-`--baseline-scope signature` and collect at least three intervals between
-completed and subsequent collective calls. The analyzer compares these
-intervals with each rank's own baseline and checks them against repeated
-directional waits. The host timestamps stay on their own clocks.
+- **Ring/Simple or Ring/LL.** Set `NCCL_ALGO=Ring` and
+  `NCCL_CCLD_WAIT_ENABLE=1` on the training ranks. For mixed slowdown across hosts,
+  add `--ring-wait-phases` and `--baseline-scope signature` to the analyzer.
+- **Tree/Simple AllReduce.** Set `NCCL_ALGO=Tree NCCL_PROTO=Simple` and
+  `NCCL_CCLD_TREE_WAIT_ENABLE=1`. For mixed slowdown across hosts, set
+  `NCCL_CCLD_DUMP_MS=1` and add `--tree-cross-host-phases` and
+  `--baseline-scope signature` to the analyzer. The analyzer bounds the
+  host clock offsets and compares Tree edge waits after the ranks enter.
 
-For Tree/Simple AllReduce, set
-`NCCL_ALGO=Tree NCCL_PROTO=Simple NCCL_CCLD_TREE_WAIT_ENABLE=1` and use
-`--baseline-scope signature`. The analyzer scores parent and child waits
-separately. Same-host mixed attribution also uses
-`NCCL_CCLD_DUMP_MS=1` and `--ring-wait-phases` to compare waits before
-and after the delayed rank enters. `--tree-wait-gap` sets the required
-separation between the top communication scores. [Validation](RESULTS.md)
+### Replay and validate
 
-### Hang and process exit
-
-Tree H3 compares each rank's progress against a matching completed round.
-Tied progress can leave several candidates. A live node agent reports
-`rank_exit` with the communicator rank and its last observed operation
-counter when it verifies local process exit. If it can establish only
-the socket closure, it reports a coverage gap. Upgrade the node agent and
-analyzer together.
-
-### Record a trace for replay
-
-Set `NCCL_CCLD_OUT_DIR` to an existing directory on each training node to write binary files. Decode the directory from the same revision.
+For offline replay, set `NCCL_CCLD_OUT_DIR` to an existing directory on each
+training node. Decode the collected traces and run the analyzer.
 
 ```bash
 python3 -m ccld.tools.decode_async_wait "$TRACE_DIR" "$JSONL_DIR"
-python3 -m ccld.analyzer.ccld_analyze "$JSONL_DIR" --baseline-ms 1 --baseline-scope signature
+python3 -m ccld.analyzer.ccld_analyze "$JSONL_DIR" \
+  --baseline-ms 1 --baseline-scope signature
 ```
 
-## Run validation
-
-Build a separate library with `CCLD_FAULT_INJECTION=ON` to run the controlled fault experiments. The Evaluation 5.1 runner accepts `RCCL_BUILD_DIR` and `RCCL_LIB` to select that build.
+For controlled fault validation, build a separate library with
+`-DCCLD_FAULT_INJECTION=ON` and use the evaluation runner.
 
 ```bash
 RCCL_BUILD_DIR="$PWD/build-ccld-gfx936-fault" \
   tools/tests/run_antccl_eval51_gfx936.sh --case H1
 ```
 
-Run the script with `--help` for available cases and topology options. The S2 suite uses `CCLD_WAIT_THRESHOLD` calibrated for that protocol, message size, and topology. [Workloads, accuracy, and overhead](RESULTS.md)
+The runner's `--help` lists its fault and topology options. See
+[validation results](RESULTS.md) for the tested collective and training
+configurations.
 
-## Attribution and licenses
+## Licenses and attribution
 
-This branch builds on niheartent's RCCL port and preserves its commit history. [Original RCCL port](https://github.com/niheartent/CCL-D-DCU/tree/486a4ced7fce37b41b6b60689d6c2143b34f0a28)
-
-See the [RCCL license](LICENSE.txt) and the [CCL-D license](ccld/LICENSE.txt).
+The branch preserves the history of
+[niheartent's RCCL port](https://github.com/niheartent/CCL-D-DCU/tree/486a4ced7fce37b41b6b60689d6c2143b34f0a28).
+See the [RCCL license](LICENSE.txt) and the
+[CCL-D license](ccld/LICENSE.txt).

@@ -1,7 +1,50 @@
 """Locate repeated communication slowdown with directional Tree edge waits."""
+from __future__ import annotations
+
 from collections import defaultdict, deque
 from statistics import median
+from typing import NamedTuple
 import time
+
+if __package__:
+    from .clock_bounds import bracket_peer_waits, rank_clock_shifts
+    from .ring_wait import PHASE_ENTRY_GAP_NS, PHASE_WINDOW_NS, phase_boundaries
+else:
+    from clock_bounds import bracket_peer_waits, rank_clock_shifts
+    from ring_wait import PHASE_ENTRY_GAP_NS, PHASE_WINDOW_NS, phase_boundaries
+
+
+class TreePhase(NamedTuple):
+    admission_rank: int
+    limits: dict | None
+    tail_ns: float
+    uncertainty_ns: int | None = None
+    confirmed_admission: bool = True
+
+
+def tree_phase(states, snapshots, hosts, compute_rank, clocks=None):
+    if len(set(hosts.values())) == 1:
+        bounds = phase_boundaries(states, snapshots, hosts) if snapshots else None
+        if bounds is None or bounds[0] != compute_rank:
+            return None
+        cutoff = states[compute_rank]['start_mono_ns']
+        return TreePhase(compute_rank, bounds[1], median(e['mono_ns'] - cutoff for e in states.values()))
+    if clocks is None:
+        return None
+    shifts = rank_clock_shifts(states, hosts, compute_rank, clocks)
+    if shifts is None:
+        return None
+    cutoff = states[compute_rank]['start_mono_ns']
+    entries = {r: (e['start_mono_ns'] + shifts[r][0], e['start_mono_ns'] + shifts[r][1])
+               for r, e in states.items()}
+    confirmed = all(hi <= cutoff - PHASE_ENTRY_GAP_NS for r, (_, hi) in entries.items() if r != compute_rank)
+    ready = (max(lo for lo, _ in entries.values()), max(hi for _, hi in entries.values()))
+    tails = [event['mono_ns'] - ready[1] + shifts[rank][0] for rank, event in states.items()]
+    uncertainty = max(hi - lo for lo, hi in shifts.values())
+    limits = None
+    if snapshots and min(tails) >= 0:
+        limits = bracket_peer_waits(states, snapshots, shifts, ready, PHASE_WINDOW_NS)
+    return TreePhase(compute_rank, limits, median(tails), uncertainty, confirmed)
 
 
 def uniform_slowdown(states, hosts, base_ms, threshold, previous_ends=None, admission=None):
@@ -113,17 +156,18 @@ def wait_delta(final, earlier):
 
 
 def phase_rank(states, boundaries, base_ms, gap):
-    late, limits = boundaries
-    cutoff = states[late]['start_mono_ns']
-    if median(event['mono_ns'] - cutoff for event in states.values()) <= max(2_000_000, 1.5 * base_ms * 1e6):
+    delayed, limits = boundaries.admission_rank, boundaries.limits
+    if limits is None or boundaries.tail_ns <= max(2_000_000, 1.5 * base_ms * 1e6):
         return None, None
     votes = []
     for index in (0, 1):
-        view = {rank: wait_delta(event, limits[rank][index]) if rank != late else event
-                for rank, event in states.items()}
+        view = {}
+        for rank, event in states.items():
+            earlier = limits[rank][index] if rank in limits else None
+            view[rank] = wait_delta(event, earlier) if earlier is not None else event
         votes.append(preferred_rank(view, gap))
     (early, a), (late_vote, b) = votes
-    if early is None or early != late_vote or early == late:
+    if early is None or early != late_vote or early == delayed:
         return None, None
     return early, min(a, b)
 
@@ -131,18 +175,18 @@ def phase_rank(states, boundaries, base_ms, gap):
 class TreeWaitAttribution:
     def __init__(self, gap):
         self.gap = gap
-        self.rounds = deque(maxlen=3)
+        self.rounds = deque(maxlen=5)
         self.last_window = None
 
     def refine(self, item, states, operation, window, boundaries=None):
         if item['kind'] == 'detected':
             return item
         if (self.last_window is not None and window - self.last_window > 2 or
-                self.rounds and self.rounds[-1][0] >= operation):
+                self.rounds and self.rounds[-1][1] >= operation):
             self.rounds.clear()
         self.last_window = window
         started = time.perf_counter_ns()
-        compute = boundaries[0] if boundaries is not None else None
+        compute = boundaries.admission_rank if boundaries is not None and boundaries.confirmed_admission else None
         candidate, separation = None, None
         try:
             if boundaries is None:
@@ -151,17 +195,34 @@ class TreeWaitAttribution:
                 candidate, separation = phase_rank(states, boundaries, item['t_base_ms'], self.gap)
         except ValueError:
             pass
-        self.rounds.append((operation, (compute, candidate)))
+        self.rounds.append((window, operation, (compute, candidate)))
         item.update(roots=[], compute_roots=[], communication_roots=[], tree_wait_gap=separation)
-        if len(self.rounds) < 3:
-            item.update(kind='detected', reason='waiting for three directional Tree samples')
-        elif candidate is not None and sum(vote == (compute, candidate) for _, vote in self.rounds) >= 2:
+        cross_host = boundaries is not None and boundaries.uncertainty_ns is not None
+        if cross_host:
+            item['clock_uncertainty_us'] = boundaries.uncertainty_ns / 1e3
+            if compute is None:
+                item['admission_candidates'] = [boundaries.admission_rank]
+            recent = [vote[1] for when, _, vote in self.rounds if window - when <= 4 and vote[1] is not None]
+            votes = recent.count(candidate)
+            repeated = len(self.rounds) >= 3 and votes >= 2 and votes > len(recent) // 2
+        else:
+            recent = list(self.rounds)[-3:]
+            repeated = len(recent) == 3 and sum(vote == (compute, candidate) for _, _, vote in recent) >= 2
+        if candidate is not None and repeated:
             roots = [candidate] if compute is None else sorted([compute, candidate])
             item.update(kind='S2' if compute is None else 'S3', roots=roots,
                         compute_roots=[] if compute is None else [compute], communication_roots=[candidate],
-                        method='tree_directional_wait' if compute is None else 'post_entry_tree_wait',
-                        location_latency_ms=(item.get('location_latency_ms') or 0) +
-                        (time.perf_counter_ns() - started) / 1e6)
+                        method='tree_directional_wait' if boundaries is None else 'post_entry_tree_wait')
+        elif cross_host and compute is not None:
+            reason = ('no bounded wait samples at the last admission' if boundaries.limits is None else
+                      'no repeated post-entry communication root')
+            item.update(kind='S1', roots=[compute], compute_roots=[compute],
+                        method='tree_rank_admission', reason=reason)
+        elif len(self.rounds) < 3:
+            item.update(kind='detected', reason='waiting for three directional Tree samples')
         else:
             item.update(kind='undetermined', reason='no repeated directional Tree root')
+        if item['roots']:
+            item['location_latency_ms'] = (item.get('location_latency_ms') or 0) + (
+                time.perf_counter_ns() - started) / 1e6
         return item

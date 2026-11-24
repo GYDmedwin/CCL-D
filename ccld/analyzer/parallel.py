@@ -76,7 +76,7 @@ class ParallelAnalysis(LiveAnalysis):
         self.context = multiprocessing.get_context('spawn')
         self.workers = workers
         self.decode = _decode_coalesced if coalesce_completed else _decode
-        if coalesce_completed and cfg.ring_wait_phases:
+        if coalesce_completed and (cfg.ring_wait_phases or cfg.tree_cross_host_phases):
             self.decode = partial(_decode_coalesced, keep_wait_snapshots=True)
         self.coalesced = Counter()
         # Each shard always uses the same process. A Ring-wait pair may span

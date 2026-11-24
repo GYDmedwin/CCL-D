@@ -13,10 +13,11 @@ import time
 from .ccld_analyze import (acknowledged_exclusion, add_decision_arguments, aligned_exclusion, analyze_comm, barrier,
                            completed_mismatch, decision_config, exclusion_report,
                            result_common, SlowWindows)
+from .clock_bounds import ClockBounds
 from .cross_domain import CrossDomainWaits
 from .tree_s1_vote import CLASSIFIED, vote
 from ..tools.decode_async_wait import RECORD_BYTES, WaitDecoder
-from ..tools.live_transport import job_token, pull
+from ..tools.live_transport import job_token, pull, sample_clock
 
 
 class SlowWindow(SlowWindows):
@@ -62,14 +63,15 @@ class Communicator:
     MAX_PHASE_OPERATIONS = 16
     MAX_PHASE_SNAPSHOTS = 32
 
-    def __init__(self, comm, world, cfg, emit):
+    def __init__(self, comm, world, cfg, emit, clocks=None):
         self.comm, self.world, self.cfg, self.emit = comm, world, cfg, emit
+        self.clocks = clocks
         self.observed = {}
         self.rank_hosts = {}
         self.ended = set()
         self.rank_losses = {}
         self.pending = defaultdict(dict)
-        self.phase_samples = OrderedDict() if cfg.ring_wait_phases else None
+        self.phase_samples = OrderedDict() if cfg.ring_wait_phases or cfg.tree_cross_host_phases else None
         self.completed_by_time = []
         self.tree_references = deque(maxlen=4)
         self.rank0_entry_ns = 0
@@ -227,7 +229,7 @@ class Communicator:
             _, op, states = heapq.heappop(self.completed_by_time)
             snapshots = self.phase_samples.pop(op, None) if self.phase_samples is not None else None
             try:
-                self.window.add(op, states, self.world, self.rank_hosts, snapshots)
+                self.window.add(op, states, self.world, self.rank_hosts, snapshots, self.clocks)
             except ValueError as exc:
                 self.mark_gap(op, str(exc))
                 break
@@ -238,6 +240,7 @@ class LiveAnalysis:
         self.cfg, self.emit = cfg, emit
         self.comms = {}
         self.cross_domain = CrossDomainWaits()
+        self.clocks = ClockBounds() if cfg.tree_cross_host_phases else None
         self.events = Counter()
         self.completed = Counter()
         self.first_complete_ns = None
@@ -254,7 +257,7 @@ class LiveAnalysis:
                 self.first_complete_ns = time.monotonic_ns()
         comm = event['comm_hash']
         if comm not in self.comms:
-            self.comms[comm] = Communicator(comm, event['world_size'], self.cfg, self.emit)
+            self.comms[comm] = Communicator(comm, event['world_size'], self.cfg, self.emit, self.clocks)
         self.comms[comm].add(event)
 
     def receive(self, endpoint, records):
@@ -369,14 +372,36 @@ def emit(item):
     print(json.dumps(item, sort_keys=True), flush=True)
 
 
+async def refresh_clocks(endpoints, token, clocks, stop):
+    while not stop.is_set():
+        results = await asyncio.gather(*(sample_clock(e.host, e.port, token, .25) for e in endpoints),
+                                       return_exceptions=True)
+        for endpoint, sample in zip(endpoints, results):
+            if isinstance(sample, Exception):
+                continue
+            if not endpoint.epoch or endpoint.epoch == sample.epoch:
+                clocks.add((endpoint.host, endpoint.port), sample)
+        try:
+            await asyncio.wait_for(stop.wait(), .1)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run(args, cfg):
     stop = asyncio.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
     analysis = make_analysis(cfg, emit, args.decode_workers, args.coalesce_completed)
+    token = job_token()
+    sampler = None
+    if analysis.clocks is not None and len(args.node) > 1:
+        sampler = asyncio.create_task(refresh_clocks(args.node, token, analysis.clocks, stop))
     try:
-        await monitor(args.node, job_token(), analysis, args.poll_s, args.timeout_s, stop)
+        await monitor(args.node, token, analysis, args.poll_s, args.timeout_s, stop)
     finally:
+        if sampler is not None:
+            stop.set()
+            await sampler
         await analysis.close()
     emit({'category': 'summary', 'nodes': len(args.node), 'events': dict(analysis.events),
           'completed_operations': dict(analysis.completed),
@@ -402,6 +427,8 @@ def main():
     p.add_argument('--coalesce-completed', action='store_true',
                    help='fold progress superseded by completion within a decoder batch')
     add_decision_arguments(p)
+    p.add_argument('--tree-cross-host-phases', action='store_true',
+                   help='bound node clock offsets for phased Tree slowdown analysis')
     args = p.parse_args()
     if any(not math.isfinite(x) or x <= 0 for x in (args.poll_s, args.timeout_s)):
         p.error('poll and timeout intervals must be positive')

@@ -46,6 +46,19 @@ static void test_batch_capacity_and_wrap() {
   assert(!queue.pop(value));
 }
 
+static void test_runtime_capacity() {
+  constexpr uint64_t capacity = 2048;
+  CcldQueue<uint64_t> queue(capacity);
+  assert(queue.valid() && queue.lockFree());
+  assert(queue.allocatedBytes() >= capacity * sizeof(uint64_t));
+  for (uint64_t i = 0; i < capacity; ++i) assert(queue.push(i));
+  assert(!queue.push(capacity));
+  for (uint64_t i = 0; i < capacity; ++i) {
+    uint64_t value = 0;
+    assert(queue.pop(value) && value == i);
+  }
+}
+
 static void test_multiple_producers() {
   const uint64_t producerCount = 4;
   const uint64_t valuesPerProducer = 20000;
@@ -86,6 +99,7 @@ int main() {
   test_capacity_and_wrap();
   test_invalid_capacity();
   test_batch_capacity_and_wrap();
+  test_runtime_capacity();
   test_multiple_producers();
   return 0;
 }

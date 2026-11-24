@@ -4,6 +4,8 @@ from pathlib import Path
 import unittest
 
 WORKLOAD = Path(__file__).with_name('ccld_torch_collectives_rccl.py')
+if importlib.util.find_spec('torch') is None:
+    raise unittest.SkipTest('PyTorch is required for the workload tests')
 spec = importlib.util.spec_from_file_location('ccld_torch_collectives_rccl', WORKLOAD)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)

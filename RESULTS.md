@@ -199,7 +199,7 @@ Tree 分组的 Python CPU 微基准使用重复的链形和二叉拓扑。4 rank
 | LL128 | H100 上已覆盖 LL128，测试用 gfx936 RCCL 构建关闭 LL128，移植探针只接受 Simple 和 LL | 在 gfx936 使用 Simple/LL。如目标 ROCm/RCCL 版本提供 LL128 实现，再单独移植计数位置并做数值、时延和准确度验证 |
 | 跨 communicator H1 | H100 的双机 TP8×DP2 和 BW1000 的单机 TP4×DP2 都验证了训练显式登记的等待关系 | 在训练框架的实际等待点记录上游和下游 collective ID，并用跨机多通信域工作负载验证覆盖 |
 | Channel 容量 | 帧按 communicator 通道容量分配，编码可覆盖 RCCL 的 128 个 channel。BW1000 的 33 个活跃 channel 已验证 | 超过 32 个活跃 channel 时并入完整片段后参与分析。强制通道数需要按 RCCL 版本和拓扑验证 |
-| Tree S1/S2/S3 | 同机 Tree/Simple 的 S1 和逐边 S2 已验证。8+8 Tree/Simple 的 S1 经同层和多通道投票定位 | 同机以主机时刻识别晚入场，以父子边等待定位纯通信慢。混合慢、LL 和跨节点 Tree 通信归因需继续验证 |
+| Tree S1/S2/S3 | 同机和双机 Tree/Simple 已测试入场延迟、通信慢和混合慢 | 双机用全员入场后的逐边等待与独立的入场证据，结果见 [Directional Tree waits across hosts](#directional-tree-waits-across-hosts) |
 | AllToAll 和普通 P2P | 此处验证 P2P AllToAll 的数值。H100 参考发布也只验证了该路径的数值 | 给 P2P 分组增加显式覆盖记录，再按 peer 和方向进行探测及根因建模。Pivot AllToAll 应单独验证 |
 | 同一计划多 collective、图重放 | 当前两套实现均以单 collective 计划为主要覆盖范围。RCCL 对多任务计划记录显式跳过，在各 rank 对齐后恢复诊断 | 对成组调用与图重放建立每个 work 的独立元数据及完成标记。诊断复核可先使用无图、单 collective 工作负载 |
 | 完成时刻 | 两版默认轮询 event，也保留流回调。RCCL 使用 HIP event 和 HIP 映射内存 | HIP event 查询确认完成后读取探针。短操作需要同时报告采样间隔与应用端基准 |
@@ -242,3 +242,17 @@ version gave median analysis CPU times of 105.4 ms before the change and
 98.9 ms after it, per case. All 20 mixed cases in the retained captures
 were located by the updated analyzer. This measurement covers the
 binary-record replay and decision code on the same data.
+
+## Directional Tree waits across hosts
+
+The opt-in Tree/Simple AllReduce trials used two BW1000 hosts with four
+ranks each. With 1 ms snapshots, the analyzer identified both exact ranks
+in 4/10 mixed injections and found the communication rank in 9/10. In
+five cases it confirmed communication slowdown and retained the correct
+admission candidate. In one case it confirmed only delayed entry. The
+pure delayed-entry and pure communication controls located 2/2 and 1/2.
+Both healthy controls stayed clear.
+
+The missed pure communication injection produced the correct directional
+candidate in all nine injected rounds. The rank-local entry variation
+exceeded the gate for that classification.
