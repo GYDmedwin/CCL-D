@@ -46,7 +46,12 @@ class RankStreamLossTests(unittest.IsolatedAsyncioTestCase):
         analysis.add(decoder.consume(event(1, 0, 0, 0)))
         for raw in buffer.records[:buffer.end]:
             analysis.add(decoder.consume(raw))
-        analysis.evaluate()
+        with patch('ccld.analyzer.live.time.monotonic_ns', return_value=1_000_000_000):
+            analysis.evaluate()
+        self.assertFalse(results)
+        analysis.add(decoder.consume(event(3, 0, 4, 2_001_000_000, 1_500_000_000)))
+        with patch('ccld.analyzer.live.time.monotonic_ns', return_value=2_001_000_000):
+            analysis.evaluate()
         self.assertEqual([(x['kind'], x['roots']) for x in results], [('rank_exit', [1])])
         self.assertEqual(results[0]['rank_streams'],
                          [{'rank': 1, 'last_op_count': 4, 'process_exited': True}])
@@ -63,6 +68,35 @@ class RankStreamLossTests(unittest.IsolatedAsyncioTestCase):
         analysis.evaluate()
         self.assertEqual([(x['category'], x['roots']) for x in results], [('coverage_gap', [])])
         self.assertEqual(results[0]['rank_streams'][0]['rank'], 1)
+
+    async def test_verified_exit_after_the_last_completion_is_a_coverage_gap(self):
+        results = []
+        analysis, decoder = LiveAnalysis(Config(baseline_ms=1.), results.append), WaitDecoder()
+        for rank in range(2):
+            analysis.add(decoder.consume(event(1, rank, 0, 0)))
+            analysis.add(decoder.consume(event(4, rank, 1, 10_000, 500)))
+        analysis.evaluate()
+        analysis.add(decoder.consume(rank_stream_lost_record((42, 1, 2), 1, True)))
+        analysis.evaluate()
+        self.assertFalse(results)
+        analysis.add(decoder.consume(event(8, 0, 1, 20_000)))
+        analysis.evaluate()
+        self.assertEqual([(row['category'], row['roots']) for row in results], [('coverage_gap', [])])
+
+    async def test_peer_last_completion_can_arrive_after_the_rank_loss(self):
+        results = []
+        analysis, decoder = LiveAnalysis(Config(baseline_ms=1.), results.append), WaitDecoder()
+        for rank in range(2):
+            analysis.add(decoder.consume(event(1, rank, 0, 0)))
+        analysis.add(decoder.consume(event(3, 0, 1, 1_000, 500)))
+        analysis.add(decoder.consume(rank_stream_lost_record((42, 1, 2), 1, True)))
+        with patch('ccld.analyzer.live.time.monotonic_ns', return_value=1_000_000_000):
+            analysis.evaluate()
+        analysis.add(decoder.consume(event(4, 0, 1, 1_500, 1_000)))
+        with patch('ccld.analyzer.live.time.monotonic_ns', return_value=2_100_000_000):
+            analysis.evaluate()
+        self.assertEqual([(row['category'], row['roots']) for row in results], [('coverage_gap', [])])
+
 
 
 class LiveDecisionTests(unittest.TestCase):

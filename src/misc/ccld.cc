@@ -21,6 +21,7 @@
 #include <inttypes.h>
 #include <mutex>
 #include <new>
+#include <pthread.h>
 #include <thread>
 #include <strings.h>
 #include <unistd.h>
@@ -142,6 +143,7 @@ static void ccldWrite(CcldState* state, const CcldLogEvent& event) {
 }
 
 static void ccldWriter(CcldState* state) {
+  (void)pthread_setname_np(pthread_self(), "ccld-writer");
   CcldLogEvent batch[16];
   for (;;) {
     size_t count = 0;
@@ -339,6 +341,7 @@ static void ccldPollSlot(CcldState* state, unsigned index, bool eventDeviceReady
 }
 
 static void ccldSampler(CcldState* state) {
+  (void)pthread_setname_np(pthread_self(), "ccld-probe");
   const bool eventDeviceReady = !state->useEvent || hipSetDevice(state->device) == hipSuccess;
   if (!eventDeviceReady)
     WARN("CCL-D rank %d sampler could not select device %d", state->rank, state->device);
