@@ -1,5 +1,6 @@
 import unittest
 
+from ccld.analyzer.admission import AdmissionEvidence
 from ccld.analyzer.tree_wait import TreePhase, TreeWaitAttribution, directional_scores, uniform_slowdown
 
 
@@ -71,6 +72,16 @@ class TreeWaitTests(unittest.TestCase):
         rows[3]['start_mono_ns'] -= 5_000_000
         rows[0]['duration_ns'] = 500_000
         self.assertFalse(uniform_slowdown(rows, hosts, .5, 2))
+
+    def test_cross_host_spread_can_coexist_with_unambiguous_communication_slowdown(self):
+        rows = states()
+        hosts = {0: 'a', 1: 'a', 2: 'b', 3: 'b'}
+        mild_skew = AdmissionEvidence(2_600_000, None, None, 2_400_000)
+        self.assertTrue(uniform_slowdown(rows, hosts, .5, 2, admission=mild_skew))
+        tied_late_ranks = AdmissionEvidence(5_000_000, None, None, 5_000_000)
+        self.assertFalse(uniform_slowdown(rows, hosts, .5, 2, admission=tied_late_ranks))
+        confirmed_late = AdmissionEvidence(5_000_000, 2, 2, 5_000_000)
+        self.assertFalse(uniform_slowdown(rows, hosts, .5, 2, admission=confirmed_late))
 
     def test_bad_edge_or_saturated_counter_does_not_supply_an_attribution(self):
         broken = states()
