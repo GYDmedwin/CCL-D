@@ -53,6 +53,7 @@ struct CcldSlot {
   const char* algo = nullptr;
   const char* proto = nullptr;
   int lo = 0, hi = -1;
+  const CcldTreeWaitChannel* treeWait = nullptr;
   int parents[CCLD_MAX_CHANNELS] = {};
   int ringPrev[CCLD_MAX_CHANNELS] = {}, ringNext[CCLD_MAX_CHANNELS] = {};
   uint64_t lastSend[CCLD_MAX_CHANNELS] = {}, lastRecv[CCLD_MAX_CHANNELS] = {};
@@ -72,6 +73,7 @@ struct CcldState {
   CcldFrame* device = nullptr;
   CcldWaitChannel* waitFrame = nullptr;
   CcldWaitChannel* waitDevice = nullptr;
+  std::unique_ptr<ncclTree[]> treeTopology;
   size_t waitBytes = 0, waitBlockBytes = 0;
   size_t frameBytes = 0;
   unsigned frameChannels = 0, frameGroups = 0, frameBlocks = CCLD_BLOCKS;
@@ -80,7 +82,7 @@ struct CcldState {
   CcldPending pending[256];
   std::unique_ptr<CcldQueue<CcldLogEvent>> logQueue;
   size_t queueSlots = 0;
-  uint64_t hash = 0, pollUs = 200, dumpNs = 1000000000ull;
+  uint64_t hash = 0, pollUs = 200, dumpNs = 1000000000ull, treeDumpNs = 1000000000ull;
   uint64_t mode = 1;
   int cudaDev = -1;
   bool useEvent = true;
@@ -173,7 +175,7 @@ static void ccldSample(CcldState* s, int idx) {
     if (recv != slot.lastRecv[c]) ++slot.changesRecv[c];
     slot.lastSend[c] = send;
     slot.lastRecv[c] = recv;
-    if (s->waitFrame) {
+    if (s->waitFrame && !s->treeTopology) {
       const CcldWaitChannel* waits = reinterpret_cast<const CcldWaitChannel*>(
           reinterpret_cast<const unsigned char*>(s->waitFrame) + size_t(idx) * s->waitBlockBytes);
       uint64_t data = 0, credit = 0;
@@ -194,9 +196,11 @@ static void ccldEmit(CcldState* s, int idx, const char* type, uint64_t now) {
   ccldCopyString(e.op, sizeof(e.op), slot.op); ccldCopyString(e.algorithm, sizeof(e.algorithm), slot.algo);
   ccldCopyString(e.protocol, sizeof(e.protocol), slot.proto); ccldCopyString(e.datatype, sizeof(e.datatype), slot.dtype);
   CcldLogEvent w{};
-  if (s->waitFrame) {
-    ccldCopyString(e.reason, sizeof(e.reason), "ring_wait_v1");
-    w = ccldLogBase(s, CcldLogRingWait, slot.seq, now);
+  const bool ringWait = s->waitFrame && !s->treeTopology;
+  const bool treeWait = slot.treeWait != nullptr;
+  if (ringWait || treeWait) {
+    ccldCopyString(e.reason, sizeof(e.reason), treeWait ? "tree_wait_v1" : "ring_wait_v1");
+    w = ccldLogBase(s, treeWait ? CcldLogTreeWait : CcldLogRingWait, slot.seq, now);
     w.reserved = e.type; w.nChannels = e.nChannels;
   }
   for (int c = slot.lo; c <= slot.hi; ++c) {
@@ -205,7 +209,20 @@ static void ccldEmit(CcldState* s, int idx, const char* type, uint64_t now) {
     channel.send = slot.lastSend[c]; channel.recv = slot.lastRecv[c];
     channel.sendChanges = slot.changesSend[c]; channel.recvChanges = slot.changesRecv[c];
     channel.sendDelta = slot.lastSend[c] - slot.dumpSend[c]; channel.recvDelta = slot.lastRecv[c] - slot.dumpRecv[c];
-    if (s->waitFrame) {
+    if (treeWait) {
+      const ncclTree& topology = s->treeTopology[c];
+      CcldTreeLogChannel row{};
+      row.id = c;
+      row.parent = topology.up;
+      static_assert(CCLD_TREE_PEERS - 1 == NCCL_MAX_TREE_ARITY, "Tree peer count differs");
+      for (unsigned p = 0; p < CCLD_TREE_PEERS - 1; ++p) row.children[p] = topology.down[p];
+      for (unsigned p = 0; p < CCLD_TREE_PEERS; ++p) {
+        const auto& edge = slot.treeWait[c].peers[p];
+        row.data[p] = std::min<uint64_t>(ccldLoad(&edge.data), UINT32_MAX);
+        row.credit[p] = std::min<uint64_t>(ccldLoad(&edge.credit), UINT32_MAX);
+      }
+      memcpy(&w.channels[c - slot.lo], &row, sizeof(row));
+    } else if (ringWait) {
       CcldLogChannel& wait = w.channels[c - slot.lo];
       wait.id = c; wait.parent = slot.ringPrev[c]; wait.sendChanges = uint64_t(slot.ringNext[c]);
       wait.send = slot.lastWaitData[c]; wait.recv = slot.lastWaitCredit[c];
@@ -214,7 +231,7 @@ static void ccldEmit(CcldState* s, int idx, const char* type, uint64_t now) {
     slot.dumpRecv[c] = slot.lastRecv[c];
     slot.changesSend[c] = slot.changesRecv[c] = 0;
   }
-  if (s->waitFrame) ccldLog(s, w); // Paired by rank, sequence, timestamp and base type.
+  if (ringWait || treeWait) ccldLog(s, w); // Paired by rank, sequence, timestamp and base type.
   ccldLog(s, e);
   slot.lastDumpNs = now;
 }
@@ -247,7 +264,8 @@ static void ccldWorker(CcldState* s) {
         uint64_t end = slot.endNs.load(std::memory_order_relaxed);
         ccldEmit(s, i, "complete", end);
         slot.phase.store(0, std::memory_order_release);
-      } else if (now - slot.lastDumpNs >= s->dumpNs) {
+      } else if (now >= slot.lastDumpNs &&
+                 now - slot.lastDumpNs >= (slot.treeWait ? s->treeDumpNs : s->dumpNs)) {
         ccldEmit(s, i, "snapshot", now);
       }
     }
@@ -319,7 +337,9 @@ void ccldInit(ncclComm* comm) {
   if (getenv("NCCL_CCLD_FAULT_KIND")) WARN("CCL-D fault injection is not compiled into this build");
 #endif
   s->pollUs = envNumber("NCCL_CCLD_POLL_US", 200, 20, 1000000);
-  s->dumpNs = envNumber("NCCL_CCLD_DUMP_MS", 1000, 10, 60000) * 1000000ull;
+  const uint64_t dumpMs = envNumber("NCCL_CCLD_DUMP_MS", 1000, 10, 60000);
+  s->dumpNs = dumpMs * 1000000ull;
+  s->treeDumpNs = envNumber("NCCL_CCLD_TREE_SNAPSHOT_MS", dumpMs, 1, 60000) * 1000000ull;
   if (inMemory) {
     if (!s->nodeStream.open(nodeSocket)) {
       WARN("CCL-D cannot connect to local node agent; telemetry disabled"); delete s; return;
@@ -340,6 +360,17 @@ void ccldInit(ncclComm* comm) {
   s->frameGroups = selectedAlgo && strcasecmp(selectedAlgo, "Ring") == 0 ? 1 : CCLD_GROUPS;
   const bool waitRequested = envNumber("NCCL_CCLD_WAIT_ENABLE", 0, 0, 1) == 1;
   if (waitRequested && s->frameGroups != 1) WARN("CCL-D wait experiment requires NCCL_ALGO=Ring");
+  const bool treeRequested = envNumber("NCCL_CCLD_TREE_WAIT_ENABLE", 0, 0, 1) == 1;
+  const bool treeWait = treeRequested && selectedAlgo && strcasecmp(selectedAlgo, "Tree") == 0;
+  if (treeRequested && !treeWait) WARN("CCL-D Tree wait requires NCCL_ALGO=Tree");
+  if (treeWait) {
+    s->treeTopology.reset(new (std::nothrow) ncclTree[s->frameChannels]);
+    if (!s->treeTopology) {
+      WARN("CCL-D Tree topology allocation failed");
+      delete s; return;
+    }
+    for (unsigned c = 0; c < s->frameChannels; ++c) s->treeTopology[c] = comm->channels[c].tree;
+  }
   s->frameBlocks = unsigned(envNumber("NCCL_CCLD_FRAME_BLOCKS", CCLD_BLOCKS, CCLD_BLOCKS, CCLD_MAX_BLOCKS));
   s->slots.reset(new (std::nothrow) CcldSlot[s->frameBlocks]);
   if (!s->slots) {
@@ -354,8 +385,8 @@ void ccldInit(ncclComm* comm) {
     if (s->frame) cudaFreeHost(s->frame);
     delete s; return;
   }
-  if (waitRequested && s->frameGroups == 1) {
-    s->waitBlockBytes = size_t(s->frameChannels) * s->frameGroups * sizeof(CcldWaitChannel);
+  if (treeWait || (waitRequested && s->frameGroups == 1)) {
+    s->waitBlockBytes = size_t(s->frameChannels) * (treeWait ? sizeof(CcldTreeWaitChannel) : sizeof(CcldWaitChannel));
     s->waitBytes = s->frameBlocks * s->waitBlockBytes;
     err = cudaHostAlloc((void**)&s->waitFrame, s->waitBytes, cudaHostAllocMapped);
     if (err == cudaSuccess) err = cudaHostGetDevicePointer((void**)&s->waitDevice, s->waitFrame, 0);
@@ -501,6 +532,9 @@ void ccldPlan(ncclComm* comm, ncclKernelPlan* plan) {
   slot.op = start.op; slot.dtype = start.dtype;
   slot.algo = ncclAlgoToString(task->algorithm); slot.proto = ncclProtoToString(task->protocol);
   slot.lo = work->channelLo; slot.hi = work->channelHi;
+  slot.treeWait = s->treeTopology && task->algorithm == NCCL_ALGO_TREE && task->protocol == NCCL_PROTO_SIMPLE ?
+      reinterpret_cast<const CcldTreeWaitChannel*>(
+          reinterpret_cast<const unsigned char*>(s->waitFrame) + size_t(index) * s->waitBlockBytes) : nullptr;
   for (int c = 0; c < CCLD_MAX_CHANNELS; ++c) {
     slot.parents[c] = comm->channels[c].tree.up;
     slot.ringPrev[c] = comm->channels[c].ring.prev; slot.ringNext[c] = comm->channels[c].ring.next;

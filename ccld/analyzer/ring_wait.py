@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import json
 import math
 from pathlib import Path
 import statistics
+import time
+
+
+PHASE_WINDOW_NS = 2_500_000
+PHASE_ENTRY_GAP_NS = 1_000_000
+WAIT_FIELDS = ('wait_data_spins', 'wait_credit_spins')
 
 
 def graph_wait_scores(states: dict[int, dict]) -> dict:
@@ -120,6 +126,182 @@ def decide(states: dict, threshold: float, slow_confirmed: bool) -> dict:
             'candidate_ranks': [r for r, n in sorted(votes.items()) if n >= 2] if detected else [],
             'trial_median_gap': statistics.median(gaps), 'operation_gaps': gaps,
             'qualifying_votes': dict(sorted(votes.items()))}
+
+
+def phase_boundaries(states, snapshots, hosts):
+    """Bracket the last entry with observed samples on the same host clock."""
+    if not snapshots or len(states) < 3:
+        return None
+    clock_hosts = {hosts.get(rank) for rank in states}
+    if len(clock_hosts) != 1 or not all(isinstance(h, str) and h for h in clock_hosts):
+        return None
+    if any(type(event.get('start_mono_ns')) is not int for event in states.values()):
+        return None
+    ordered = sorted((e['start_mono_ns'], rank) for rank, e in states.items())
+    cutoff, last = ordered[-1]
+    if cutoff - ordered[-2][0] <= PHASE_ENTRY_GAP_NS or any(e['mono_ns'] < cutoff for e in states.values()):
+        return None
+    bounds = {}
+    for rank, final in states.items():
+        if rank == last:
+            continue
+        before, after = None, final if final['mono_ns'] <= cutoff + PHASE_WINDOW_NS else None
+        for event in snapshots.get(rank, ()):
+            if event.get('start_mono_ns') != final['start_mono_ns']:
+                continue
+            when = event['mono_ns']
+            if cutoff - PHASE_WINDOW_NS <= when <= cutoff and (before is None or when > before['mono_ns']):
+                before = event
+            if cutoff <= when <= cutoff + PHASE_WINDOW_NS and (after is None or when < after['mono_ns']):
+                after = event
+        if before is None or after is None:
+            return None
+        bounds[rank] = before, after
+    return last, bounds
+
+
+def phase_vote(states, boundaries, gap):
+    """Vote only when subtraction on both sides produces the same strong root."""
+    last, bounds = boundaries
+    roots = []
+    for index in range(2):
+        views = {}
+        for rank, final in states.items():
+            baseline = bounds[rank][index] if rank != last else None
+            rows = {c.get('id'): c for c in baseline['channels']} if baseline is not None else {}
+            if baseline is not None and (baseline.get('wait_probe') is not True or
+                    set(rows) != {c.get('id') for c in final['channels']} or len(rows) != len(baseline['channels'])):
+                return None
+            channels = []
+            for channel in final['channels']:
+                old = rows.get(channel.get('id'))
+                if old is not None and any(old.get(k) != channel.get(k) for k in ('ring_prev', 'ring_next')):
+                    return None
+                deltas = {}
+                for field in WAIT_FIELDS:
+                    end = channel.get(field)
+                    start = old.get(field) if old is not None else 0
+                    if type(end) is not int or type(start) is not int or not 0 <= start <= end:
+                        return None
+                    deltas[field] = end - start
+                channels.append(dict(channel, **deltas))
+            views[rank] = dict(final, channels=channels)
+        score = graph_wait_scores(views)
+        candidates = score['forced_top_ranks']
+        if len(candidates) != 1 or score['top_gap'] < gap or candidates[0] == last:
+            return None
+        roots.append(candidates[0])
+    return roots[0] if roots[0] == roots[1] else None
+
+
+class RingWaitAttribution:
+    """Require directionally consistent waits before attributing communication slowdown."""
+
+    def __init__(self, gap, slow_threshold, use_phases=False, alpha=0.4):
+        self.gap = gap
+        self.slow_threshold = slow_threshold
+        self.use_phases = use_phases
+        self.alpha = alpha
+        self.rounds = deque(maxlen=3)
+        self.last_window = None
+        self.last_phase = False
+
+    def refine(self, item, states, operation, window, boundaries=None):
+        if item is None or not all(state.get('wait_probe') is True for state in states.values()):
+            self.rounds.clear()
+            return item
+        kind = item['kind']
+        mixed = kind == 'S3' or (kind == 'S1' and
+                item['t_min_ms'] > item['t_base_ms'] * (1 + self.slow_threshold))
+        if self.use_phases and kind == 'undetermined' and item['p'] >= self.alpha:
+            mixed = True
+        verify_s1 = self.use_phases and kind == 'S1' and not mixed
+        if not (mixed or verify_s1 or kind in ('S2', 'undetermined')):
+            self.rounds.clear()
+            return item
+        phased = self.use_phases and (mixed or verify_s1)
+        if phased != self.last_phase or (self.last_window is not None and window - self.last_window > 2) or (
+                self.rounds and self.rounds[-1][0] >= operation):
+            self.rounds.clear()
+        self.last_window = window
+        self.last_phase = phased
+        started = time.perf_counter_ns()
+        comp = item['compute_roots'] if mixed or verify_s1 else []
+        if phased:
+            vote = None
+            if boundaries is not None and comp == [boundaries[0]]:
+                cutoff = states[comp[0]]['start_mono_ns']
+                tail_ns = statistics.median(e['mono_ns'] - cutoff for e in states.values())
+                # The early finish of the late rank can hide a slow tail on its peers.
+                if tail_ns > max(PHASE_ENTRY_GAP_NS, item['t_base_ms'] * 1e6):
+                    try:
+                        vote = phase_vote(states, boundaries, self.gap)
+                    except ValueError:
+                        pass
+            self.rounds.append((operation, (tuple(comp), vote)))
+        else:
+            self.rounds.append((operation, states))
+        if len(self.rounds) < 3:
+            if verify_s1:
+                return item
+            return dict(item, kind='detected', roots=[], reason='waiting for three directional samples')
+
+        if phased:
+            votes = Counter(rank for _, (compute, rank) in self.rounds if rank is not None and compute == tuple(comp))
+            suspects = [rank for rank, support in votes.items() if support >= 2 and (not verify_s1 or rank == vote)]
+        else:
+            try:
+                suspects = decide(dict(self.rounds), self.gap, slow_confirmed=True)['candidate_ranks']
+            except ValueError:
+                suspects = []
+        if len(suspects) != 1 or suspects[0] in comp:
+            if verify_s1:
+                return item
+            return dict(item, kind='undetermined', roots=[], compute_roots=comp,
+                        communication_roots=[], reason=('no consistent post-entry wait attribution' if phased
+                                                        else 'no consistent directional wait attribution'))
+        elapsed_ms = (time.perf_counter_ns() - started) / 1e6
+        return dict(item, kind='S3' if mixed or phased else 'S2',
+                    roots=sorted(set(comp + suspects)), communication_roots=suspects,
+                    compute_roots=comp, method='post_entry_ring_wait' if phased else 'directional_ring_wait',
+                    location_latency_ms=(item.get('location_latency_ms') or 0) + elapsed_ms)
+
+
+class RankMixedWait:
+    """Require separate and repeated host-admission and Ring wait evidence."""
+
+    def __init__(self, gap):
+        self.gap = gap
+        self.rounds = deque(maxlen=3)
+        self.last_window = None
+
+    def refine(self, item, states, operation, window, delayed_rank):
+        if self.last_window is not None and (window - self.last_window > 2 or
+                self.rounds and self.rounds[-1][0] >= operation):
+            self.rounds.clear()
+        self.last_window = window
+        started = time.perf_counter_ns()
+        sender = None
+        try:
+            score = graph_wait_scores(states)
+            suspects = score['forced_top_ranks']
+            if len(suspects) == 1 and score['top_gap'] >= self.gap and suspects[0] != delayed_rank:
+                sender = suspects[0]
+        except ValueError:
+            pass
+        vote = delayed_rank, sender
+        self.rounds.append((operation, vote))
+        if (item['kind'] != 'detected' and len(self.rounds) == 3 and sender is not None
+                and sum(previous == vote for _, previous in self.rounds) >= 2):
+            item.update(kind='S3', roots=sorted(vote), compute_roots=[delayed_rank],
+                        communication_roots=[sender], method='ring_wait_and_rank_admission',
+                        location_latency_ms=(time.perf_counter_ns() - started) / 1e6)
+        elif sender is None or len(self.rounds) == 3 and item['kind'] != 'detected':
+            item.update(kind='undetermined', compute_roots=[delayed_rank],
+                        reason='no repeated independent Ring communication root')
+        else:
+            item.update(kind='detected', reason='waiting for repeated independent Ring signals')
+        return item
 
 
 def main() -> None:

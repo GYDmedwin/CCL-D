@@ -20,6 +20,8 @@ class Primitives<
   > {
   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
   static constexpr int Input=0, Output=1;
+  static constexpr bool TreeFan = (MaxRecv == NCCL_MAX_TREE_ARITY && MaxSend == 1) ||
+                                  (MaxSend == NCCL_MAX_TREE_ARITY && MaxRecv == 1);
   static constexpr int RoleInput = 0x01,
                        RoleOutput = 0x02,
                        RoleWaitRecv = 0x04,
@@ -34,9 +36,11 @@ class Primitives<
                        PatMode = 0x800,
                        NvlsMinPolling = 0x1000,
                        NetDeviceUnpack = 0x2000,
-                       AnyNetDeviceUnpack = 0x4000;
+                       AnyNetDeviceUnpack = 0x4000,
+                       CcldTreeWaitRole = 0x8000;
   CcldChannel* ccldChannel;
   CcldWaitChannel* ccldWaitChannel;
+  uint64_t ccldTreeSpins = 0;
 #ifdef CCLD_FAULT_INJECTION
   uint64_t ccldFaultCycles;
   uint32_t ccldFaultKind;
@@ -119,6 +123,11 @@ class Primitives<
     return ld_volatile_global(ptr);
   }
 
+  __device__ __forceinline__ void publishTreeWait() {
+    volatile uint64_t* target = (flags & RoleWaitSend) ? &ccldWaitChannel->credit : &ccldWaitChannel->data;
+    *target = ccldTreeSpins;
+  }
+
   template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
   __device__ __forceinline__ void waitPeer(intptr_t srcIx, intptr_t dstIx, int offset, int nelts) {
     const bool isSendNotRecv = (Send && Recv) ? (flags & RoleWaitSend) : Send;
@@ -126,15 +135,20 @@ class Primitives<
     // coverity[dead_error_line]
     if ((flags & (Recv * RoleWaitRecv)) || (flags & (Send * RoleWaitSend))) {
       int spins = 0;
+      const bool treeTrack = TreeFan && (flags & CcldTreeWaitRole);
       const bool track = ccldWaitChannel && index == 0;
       uint64_t waitSpins = 0;
       while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
         connStepCache = loadStepValue(connStepPtr);
-        if (track && (++waitSpins & 1023) == 0) ccldWaitAdd(ccldWaitChannel, group, isSendNotRecv, 1024);
+        if (treeTrack) {
+          if ((++ccldTreeSpins & 1023) == 0) publishTreeWait();
+        } else if (track && (++waitSpins & 1023) == 0) {
+          ccldWaitAdd(ccldWaitChannel, group, isSendNotRecv, 1024);
+        }
         if (checkAbort(spins)) break;
         //if (spins == 0) printf("r=%d b=%d t=%d SPUN OUT got=%d want=%d\n", ncclShmem.comm.rank, blockIdx.x, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
       }
-      if (track) ccldWaitAdd(ccldWaitChannel, group, isSendNotRecv, waitSpins & 1023);
+      if (track && !treeTrack) ccldWaitAdd(ccldWaitChannel, group, isSendNotRecv, waitSpins & 1023);
     }
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
@@ -657,6 +671,13 @@ private:
 
       if (flags & (RoleWaitRecv|RolePostRecv)) peer = recvPeers[index];
       if (flags & (RoleWaitSend|RolePostSend)) peer = sendPeers[index];
+      if (TreeFan && (flags & (RoleWaitRecv | RoleWaitSend))) {
+        const unsigned peerSlot = peer == ncclShmem.channel.tree.up ? 0 : index + 1;
+        if (auto* treeWait = ccldTreeWaitOutput(collWork, peerSlot)) {
+          ccldWaitChannel = treeWait;
+          flags |= CcldTreeWaitRole;
+        }
+      }
     } else if (mode == primsModePatRs || mode == primsModePatAg) { // Connect to all ranks +/- 2^n
       flags |= PatMode;
       accSize = 0;
@@ -719,6 +740,7 @@ private:
   }
 
   __device__ ~Primitives() {
+    if (TreeFan && (flags & CcldTreeWaitRole) && ccldTreeSpins) publishTreeWait();
     // Save steps for the next operation
     if (flags & (RolePostSend|RolePostRecv)) conn->step = step;
     if ((flags & NetRegMode) && (flags & RoleWaitSend)) {

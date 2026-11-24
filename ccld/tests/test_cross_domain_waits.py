@@ -227,7 +227,12 @@ with observe_wait(producer, [first], path) as recorded:
                     await asyncio.sleep(.01)
                 self.assertFalse(buffer.wait_pages)
                 buffer.capture_waits()
-                events = [WaitDecoder().consume(record) for record in buffer.records[3:7]]
+                decoder = WaitDecoder()
+                records = [decoder.consume(record) for record in buffer.records[:buffer.end]]
+                events = [event for event in records if event['event'] == 'wait_observation']
+                exits = [event for event in records if event['event'] == 'rank_stream_lost']
+                self.assertEqual(len(exits), 3)
+                self.assertTrue(all(event['process_exited'] for event in exits))
                 self.assertEqual([event['active'] for event in events], [True, True, False, False])
                 self.assertEqual(events[0]['wait_id'], events[-1]['wait_id'])
                 self.assertEqual(events[1]['wait_id'], events[2]['wait_id'])

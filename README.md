@@ -1,17 +1,18 @@
 # CCL-D for NCCL
 
-CCL-D for NCCL diagnoses slow and hanging collective operations during
-distributed training with GPU progress probes, host monitoring, and an
-independent online analyzer. This research implementation builds on NVIDIA
-NCCL **v2.24.3-1**. [CCL-D paper](https://doi.org/10.1145/3774934.3786429)
+CCL-D detects and locates slow or stalled collective operations in distributed
+training. This branch instruments NVIDIA NCCL **v2.24.3-1**. GPU kernels write
+progress counters to mapped host memory. Rank-local monitors sample the
+counters, node agents buffer the records in memory, and a separate CPU
+analyzer pulls those records over the job network.
 
-## Quick start
+[Paper](https://doi.org/10.1145/3774934.3786429) · [RCCL version](https://github.com/GYDmedwin/CCL-D/tree/rccl) · [Validation results](RESULTS.md)
 
-### Build
+## Build
 
-Use Linux with a CUDA toolkit, a C++ toolchain, and Python 3.9 or later.
-The example below builds for H100 (`sm_90`) and uses the CUDA 12.8.2
-toolchain exercised in the validation runs.
+Use Linux, a CUDA and C++ toolchain, and Python 3.9 or later. This example
+builds for H100. Set `CUDA_HOME` to your toolkit and adjust `NVCC_GENCODE` for
+your GPU. The build writes `build/lib/libnccl.so.2`.
 
 ```bash
 git clone https://github.com/GYDmedwin/CCL-D.git
@@ -21,18 +22,58 @@ make -j8 src.build CUDA_HOME=/usr/local/cuda \
 python3 -m unittest discover -s ccld/tests
 ```
 
-Set `CUDA_HOME` for your toolkit and adjust `NVCC_GENCODE` for your GPU
-architecture. The build produces `build/lib/libnccl.so.*`. The upstream
-base is commit `6aae37927840b2bd7b7d42d2f0050e75f88ee97f`.
-See the [NCCL build options](README.NVIDIA.md#build).
+The H100 validation used CUDA 12.8.2. See the
+[NCCL build options](README.NVIDIA.md#build).
 
-### Example: FSDP model training
+## Run with your training job
 
-Activate your CUDA-enabled PyTorch environment and submit from the repository
-root on shared storage. The supplied launcher requests two nodes with eight
-GPUs per node. It starts one agent on each training node, runs the analyzer
-as a separate process on the batch host, and checks which NCCL library each
-rank loaded.
+Use the same CCL-D revision for the agents and analyzer. Generate one token
+with `openssl rand -hex 32` and export it as `CCLD_PULL_TOKEN` wherever the
+agents or analyzer run.
+
+1. **Start one agent per training node.** Set `TRAIN_NODE_ADDR` to the node
+   address reachable from the analyzer. Keep the local socket path for
+   that node's training ranks.
+
+   ```bash
+   socket_dir="$(mktemp -d)"
+   export NCCL_CCLD_NODE_SOCKET="$socket_dir/ccld.sock"
+   python3 -m ccld.tools.live_transport \
+     --socket "$NCCL_CCLD_NODE_SOCKET" --bind "$TRAIN_NODE_ADDR" --port 0
+   ```
+
+2. **Start the analyzer on a CPU host.** Use the `HOST:PORT` shown in each
+   agent's `CCLD_NODE_READY` line. The analyzer prints JSON decisions to
+   standard output.
+
+   ```bash
+   python3 -m ccld.analyzer.live --node "$AGENT_A" --node "$AGENT_B" \
+     --baseline-ms 1 --baseline-scope signature --poll-s 0.2
+   ```
+
+3. **Launch training with the instrumented library.** Export the agent
+   socket for each node into that node's training ranks. Set
+   `CCLD_NCCL_LIB` to the build's library directory and use the job's
+   existing PyTorch or MPI launcher.
+
+   ```bash
+   export NCCL_CCLD_NODE_SOCKET=/path/to/local/ccld.sock
+   export CCLD_NCCL_LIB=/path/to/CCL-D/build/lib
+   export NCCL_CCLD_ENABLE=1 NCCL_CCLD_MODE=1
+   export LD_LIBRARY_PATH="$CCLD_NCCL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+   export LD_PRELOAD="$CCLD_NCCL_LIB/libnccl.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+   ```
+
+Keep the agents running until the analyzer drains their buffers. See the
+[deployment guide](ccld/docs/live.md) for retention, pull tuning, and observed
+waits between communicators.
+
+### Slurm FSDP example
+
+Run from a shared checkout with your CUDA PyTorch environment active. The
+example starts node agents and runs the analyzer on the batch host. It
+checks the NCCL library loaded by every rank and saves the training timings,
+losses, and diagnostic output under `runs/fsdp-$SLURM_JOB_ID`.
 
 ```bash
 export CCLD_ROOT="$PWD"
@@ -40,88 +81,35 @@ CCLD_PROFILE=smoke sbatch --account YOUR_ACCOUNT --partition YOUR_GPU_PARTITION 
   ccld/slurm/fsdp_train.sh
 ```
 
-The example trains a synthetic causal decoder with FSDP, bfloat16 and AdamW.
-It writes decisions and an event summary to `diagnosis.log` and each rank's
-loss, step times, and loaded library to `workload/` under
-`runs/fsdp-$SLURM_JOB_ID`. Set `CCLD_RUN` for a custom output directory.
-To change the model size or step count, set `CCLD_PROFILE` or `CCLD_STEPS`.
+## Diagnose collectives
 
-## Use with your training job
+H1 identifies a rank that has yet to enter a collective. H2 uses mismatched
+signatures or partial completion. H3 uses stalled progress. A node agent
+can also report a verified rank process exit. Slow diagnoses can identify
+delayed entry, communication slowdown, or both. The analyzer reports the
+evidence and any root ranks it can confirm.
 
-Start one agent per training node and start the analyzer on a CPU host that
-can reach the agents over the job network. The agents and analyzer use the
-same run token. The full launcher commands and tuning options are in the
-[online deployment guide](ccld/docs/live.md).
+### Directional waits
 
-On each training node, launch your existing training command with the node's
-agent socket and modified NCCL in the rank environment. For example:
+- **Ring/Simple or Ring/LL.** Set `NCCL_ALGO=Ring` and
+  `NCCL_CCLD_WAIT_ENABLE=1` on the training ranks. For mixed slowdown across hosts,
+  add `--ring-wait-phases` and `--baseline-scope signature` to the analyzer.
+- **Tree/Simple AllReduce.** Set `NCCL_ALGO=Tree NCCL_PROTO=Simple` and
+  `NCCL_CCLD_TREE_WAIT_ENABLE=1`. For mixed slowdown across hosts, set
+  `NCCL_CCLD_TREE_SNAPSHOT_MS=1` and add `--tree-cross-host-phases` and
+  `--baseline-scope signature` to the analyzer. The analyzer bounds the
+  host clock offsets and compares Tree edge waits after the ranks enter.
+  The faster snapshot interval applies to active Tree operations.
 
-```bash
-export CCLD_NCCL_LIB=/path/to/CCL-D/build/lib
-export NCCL_CCLD_NODE_SOCKET=/path/to/local/agent.sock
-export NCCL_CCLD_ENABLE=1 NCCL_CCLD_MODE=1
-export LD_LIBRARY_PATH="$CCLD_NCCL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LD_PRELOAD="$CCLD_NCCL_LIB/libnccl.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
-```
-
-Keep the agents running until the analyzer drains the final records. Set the
-pull interval and buffer size for your workload using the
-[retention guide](ccld/docs/live.md#set-the-pull-interval-and-retention).
-
-## What the analyzer reports
-
-The analyzer compares collective timing and progress within a communicator.
-It reports slow-operation candidates and classifies hangs from rank progress
-and operation metadata.
-
-| Hang class | Evidence used for diagnosis |
-|---|---|
-| H1 | Prior rank progress shows that one or more ranks have yet to enter the collective. |
-| H2 | Ranks disagree on the collective signature, or some ranks complete before the threshold while peers remain stuck. A strict majority is required to attribute a signature mismatch to the minority. |
-| H3 | All ranks remain hung on a consistent operation. Tree compares each rank with its own progress in a matching completed round. |
-
-The live analyzer reports `rank_exit` when a node agent can verify that a
-rank process exited before closing its communicator. It retains the rank and
-its last observed operation counter. Upgrade the node agent and analyzer
-together to use this record.
-
-For **cross-communicator wait attribution**, the training runtime supplies
-the exact collective IDs on both sides of an observed wait. For an H1 alert,
-this can show why a rank has yet to enter a collective, such as a DP rank
-waiting for an earlier TP operation. The analyzer keeps the original
-per-communicator alerts so independent issues remain visible. See
-[how to register observed waits](ccld/docs/live.md#observe-cross-communicator-waits).
-
-## How it works
-
-```mermaid
-flowchart LR
-    gpu["NCCL GPU probes"] -->|"mapped host frames"| monitor["Rank-local CPU monitor"]
-    monitor -->|"Unix socket"| agent["Node agent<br/>Host-memory buffer"]
-    runtime["Training runtime"] -.->|"optional shared-memory waits"| agent
-    agent -->|"binary batches pulled over TCP"| analyzer["Independent CPU analyzer"]
-```
-
-The GPU publishes raw progress counters. The host samples progress and
-computes metrics, and the analyzer evaluates diagnostic decisions as it
-pulls telemetry. See the [telemetry reference](ccld/docs/telemetry.md).
-
-## Validation and experiments
-
-- [16-H100 collective and FSDP checks](RESULTS.md#two-node-collective-and-training-checks)
-- [Online Ring hang and Tree slow validation](RESULTS.md#online-release-validation)
-- [Single-node Ring S2 checks across three protocols](RESULTS.md#released-online-observer-h100-revalidation)
-- [Cross-communicator H1 and wait registration benchmarks](RESULTS.md#cross-domain-h1-over-memory-pull)
-- [One-node Ring experiment, offline replay, and fault simulation](ccld/docs/experiments.md)
-- [Ordered NCCL patch series](ccld/patches/README.md)
+See the [telemetry reference](ccld/docs/telemetry.md) and the
+[replay and fault-injection examples](ccld/docs/experiments.md).
 
 ## License and citation
 
-NCCL's license is retained in [LICENSE.txt](LICENSE.txt), NVTX's in
-[LICENSE-NVTX.txt](LICENSE-NVTX.txt), and original reproduction additions in
-[LICENSE-CCLD.txt](LICENSE-CCLD.txt). See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+See the [NCCL license](LICENSE.txt), [NVTX license](LICENSE-NVTX.txt),
+[CCL-D license](LICENSE-CCLD.txt), and
+[third-party notices](THIRD_PARTY_NOTICES.md).
 
-Yida Gu, Fakang Wang, et al., “CCL-D: A High-Precision Diagnostic System for
-Slow and Hang Anomalies in Large-Scale Model Training,” PPoPP 2026.
-DOI: [10.1145/3774934.3786429](https://doi.org/10.1145/3774934.3786429).
+Yida Gu, Fakang Wang, et al., *CCL-D: A High-Precision Diagnostic System for
+Slow and Hang Anomalies in Large-Scale Model Training*, PPoPP 2026.
+[DOI](https://doi.org/10.1145/3774934.3786429).

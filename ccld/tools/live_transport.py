@@ -11,18 +11,21 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import socket
 import stat
 import struct
 import time
 import zlib
 
-from .decode_ccld_binary import Event, RANK_STREAM_LOST, RECORD_BYTES
+from .decode_ccld_binary import Event, RANK_STREAM_LOST, FRAGMENT_KINDS, FRAGMENT_VERSION, RECORD_BYTES, TREE_WAIT
 from .wait_memory import WAIT_ROW
 from .wait_observation import LIMIT, evidence_record, peer_process, process_groups, receive_wait, wait_socket
 
 PROTOCOL = b'CCLDP002'
+CLOCK_PROTOCOL = b'CCLDC001'
 REQUEST = struct.Struct('!8s32sQ')
 RESPONSE = struct.Struct('!8s16sQQIIQQ')
+CLOCK_RESPONSE = struct.Struct('!8s16sQQ64s')
 RECORD_HEADER = struct.Struct('<III4xQQ40xII')
 MAX_PULL = 4096
 
@@ -45,6 +48,7 @@ class NodeBuffer:
             raise ValueError('node buffer capacity must be positive')
         self.records = [None] * capacity
         self.epoch = secrets.token_bytes(16)
+        self.hostname = socket.gethostname().encode()[:63]
         self.end = 0
         self.failed = 0
         self.active = 0
@@ -177,7 +181,8 @@ async def receive_rank(reader, writer, buffer):
                 raw = data[offset:offset + RECORD_BYTES]
                 magic, version, kind, comm, op_count, rank, world = RECORD_HEADER.unpack_from(raw)
                 rank_identity = (comm, rank, world)
-                if (magic != 0x444c4343 or version != 1 or not 1 <= kind <= 8 or
+                if (magic != 0x444c4343 or not (1 <= kind <= 8 or kind == TREE_WAIT) or
+                        (version != 1 and not (version == FRAGMENT_VERSION and kind in FRAGMENT_KINDS)) or
                         rank >= world or ended or
                         (identity is None and kind != 1) or
                         (identity is not None and (kind == 1 or identity != rank_identity))):
@@ -220,13 +225,21 @@ async def receive_rank(reader, writer, buffer):
 async def serve_pull(reader, writer, buffer, token):
     try:
         raw = await asyncio.wait_for(reader.readexactly(REQUEST.size), timeout=2)
+        received = time.monotonic_ns()
         protocol, credential, cursor = REQUEST.unpack(raw)
-        if protocol == PROTOCOL and hmac.compare_digest(credential, token):
+        if not hmac.compare_digest(credential, token):
+            return
+        if protocol == PROTOCOL:
             buffer.capture_waits()
             header, data = buffer.batch(cursor)
             writer.write(header)
             writer.write(data)
-            await asyncio.wait_for(writer.drain(), timeout=2)
+        elif protocol == CLOCK_PROTOCOL and cursor == 0:
+            writer.write(CLOCK_RESPONSE.pack(CLOCK_PROTOCOL, buffer.epoch, received,
+                                             time.monotonic_ns(), buffer.hostname))
+        else:
+            return
+        await asyncio.wait_for(writer.drain(), timeout=2)
     except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError):
         pass
     finally:
@@ -273,6 +286,38 @@ async def pull(host, port, token, cursor, timeout):
                 if len(data) != raw_bytes or not expansion.eof or expansion.unused_data:
                     raise ValueError('compressed telemetry batch size does not match its header')
             return Pull(epoch, oldest, end, failed, active, data, encoded_bytes)
+        finally:
+            writer.close()
+            with suppress(OSError):
+                await writer.wait_closed()
+    return await asyncio.wait_for(exchange(), timeout=timeout)
+
+
+@dataclass(frozen=True)
+class ClockSample:
+    host: str
+    epoch: bytes
+    agent_ns: int
+    lower_ns: int
+    upper_ns: int
+
+
+async def sample_clock(host, port, token, timeout):
+    """Bound the agent-to-observer clock offset using a two-way exchange."""
+    async def exchange():
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            sent = time.monotonic_ns()
+            writer.write(REQUEST.pack(CLOCK_PROTOCOL, token, 0))
+            await writer.drain()
+            raw = await reader.readexactly(CLOCK_RESPONSE.size)
+            received = time.monotonic_ns()
+            protocol, epoch, agent_received, agent_sent, name = CLOCK_RESPONSE.unpack(raw)
+            hostname = name.split(b'\0', 1)[0].decode()
+            lower, upper = sent - agent_received, received - agent_sent
+            if protocol != CLOCK_PROTOCOL or not hostname or agent_sent < agent_received or lower > upper:
+                raise ValueError('invalid clock sample')
+            return ClockSample(hostname, epoch, (agent_received + agent_sent) // 2, lower, upper)
         finally:
             writer.close()
             with suppress(OSError):

@@ -36,12 +36,20 @@ __device__ __forceinline__ void ccldCount(CcldChannel* channel, int tid, int gro
 // Wait roles use a GPU-local cumulative counter and only publish stores to the
 // mapped frame. Each (channel, subgroup, direction) has exactly one role writer.
 __device__ __forceinline__ CcldWaitChannel* ccldWaitOutput(ncclDevWorkColl* work, int group) {
-  if (!work || !work->ccldSlotPlus1 || !ncclShmem.comm.ccldWaitFrame) return nullptr;
+  if (!work || !work->ccldSlotPlus1 || !ncclShmem.comm.ccldWaitFrame ||
+      ncclShmem.comm.ccldGroups != 1) return nullptr;
   unsigned g = group == 0 ? 0 : 1;
   if (g >= ncclShmem.comm.ccldGroups) return nullptr;
   unsigned char* base = reinterpret_cast<unsigned char*>(ncclShmem.comm.ccldWaitFrame) +
       (work->ccldSlotPlus1 - 1) * ncclShmem.comm.ccldWaitBlockBytes;
   return reinterpret_cast<CcldWaitChannel*>(base) + ncclShmem.channelId * ncclShmem.comm.ccldGroups + g;
+}
+__device__ __forceinline__ CcldWaitChannel* ccldTreeWaitOutput(ncclDevWorkColl* work, unsigned peerSlot) {
+  if (!work || !work->ccldSlotPlus1 || !ncclShmem.comm.ccldWaitFrame ||
+      ncclShmem.comm.ccldGroups != CCLD_GROUPS || peerSlot >= CCLD_TREE_PEERS) return nullptr;
+  auto* base = reinterpret_cast<unsigned char*>(ncclShmem.comm.ccldWaitFrame) +
+      (work->ccldSlotPlus1 - 1) * ncclShmem.comm.ccldWaitBlockBytes;
+  return &reinterpret_cast<CcldTreeWaitChannel*>(base)[ncclShmem.channelId].peers[peerSlot];
 }
 __device__ __forceinline__ void ccldWaitAdd(CcldWaitChannel* output, int group, bool credit, uint64_t delta) {
   if (!output || !delta) return;

@@ -1,6 +1,11 @@
 # Telemetry contract and prototype limitations
 
-Every record is one UTF-8 JSON object terminated by a newline. A rank may have more than one communicator; `comm_hash` identifies a communicator, `op_count` its rank-local collective sequence. These IDs do not need cross-host clock synchronization. Files are per rank/process/communicator to avoid concurrent writers. Rank numbers are communicator ranks, not local device IDs. A filename alone is never evidence of membership.
+The online path reads binary telemetry directly. The offline decoder can export
+one JSON object per line. A rank may have more than one communicator.
+`comm_hash` identifies the communicator and `op_count` is its rank-local
+collective sequence. These IDs do not need cross-host clock synchronization.
+Trace files are per rank, process, and communicator. Records use communicator
+ranks.
 
 Required fields for all records: `event` (`comm_init`, `heartbeat`, `entered`, `snapshot`, `complete`, or `fault`), `comm_hash` (stable string), `rank` (zero-based), `world_size`, `mono_ns` (integer local monotonic nanoseconds). `entered`, `snapshot`, `complete`, and `heartbeat` additionally require a nonnegative integer `op_count`; `snapshot` and `complete` require nonnegative integer `duration_ns` measured on that same rank. `entered` records the host-side invocation, even if the device never begins. `heartbeat` has the highest local invocation counter, including while idle, so not-entered detection has evidence. A `snapshot` is emitted periodically even while a kernel is hung. A `complete` must be emitted only after the stream completion signal, never when a call merely returns.
 
@@ -9,6 +14,14 @@ Operation records carry `op`, `algorithm` (`Ring`/`Tree`), `protocol`, `count`, 
 A producer must identify and disclose dropped/overwritten frames, unsupported algorithms, capture/replay, grouped operations, and allocation errors rather than silently returning fabricated metrics. Eight reusable pinned blocks are not safe to overwrite when more than eight operations are in flight. `cudaLaunchHostFunc` callbacks cannot use CUDA API calls and do not execute normally when previous device work never completes; periodic snapshots must be independent of the callback. GPU atomic behavior on mapped host memory depends on platform support, and GPU atomics are not necessarily atomic from the host's perspective ([NVIDIA CUDA guide](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html)). This store-only version supports mode 1; requesting mode 2 disables telemetry.
 
 ## Analyzer semantics and limitations
+
+With the Tree/Simple AllReduce wait probe, each channel snapshot and completion
+carries `tree_wait_peers` entries for its parent and children. Each entry
+contains a peer `rank`, `data_spins`, and `credit_spins`. The
+`NCCL_CCLD_TREE_SNAPSHOT_MS` setting controls the snapshot interval for
+active Tree probes. `NCCL_CCLD_DUMP_MS` still controls the heartbeat interval
+and snapshots for other operations. The online analyzer can request clock
+samples from each node agent to bound the all-rank entry time.
 
 The analyzer groups records by communicator and operation counter. Ring
 compares progress across ranks with matching channels. For Tree H3 it

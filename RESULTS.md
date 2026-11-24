@@ -648,3 +648,18 @@ is still in flight before the rank process signals itself. The node agent
 verifies the exit independently and records the latest operation it actually
 received from that rank. The H3 trials simulate a stall with a bounded
 device spin. The exit trials model a separate process-liveness fault.
+
+## Directional Tree waits across hosts
+
+Two H100 hosts with eight ranks each ran Tree/Simple AllReduce with the
+opt-in edge probe and 1 ms active snapshots. The analyzer used separate
+evidence for delayed entry and for communication waits after all ranks
+entered. In controlled injections, it found both exact ranks in 6/8 mixed
+cases and confirmed the delayed-entry rank in the two weaker cases. The
+pure delayed-entry and pure communication controls each located 2/2,
+and both healthy controls stayed clear.
+
+The unrestricted H100 build passed six two-host numerical and online
+telemetry checks for Tree/Simple, Tree/LL, Tree/LL128, Ring/Simple and
+Ring/LL. A separate fault-enabled build located both ranks in two further
+mixed Tree/Simple cases with the release analyzer.

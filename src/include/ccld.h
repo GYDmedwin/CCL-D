@@ -17,6 +17,11 @@ struct CcldChannel {
 struct CcldWaitChannel {
   uint64_t data, credit;
 };
+constexpr unsigned CCLD_TREE_PEERS = 4;
+struct CcldTreeWaitChannel {
+  // Parent first, then the three child slots in device Tree order.
+  CcldWaitChannel peers[CCLD_TREE_PEERS];
+};
 struct CcldBlock {
   uint64_t commHash, opCount;
   struct CcldChannel channel[1];

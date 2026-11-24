@@ -11,12 +11,19 @@
 enum CcldLogType : uint32_t {
   CcldLogInit = 1, CcldLogEntered = 2, CcldLogSnapshot = 3,
   CcldLogComplete = 4, CcldLogHeartbeat = 5, CcldLogDropped = 6,
-  CcldLogRingWait = 7, CcldLogEnd = 8
+  CcldLogRingWait = 7, CcldLogEnd = 8, CcldLogTreeWait = 10
 };
 struct CcldLogChannel {
   int32_t id, parent;
   uint64_t send, recv, sendChanges, recvChanges, sendDelta, recvDelta;
 };
+struct CcldTreeLogChannel {
+  int32_t id, parent;
+  int32_t children[CCLD_TREE_PEERS - 1];
+  uint32_t reserved;
+  uint32_t data[CCLD_TREE_PEERS], credit[CCLD_TREE_PEERS];
+};
+static_assert(sizeof(CcldTreeLogChannel) == sizeof(CcldLogChannel), "Tree log must fit fixed record");
 struct CcldLogEvent {
   uint32_t magic, version, type, reserved;
   uint64_t hash, seq, nowNs, startNs, count, bytes, windowNs;

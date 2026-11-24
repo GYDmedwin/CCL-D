@@ -1,7 +1,7 @@
 """Pull CCL-D events from training nodes and diagnose collectives in memory."""
 import argparse
 import asyncio
-from collections import Counter, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 import heapq
 import json
@@ -10,80 +10,31 @@ import signal
 import sys
 import time
 
-from .ccld_analyze import (add_decision_arguments, analyze_comm, barrier, completed_mismatch, comparable_groups,
-                           decision_config, result_common, slow_decision)
+from .ccld_analyze import (acknowledged_exclusion, add_decision_arguments, aligned_exclusion, analyze_comm, barrier,
+                           completed_mismatch, decision_config, exclusion_report,
+                           result_common, SlowWindows)
+from .clock_bounds import ClockBounds
 from .cross_domain import CrossDomainWaits
 from .tree_s1_vote import CLASSIFIED, vote
 from ..tools.decode_async_wait import RECORD_BYTES, WaitDecoder
-from ..tools.live_transport import job_token, pull
+from ..tools.live_transport import job_token, pull, sample_clock
 
 
-class SlowWindow:
-    def __init__(self, comm, cfg, emit):
-        self.comm, self.cfg, self.emit = comm, cfg, emit
-        self.first = None
-        self.window = 0
-        self.window_ns = max(1, int(cfg.window_s * 1e9))
-        self.winners = {}
-        self.detections = Counter()
-        self.skip = cfg.baseline_skip
-        self.baseline_first = None
-        self.baseline_count = 0
-        self.baseline_sum = 0.
-        self.baseline_ready = None
-
-    def add(self, op, states, world):
-        when = states[0]['mono_ns']
-        if self.first is None:
-            self.first = when
-        window = (when - self.first) // self.window_ns
-        if window < self.window:
-            raise ValueError('a rank-0 completion arrived after its slow window closed')
-        if window > self.window:
-            self.flush()
-            self.window = window
-        if self.skip:
-            self.skip -= 1
-        elif self.baseline_ready is None:
-            if self.baseline_first is None:
-                self.baseline_first = when
-            cutoff = self.baseline_first + int(self.cfg.baseline_s * 1e9)
-            if when <= cutoff:
-                self.baseline_count += 1
-                self.baseline_sum += max(e['duration_ns'] for e in states.values()) / 1e6
-            if self.baseline_count == self.cfg.baseline_rounds or when >= cutoff:
-                self.baseline_ready = min(when, cutoff)
-        groups, warnings = comparable_groups(states, world)
-        if not groups:
-            item = result_common(self.comm, op, 'coverage')
-            item.update(kind='undetermined', roots=[], reason='slow comparison unavailable', warnings=warnings)
-            self.emit(item)
-        for label, members, channel in groups:
-            if len(members) < 2:
-                continue
-            durations = [states[r]['duration_ns'] for r in members]
-            score = (max(durations) - min(durations), -op)
-            if label not in self.winners or score > self.winners[label][0]:
-                dynamic = self.baseline_sum > 0 and self.baseline_ready is not None and when > self.baseline_ready
-                base = self.baseline_sum / self.baseline_count if dynamic else self.cfg.baseline_ms
-                self.winners[label] = (score, op, states, members, channel, base, dynamic)
-
+class SlowWindow(SlowWindows):
     def flush(self):
-        tree_states, tree_decisions = {}, []
-        for label, (_, op, states, members, channel, base, dynamic) in sorted(self.winners.items()):
-            item = slow_decision(self.comm, op, states, label, self.window, members, channel,
-                                 base, 'dynamic' if dynamic else 'initial', self.detections, self.cfg)
-            if not item:
-                continue
+        tree_states, tree_decisions = defaultdict(dict), defaultdict(list)
+        for key, label, states, item in self.decisions():
             if label.startswith('tree:') and item['kind'] in CLASSIFIED:
-                tree_states[op] = states
-                tree_decisions.append(item)
+                tree_states[key][item['op_count']] = states
+                tree_decisions[key].append(item)
                 item = dict(item, kind='group_candidate', group_kind=item['kind'],
                             root_scope='tree_layer', candidate_ranks=item['roots'], roots=[])
             self.emit(item)
-        if tree_decisions:
-            self.emit(self.tree_decision(tree_states, tree_decisions))
-        self.winners.clear()
+        for key, decisions in tree_decisions.items():
+            outcome = self.tree_decision(tree_states[key], decisions)
+            if 'operation_profile' in decisions[0]:
+                outcome['operation_profile'] = decisions[0]['operation_profile']
+            self.emit(outcome)
 
     def tree_decision(self, states_by_op, decisions):
         ops = sorted(states_by_op)
@@ -109,13 +60,18 @@ class SlowWindow:
 
 class Communicator:
     MAX_PENDING = 2048
+    MAX_PHASE_OPERATIONS = 16
+    MAX_PHASE_SNAPSHOTS = 32
 
-    def __init__(self, comm, world, cfg, emit):
+    def __init__(self, comm, world, cfg, emit, clocks=None):
         self.comm, self.world, self.cfg, self.emit = comm, world, cfg, emit
+        self.clocks = clocks
         self.observed = {}
+        self.rank_hosts = {}
         self.ended = set()
         self.rank_losses = {}
         self.pending = defaultdict(dict)
+        self.phase_samples = OrderedDict() if cfg.ring_wait_phases or cfg.tree_cross_host_phases else None
         self.completed_by_time = []
         self.tree_references = deque(maxlen=4)
         self.rank0_entry_ns = 0
@@ -129,9 +85,11 @@ class Communicator:
             return
         self.gap = True
         self.pending.clear()
+        if self.phase_samples is not None:
+            self.phase_samples.clear()
         self.completed_by_time.clear()
         self.tree_references.clear()
-        self.window.winners.clear()
+        self.window.profiles.clear()
         item = {'category': 'coverage_gap', 'kind': 'undetermined', 'roots': [],
                 'comm_hash': self.comm, 'op_count': op, 'reason': reason}
         self.emit(dict(item, **fields))
@@ -145,6 +103,7 @@ class Communicator:
             if rank in self.observed:
                 self.mark_gap(op, 'duplicate rank stream for a communicator')
             self.observed[rank] = 0
+            self.rank_hosts[rank] = event.get('host')
         elif rank not in self.observed or rank in self.ended:
             self.mark_gap(op, 'event outside an initialized rank stream')
             return
@@ -158,7 +117,14 @@ class Communicator:
         self.observed[rank] = max(self.observed[rank], op)
         if self.gap:
             return
-        if kind in ('dropped', 'coverage_gap'):
+        if kind == 'dropped':
+            states = self.pending.get(op)
+            skipped = acknowledged_exclusion(states.get(rank) if states is not None else None, event)
+            if skipped is not None:
+                states[rank] = skipped
+                return
+            self.mark_gap(op, event.get('reason', 'missing telemetry'))
+        elif kind == 'coverage_gap':
             self.mark_gap(op, event.get('reason', 'missing telemetry'))
         elif kind in ('entered', 'snapshot', 'complete'):
             if op < self.next_op:
@@ -166,9 +132,19 @@ class Communicator:
                 return
             states = self.pending[op]
             previous = states.get(rank)
+            if previous is not None and previous['event'] == 'skipped':
+                self.mark_gap(op, 'progress after an explicit exclusion')
+                return
             if (previous is None or kind == 'complete' or
                     (previous['event'] != 'complete' and event['mono_ns'] >= previous['mono_ns'])):
                 states[rank] = event
+            if (self.phase_samples is not None and kind == 'snapshot' and
+                    (event.get('wait_probe') is True or event.get('tree_wait_probe') is True)):
+                if op not in self.phase_samples and len(self.phase_samples) == self.MAX_PHASE_OPERATIONS:
+                    self.phase_samples.popitem(last=False)
+                samples = self.phase_samples.setdefault(op, {})
+                self.phase_samples.move_to_end(op)
+                samples.setdefault(rank, deque(maxlen=self.MAX_PHASE_SNAPSHOTS)).append(event)
             if len(self.pending) + len(self.completed_by_time) > self.MAX_PENDING:
                 self.mark_gap(op, 'too many operations waiting for complete rank coverage')
 
@@ -182,6 +158,14 @@ class Communicator:
                                  tree_references=self.tree_references):
             if item['category'] != 'hang':
                 continue
+            if (self.last_hang is not None and self.last_hang[:2] == (item['op_count'], 'H1')
+                    and item['kind'] == 'H2'):
+                known_signatures = {
+                    tuple(signature) for signature in item.get('operation_signatures', {}).values()
+                    if all(value is not None and value != '' for value in signature)
+                }
+                if len(known_signatures) <= 1:
+                    continue
             key = (item['op_count'], item['kind'], tuple(item['roots']))
             if key != self.last_hang:
                 self.last_hang = key
@@ -207,18 +191,26 @@ class Communicator:
         if self.gap:
             return
         while (states := self.pending.get(self.next_op)) is not None:
-            if len(states) != self.world or any(e['event'] != 'complete' for e in states.values()):
-                if allow_partial_hang:
+            kinds = {e['event'] for e in states.values()}
+            if len(states) != self.world or not kinds <= {'complete', 'skipped'}:
+                if allow_partial_hang and 'skipped' not in kinds:
                     self.diagnose_hang(states)
                 break
             op = self.next_op
+            reason = aligned_exclusion(states, self.world) if 'skipped' in kinds else None
+            if 'skipped' in kinds and reason is None:
+                self.mark_gap(op, 'operation exclusions did not align across ranks')
+                return
             self.next_op += 1
             del self.pending[op]
-            start = states[0]['start_mono_ns']
+            start = states[0]['mono_ns' if states[0]['event'] == 'skipped' else 'start_mono_ns']
             if start < self.rank0_entry_ns:
                 self.mark_gap(op, 'rank-0 entry times were out of order')
                 return
             self.rank0_entry_ns = start
+            if reason:
+                self.emit(exclusion_report(self.comm, op, reason))
+                continue
             if all(barrier(e) for e in states.values()):
                 continue
             mismatch = completed_mismatch(self.comm, op, states, self.world)
@@ -235,8 +227,9 @@ class Communicator:
         watermark = math.inf if len(self.ended) == self.world else self.rank0_entry_ns
         while self.completed_by_time and self.completed_by_time[0][0] <= watermark:
             _, op, states = heapq.heappop(self.completed_by_time)
+            snapshots = self.phase_samples.pop(op, None) if self.phase_samples is not None else None
             try:
-                self.window.add(op, states, self.world)
+                self.window.add(op, states, self.world, self.rank_hosts, snapshots, self.clocks)
             except ValueError as exc:
                 self.mark_gap(op, str(exc))
                 break
@@ -247,6 +240,7 @@ class LiveAnalysis:
         self.cfg, self.emit = cfg, emit
         self.comms = {}
         self.cross_domain = CrossDomainWaits()
+        self.clocks = ClockBounds() if cfg.tree_cross_host_phases else None
         self.events = Counter()
         self.completed = Counter()
         self.first_complete_ns = None
@@ -263,7 +257,7 @@ class LiveAnalysis:
                 self.first_complete_ns = time.monotonic_ns()
         comm = event['comm_hash']
         if comm not in self.comms:
-            self.comms[comm] = Communicator(comm, event['world_size'], self.cfg, self.emit)
+            self.comms[comm] = Communicator(comm, event['world_size'], self.cfg, self.emit, self.clocks)
         self.comms[comm].add(event)
 
     def receive(self, endpoint, records):
@@ -373,9 +367,24 @@ def address(value):
 
 def emit(item):
     now = time.monotonic_ns()
-    if item.get('category') in ('rank_liveness', 'hang', 'slow', 'cross_domain'):
+    if item.get('category') in ('rank_liveness', 'hang', 'slow', 'cross_domain', 'collective_mismatch'):
         item = dict(item, observer_mono_ns=now, timing_note='analyzer local observation time')
     print(json.dumps(item, sort_keys=True), flush=True)
+
+
+async def refresh_clocks(endpoints, token, clocks, stop):
+    while not stop.is_set():
+        results = await asyncio.gather(*(sample_clock(e.host, e.port, token, .25) for e in endpoints),
+                                       return_exceptions=True)
+        for endpoint, sample in zip(endpoints, results):
+            if isinstance(sample, Exception):
+                continue
+            if not endpoint.epoch or endpoint.epoch == sample.epoch:
+                clocks.add((endpoint.host, endpoint.port), sample)
+        try:
+            await asyncio.wait_for(stop.wait(), .1)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def run(args, cfg):
@@ -383,9 +392,16 @@ async def run(args, cfg):
     for signum in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
     analysis = make_analysis(cfg, emit, args.decode_workers, args.coalesce_completed)
+    token = job_token()
+    sampler = None
+    if analysis.clocks is not None and len(args.node) > 1:
+        sampler = asyncio.create_task(refresh_clocks(args.node, token, analysis.clocks, stop))
     try:
-        await monitor(args.node, job_token(), analysis, args.poll_s, args.timeout_s, stop)
+        await monitor(args.node, token, analysis, args.poll_s, args.timeout_s, stop)
     finally:
+        if sampler is not None:
+            stop.set()
+            await sampler
         await analysis.close()
     emit({'category': 'summary', 'nodes': len(args.node), 'events': dict(analysis.events),
           'completed_operations': dict(analysis.completed),
@@ -411,6 +427,8 @@ def main():
     p.add_argument('--coalesce-completed', action='store_true',
                    help='fold progress superseded by completion within a decoder batch')
     add_decision_arguments(p)
+    p.add_argument('--tree-cross-host-phases', action='store_true',
+                   help='bound node clock offsets for phased Tree slowdown analysis')
     args = p.parse_args()
     if any(not math.isfinite(x) or x <= 0 for x in (args.poll_s, args.timeout_s)):
         p.error('poll and timeout intervals must be positive')
