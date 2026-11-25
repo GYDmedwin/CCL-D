@@ -22,7 +22,9 @@
 #include <mutex>
 #include <new>
 #include <pthread.h>
+#include <string>
 #include <thread>
+#include <vector>
 #include <strings.h>
 #include <unistd.h>
 
@@ -79,20 +81,15 @@ struct CcldState {
   };
   std::unique_ptr<Slot[]> slots;
   std::unique_ptr<ChannelSample[]> samples;
-  std::thread sampler;
-  std::mutex mutex;
-  std::condition_variable cv;
-  std::mutex outputMutex;
-  std::atomic<bool> stop{false};
-  std::atomic<bool> writerStop{false};
-  std::atomic<bool> ioFailed{false};
-  std::atomic<uint64_t> logDrops{0};
-  std::atomic<uint64_t> lastDroppedSeq{0};
+  std::atomic<unsigned> activeFrames{0};
+  std::atomic<uint64_t> logDrops{0}, lastDroppedSeq{0};
   std::atomic<int> callbacksOutstanding{0};
+  // Registry flags are guarded by their respective worker mutex.
+  bool probeStop = false, probeDone = false, deviceFailed = false;
+  bool writerStop = false, writerDone = false, ioFailed = false;
+  uint64_t nextPollNs = 0, lastHeartbeatNs = 0;
   std::unique_ptr<CcldQueue<CcldLogEvent>> logQueue;
   size_t queueSlots = 0;
-  std::thread writer;
-  CcldNodeStream nodeStream;
   FILE* output = nullptr;
   uint64_t commHash = 0;
   uint64_t pollUs = 200;
@@ -142,44 +139,18 @@ static void ccldWrite(CcldState* state, const CcldLogEvent& event) {
   ccldWrite(state, &event, 1);
 }
 
-static void ccldWriter(CcldState* state) {
-  (void)pthread_setname_np(pthread_self(), "ccld-writer");
-  CcldLogEvent batch[16];
-  for (;;) {
-    size_t count = 0;
-    const uint64_t drops = state->logDrops.exchange(0, std::memory_order_acq_rel);
-    if (drops != 0) {
-      batch[count] = ccldLogBase(state, CcldLogDropped,
-                                 state->lastDroppedSeq.load(std::memory_order_relaxed), ccldNow());
-      batch[count].count = drops;
-      snprintf(batch[count].reason, sizeof(batch[count].reason), "%s", "binary_queue_overflow");
-      ++count;
-    }
-    while (count < 16 && state->logQueue->pop(batch[count])) ++count;
-    if (count != 0) {
-      bool ok = false;
-      {
-        std::lock_guard<std::mutex> lock(state->outputMutex);
-        if (state->output != nullptr)
-          ok = fwrite(batch, sizeof(CcldLogEvent), count, state->output) == count && fflush(state->output) == 0;
-      }
-      if (state->output == nullptr && !state->ioFailed.load(std::memory_order_relaxed))
-        ok = state->nodeStream.write(batch, count * sizeof(CcldLogEvent));
-      if (!ok) {
-        state->ioFailed.store(true, std::memory_order_release);
-        state->nodeStream.close();
-      }
-    } else if (state->writerStop.load(std::memory_order_acquire)) {
-      break;
-    } else {
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
+static size_t ccldReadBatch(CcldState* state, CcldLogEvent* batch, size_t capacity) {
+  size_t count = 0;
+  const uint64_t drops = state->logDrops.exchange(0, std::memory_order_acq_rel);
+  if (drops != 0) {
+    batch[count] = ccldLogBase(state, CcldLogDropped,
+                               state->lastDroppedSeq.load(std::memory_order_relaxed), ccldNow());
+    batch[count].count = drops;
+    snprintf(batch[count].reason, sizeof(batch[count].reason), "%s", "binary_queue_overflow");
+    ++count;
   }
-  if (state->output == nullptr && !state->ioFailed.load(std::memory_order_acquire)) {
-    CcldLogEvent end = ccldLogBase(state, CcldLogEnd, state->sequence.next(), ccldNow());
-    state->nodeStream.write(&end, sizeof(end));
-    state->nodeStream.close();
-  }
+  while (count < capacity && state->logQueue->pop(batch[count])) ++count;
+  return count;
 }
 
 static void ccldDropped(CcldState* state, uint64_t seq, const char* reason) {
@@ -334,27 +305,246 @@ static void ccldPollSlot(CcldState* state, unsigned index, bool eventDeviceReady
   ccldSample(state, index, done);
   if (done) {
     ccldEmit(state, index, true, slot.endNs.load(std::memory_order_relaxed));
+    state->activeFrames.fetch_sub(1, std::memory_order_release);
     slot.phase.store(0, std::memory_order_release);
   } else if (finishing || (now >= slot.lastDumpNs && now - slot.lastDumpNs >= state->dumpNs)) {
     ccldEmit(state, index, false, ccldNow());
   }
 }
 
-static void ccldSampler(CcldState* state) {
-  (void)pthread_setname_np(pthread_self(), "ccld-probe");
-  const bool eventDeviceReady = !state->useEvent || hipSetDevice(state->device) == hipSuccess;
-  if (!eventDeviceReady)
-    WARN("CCL-D rank %d sampler could not select device %d", state->rank, state->device);
-  std::unique_lock<std::mutex> lock(state->mutex);
-  while (!state->stop.load(std::memory_order_acquire)) {
-    state->cv.wait_for(lock, std::chrono::microseconds(state->pollUs));
-    const uint64_t now = ccldNow();
-    for (unsigned i = 0; i < state->frameBlocks; ++i)
-      ccldPollSlot(state, i, eventDeviceReady, now, false);
-  }
-  const uint64_t now = ccldNow();
+static void ccldPoll(CcldState* state, bool eventDeviceReady, uint64_t now, bool finishing) {
   for (unsigned i = 0; i < state->frameBlocks; ++i)
-    ccldPollSlot(state, i, eventDeviceReady, now, true);
+    ccldPollSlot(state, i, eventDeviceReady, now, finishing);
+}
+
+// Registry locks only serialize worker loops and communicator lifecycle.
+// Collective enqueue keeps using its own bounded queue and frame slots.
+class CcldProcessWorkers {
+  std::mutex probeMu, writerMu;
+  std::mutex probeWakeMu;
+  std::condition_variable probeCv, probeRetiredCv, writerCv;
+  uint64_t probeGeneration = 0;
+  std::vector<CcldState*> probes, writers;
+  std::thread probe, writer;
+  bool stopProbe = false, stopWriter = false;
+  CcldNodeStream stream;
+  std::string socketPath;
+  size_t onlineUsers = 0;
+  bool connected = false;
+
+  bool selectDevice(CcldState* state, int& currentDevice) {
+    if (!state->useEvent) return true;
+    if (state->deviceFailed) return false;
+    if (state->device == currentDevice) return true;
+    if (hipSetDevice(state->device) == hipSuccess) {
+      currentDevice = state->device;
+      return true;
+    }
+    state->deviceFailed = true;
+    currentDevice = -1;
+    WARN("CCL-D rank %d sampler could not select device %d", state->rank, state->device);
+    return false;
+  }
+
+  void probeLoop() {
+    (void)pthread_setname_np(pthread_self(), "ccld-probe");
+    int currentDevice = -1;
+    while (true) {
+      std::unique_lock<std::mutex> wakeLock(probeWakeMu);
+      const uint64_t generation = probeGeneration;
+      wakeLock.unlock();
+
+      uint64_t deadline = UINT64_MAX;
+      {
+        std::lock_guard<std::mutex> lock(probeMu);
+        if (stopProbe) return;
+        for (auto it = probes.begin(); it != probes.end();) {
+          CcldState* state = *it;
+          uint64_t now = ccldNow();
+          if (state->probeStop) {
+            ccldPoll(state, selectDevice(state, currentDevice), now, true);
+            it = probes.erase(it);
+            state->probeDone = true;
+            probeRetiredCv.notify_all();
+            continue;
+          }
+          if (now >= state->nextPollNs && state->activeFrames.load(std::memory_order_acquire) != 0) {
+            ccldPoll(state, selectDevice(state, currentDevice), now, false);
+            state->nextPollNs = ccldNow() + state->pollUs * 1000;
+          }
+          if (state->activeFrames.load(std::memory_order_acquire) != 0) {
+            deadline = std::min(deadline, state->nextPollNs);
+          }
+          // RCCL also uses the dump period for fine Tree snapshots.
+          // Park idle communicators until a heartbeat even in that mode.
+          const uint64_t heartbeatNs = std::max(state->dumpNs, uint64_t{1000000000});
+          if (now - state->lastHeartbeatNs >= heartbeatNs) {
+            ccldWrite(state, ccldLogBase(state, CcldLogHeartbeat, state->sequence.current(), now));
+            state->lastHeartbeatNs = now;
+          }
+          deadline = std::min(deadline, state->lastHeartbeatNs + heartbeatNs);
+          ++it;
+        }
+      }
+
+      // A transition during the scan changes the generation. A transition
+      // during parking shares this lock with the condition-variable wait.
+      wakeLock.lock();
+      auto ready = [this, generation] { return probeGeneration != generation; };
+      if (deadline == UINT64_MAX) {
+        probeCv.wait(wakeLock, ready);
+      } else {
+        const uint64_t now = ccldNow();
+        if (deadline > now) probeCv.wait_for(wakeLock, std::chrono::nanoseconds(deadline - now), ready);
+      }
+    }
+  }
+
+  void send(const CcldLogEvent* batch, size_t n) {
+    if (n && connected && !stream.write(batch, n * sizeof(CcldLogEvent))) {
+      connected = false;
+      stream.close();
+      WARN("CCL-D shared writer lost its node agent");
+    }
+  }
+
+  void writerLoop() {
+    (void)pthread_setname_np(pthread_self(), "ccld-writer");
+    constexpr size_t perComm = 16, maxBatch = 64;
+    CcldLogEvent mixed[maxBatch], file[perComm];
+    while (true) {
+      std::unique_lock<std::mutex> lock(writerMu);
+      if (stopWriter) return;
+      if (writers.empty()) {
+        writerCv.wait(lock);
+        continue;
+      }
+      size_t used = 0;
+      bool worked = false;
+      for (auto it = writers.begin(); it != writers.end();) {
+        CcldState* state = *it;
+        if (!state->output && used + perComm > maxBatch) {
+          send(mixed, used);
+          used = 0;
+        }
+        size_t n = ccldReadBatch(state, state->output ? file : mixed + used, perComm);
+        if (n) {
+          worked = true;
+          if (!state->output) {
+            used += n;
+          } else if (!state->ioFailed &&
+                     (fwrite(file, sizeof(CcldLogEvent), n, state->output) != n || fflush(state->output) != 0)) {
+            state->ioFailed = true;
+            WARN("CCL-D shared writer lost a file sink");
+          }
+        }
+        if (n || !state->writerStop) {
+          ++it;
+          continue;
+        }
+        CcldLogEvent end = ccldLogBase(state, CcldLogEnd, state->sequence.next(), ccldNow());
+        if (!state->output) {
+          mixed[used++] = end;
+          --onlineUsers;
+        } else if (!state->ioFailed) {
+          if (fwrite(&end, sizeof(end), 1, state->output) != 1 || fflush(state->output) != 0)
+            WARN("CCL-D shared writer could not finish a file sink");
+        }
+        it = writers.erase(it);
+        state->writerDone = true;
+        writerCv.notify_all();
+      }
+      send(mixed, used);
+      if (onlineUsers == 0 && !socketPath.empty()) {
+        stream.close();
+        connected = false;
+        socketPath.clear();
+      }
+      if (!worked && !writers.empty()) writerCv.wait_for(lock, std::chrono::milliseconds(2));
+    }
+  }
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lock(probeMu);
+      stopProbe = true;
+    }
+    wakeProbe();
+    {
+      std::lock_guard<std::mutex> lock(writerMu);
+      stopWriter = true;
+    }
+    writerCv.notify_all();
+    if (probe.joinable()) probe.join();
+    if (writer.joinable()) writer.join();
+  }
+
+ public:
+  CcldProcessWorkers() {
+    probe = std::thread(&CcldProcessWorkers::probeLoop, this);
+    try {
+      writer = std::thread(&CcldProcessWorkers::writerLoop, this);
+    } catch (...) {
+      stop();
+      throw;
+    }
+  }
+  ~CcldProcessWorkers() { stop(); }
+
+  void wakeProbe() {
+    std::lock_guard<std::mutex> lock(probeWakeMu);
+    ++probeGeneration;
+    probeCv.notify_one();
+  }
+
+  bool attach(CcldState* state, const char* path) {
+    std::unique_lock<std::mutex> plock(probeMu, std::defer_lock);
+    std::unique_lock<std::mutex> wlock(writerMu, std::defer_lock);
+    std::lock(plock, wlock);
+    probes.reserve(probes.size() + 1);
+    writers.reserve(writers.size() + 1);
+    if (path) {
+      if (onlineUsers == 0) {
+        std::string name(path);
+        constexpr char preface[] = "CCLDMS01";
+        if (!stream.open(path) || !stream.write(preface, sizeof(preface) - 1)) {
+          stream.close();
+          return false;
+        }
+        socketPath.swap(name);
+        connected = true;
+      } else if (!connected || socketPath != path) {
+        return false;
+      }
+      ++onlineUsers;
+    }
+    state->lastHeartbeatNs = ccldNow();
+    probes.push_back(state);
+    writers.push_back(state);
+    wakeProbe();
+    writerCv.notify_one();
+    return true;
+  }
+
+  void detach(CcldState* state) {
+    {
+      std::unique_lock<std::mutex> lock(probeMu);
+      state->probeStop = true;
+      wakeProbe();
+      probeRetiredCv.wait(lock, [state] { return state->probeDone; });
+    }
+    {
+      std::unique_lock<std::mutex> lock(writerMu);
+      state->writerStop = true;
+      writerCv.notify_all();
+      writerCv.wait(lock, [state] { return state->writerDone; });
+    }
+  }
+};
+
+static CcldProcessWorkers& ccldProcessWorkers() {
+  static CcldProcessWorkers workers;
+  return workers;
 }
 
 static void ccldDone(void* data) {
@@ -363,8 +553,8 @@ static void ccldDone(void* data) {
   CcldState::Slot& slot = state->slots[callback->slot];
   slot.endNs.store(ccldNow(), std::memory_order_relaxed);
   slot.done.store(true, std::memory_order_release);
-  state->cv.notify_one();
   delete callback;
+  // This must be the callback's last access to state.
   state->callbacksOutstanding.fetch_sub(1, std::memory_order_release);
 }
 
@@ -495,7 +685,7 @@ void ccldInit(struct ncclComm* comm) {
       return;
     }
   }
-  if (state->output == nullptr && (nodeSocket == nullptr || !state->nodeStream.open(nodeSocket))) {
+  if (state->output == nullptr && (nodeSocket == nullptr || *nodeSocket == '\0')) {
     WARN("CCL-D requires NCCL_CCLD_NODE_SOCKET or NCCL_CCLD_OUT_DIR for binary telemetry");
     ccldMappedHostFree(&state->waitAllocation);
     ccldMappedHostFree(&state->frameAllocation);
@@ -531,13 +721,14 @@ void ccldInit(struct ncclComm* comm) {
   init.windowNs = state->logQueue->allocatedBytes();
   snprintf(init.reason, sizeof(init.reason), "%s", state->useEvent ? "event_query" : "hostfunc");
   ccldWrite(state, init);
+  bool registered = false;
   try {
-    state->writer = std::thread(ccldWriter, state);
-    state->sampler = std::thread(ccldSampler, state);
+    registered = ccldProcessWorkers().attach(state, state->output == nullptr ? nodeSocket : nullptr);
   } catch (const std::exception& errorException) {
-    WARN("CCL-D sampler creation failed: %s", errorException.what());
-    state->writerStop.store(true, std::memory_order_release);
-    if (state->writer.joinable()) state->writer.join();
+    WARN("CCL-D shared worker creation failed: %s", errorException.what());
+  }
+  if (!registered) {
+    WARN("CCL-D rank %d could not register a telemetry sink", state->rank);
     if (state->useEvent) for (unsigned i = 0; i < state->frameBlocks; ++i)
       hipEventDestroy(state->slots[i].completionEvent);
     ccldMappedHostFree(&state->waitAllocation);
@@ -552,29 +743,21 @@ void ccldInit(struct ncclComm* comm) {
 void ccldFree(struct ncclComm* comm) {
   CcldState* state = ccldState(comm);
   if (state == nullptr) return;
-  state->stop.store(true, std::memory_order_release);
-  state->cv.notify_one();
-  if (state->sampler.joinable()) state->sampler.join();
-  if (state->output != nullptr) {
-    CcldLogEvent end = ccldLogBase(state, CcldLogEnd, state->sequence.next(), ccldNow());
-    ccldWrite(state, end);
-  }
-  state->writerStop.store(true, std::memory_order_release);
-  if (state->writer.joinable()) state->writer.join();
+  ccldProcessWorkers().detach(state);
   bool active = state->callbacksOutstanding.load(std::memory_order_acquire) != 0;
   for (unsigned i = 0; i < state->frameBlocks; ++i)
     active = active || state->slots[i].phase.load(std::memory_order_acquire) != 0;
   comm->ccldState = nullptr;
+  if (state->output != nullptr) {
+    fclose(state->output);
+    state->output = nullptr;
+  }
   if (active) {
     WARN("CCL-D retains mapped storage while completion callback is active");
     return;
   }
   if (state->useEvent) for (unsigned i = 0; i < state->frameBlocks; ++i)
     hipEventDestroy(state->slots[i].completionEvent);
-  if (state->output != nullptr) {
-    fclose(state->output);
-    state->output = nullptr;
-  }
   ccldMappedHostFree(&state->waitAllocation);
   ccldMappedHostFree(&state->frameAllocation);
   delete state;
@@ -755,11 +938,12 @@ void ccldPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   slot.done.store(false, std::memory_order_relaxed);
   slot.eventRecorded.store(false, std::memory_order_relaxed);
   slot.eventFailed.store(false, std::memory_order_relaxed);
+  const bool wasIdle = state->activeFrames.fetch_add(1, std::memory_order_release) == 0;
   slot.phase.store(2, std::memory_order_release);
   work->ccldSlotPlus1 = static_cast<uint16_t>(index + 1);
   work->ccldTreeWait = slot.treeWait != nullptr;
   plan->ccldSlotPlus1 = static_cast<uint16_t>(index + 1);
-  state->cv.notify_one();
+  if (wasIdle) ccldProcessWorkers().wakeProbe();
 }
 
 void ccldCallbackEnqueue(struct ncclComm* comm, struct ncclKernelPlan* plan,
@@ -772,7 +956,6 @@ void ccldCallbackEnqueue(struct ncclComm* comm, struct ncclKernelPlan* plan,
     hipError_t error = hipEventRecord(slot.completionEvent, stream);
     if (error == hipSuccess) {
       slot.eventRecorded.store(true, std::memory_order_release);
-      state->cv.notify_one();
     } else {
       slot.eventFailed.store(true, std::memory_order_release);
       ccldDropped(state, slot.seq, "completion_event_record_failed");

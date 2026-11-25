@@ -27,6 +27,7 @@ class CcldSequence {
     return seq;
   }
 
+  uint64_t current() const { return counter.load(std::memory_order_relaxed); }
   bool lockFree() const { return counter.is_lock_free(); }
 
  private:
