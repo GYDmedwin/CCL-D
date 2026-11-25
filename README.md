@@ -2,9 +2,10 @@
 
 CCL-D detects and locates slow or stalled collective operations in distributed
 training. This branch instruments RCCL **2.22.3-1**. DCU kernels write
-progress counters to mapped host memory. Rank-local monitors sample the
-counters, node agents buffer the records in memory, and a separate CPU
-analyzer pulls those records over the job network.
+progress counters to mapped host memory. Communicators in one training
+process share a probe thread, a writer thread, and a Unix connection to
+the node agent. Node agents buffer the records in memory, and a separate
+CPU analyzer pulls those records over the job network.
 
 [Paper](https://doi.org/10.1145/3774934.3786429) · [NCCL version](https://github.com/GYDmedwin/CCL-D/tree/main) · [Validation results](RESULTS.md)
 
@@ -30,9 +31,10 @@ for training that selects collectives and datatypes at runtime. See the
 
 ## Run with your training job
 
-Use the same CCL-D revision for the agents and analyzer. Generate one token
-with `openssl rand -hex 32` and export it as `CCLD_PULL_TOKEN` wherever the
-agents or analyzer run.
+Build RCCL and run the agents and analyzer from the same revision. Agents
+from this revision can also read streams from older RCCL builds. Generate
+one token with `openssl rand -hex 32` and export it as `CCLD_PULL_TOKEN`
+wherever the agents or analyzer run.
 
 1. **Start one agent per training node.** Set `TRAIN_NODE_ADDR` to the node
    address reachable from the analyzer. Keep the local socket path for
